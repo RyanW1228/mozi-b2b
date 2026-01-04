@@ -2,8 +2,9 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import type { PlanInput, PlanOutput } from "@/lib/types";
 
-export async function POST() {
+export async function POST(req: Request) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -13,28 +14,123 @@ export async function POST() {
       );
     }
 
-    const ai = new GoogleGenAI({ apiKey });
+    // 1) Read typed input
+    const input = (await req.json()) as PlanInput;
 
+    // Basic runtime validation (prevents undefined.map crashes)
+    if (
+      !input ||
+      !input.restaurant ||
+      typeof input.restaurant.planningHorizonDays !== "number" ||
+      typeof input.restaurant.timezone !== "string" ||
+      !Array.isArray(input.skus) ||
+      !Array.isArray(input.suppliers)
+    ) {
+      return NextResponse.json(
+        {
+          error: "Invalid PlanInput: missing skus or suppliers arrays",
+          got: {
+            hasInput: Boolean(input),
+            skusType: typeof (input as any)?.skus,
+            suppliersType: typeof (input as any)?.suppliers,
+          },
+        },
+        { status: 400 }
+      );
+    }
+
+    // 2) Tell Gemini to output STRICT JSON for PlanOutput
+    const prompt =
+      `You are Mozi, an AI purchasing assistant for a single-location restaurant.\n` +
+      `Goal: balance profit and waste minimization given owner preferences.\n\n` +
+      `Return ONLY valid JSON. No markdown. No extra text.\n` +
+      `Your JSON MUST match this TypeScript shape (PlanOutput):\n` +
+      `{\n` +
+      `  "generatedAt": string,\n` +
+      `  "horizonDays": number,\n` +
+      `  "orders": [\n` +
+      `    {\n` +
+      `      "supplierId": string,\n` +
+      `      "orderDate": "YYYY-MM-DD",\n` +
+      `      "items": [\n` +
+      `        {\n` +
+      `          "sku": string,\n` +
+      `          "orderUnits": number,\n` +
+      `          "reason": string,\n` +
+      `          "riskNote"?: "waste_risk" | "stockout_risk" | "balanced",\n` +
+      `          "confidence"?: number\n` +
+      `        }\n` +
+      `      ]\n` +
+      `    }\n` +
+      `  ],\n` +
+      `  "summary": { "keyDrivers": string[], "warnings"?: string[] }\n` +
+      `}\n\n` +
+      `Use these inputs (JSON):\n` +
+      `${JSON.stringify(input, null, 2)}\n\n` +
+      `Rules:\n` +
+      `- Only recommend SKUs that exist in input.skus[*].sku.\n` +
+      `- supplierId must match one of input.suppliers[*].supplierId.\n` +
+      `- Use horizonDays = input.restaurant.planningHorizonDays.\n` +
+      `- Use timezone = input.restaurant.timezone when choosing orderDate.\n` +
+      `- Respect input.ownerPrefs.strategy (min_waste vs balanced vs min_stockouts).\n` +
+      `- Bias toward neverRunOutSkus (strongest) and criticalSkus (strong).\n` +
+      `- Keep orderUnits as a reasonable positive number; omit items rather than using 0.\n` +
+      `- If required data is missing, include it in summary.warnings.\n`;
+
+    const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
       model: "gemini-3-pro-preview",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text:
-                "You are helping a restaurant owner. Explain in 3 bullet points why an AI would order more chicken this week.\n" +
-                "Context: higher sales last week; chicken shelf life 3 days; supplier lead time 2 days; owner wants balanced waste vs stockout risk.",
-            },
-          ],
-        },
-      ],
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: {
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        temperature: 1.0,
       },
     });
 
-    return NextResponse.json({ explanation: response.text });
+    // 3) Parse JSON safely
+    const raw = (response.text ?? "").trim();
+
+    // If Gemini adds any extra text, try to grab the JSON object
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) {
+      return NextResponse.json(
+        { error: "Model response had no JSON object", raw },
+        { status: 502 }
+      );
+    }
+    const jsonText = raw.slice(start, end + 1);
+
+    let plan: PlanOutput;
+    try {
+      plan = JSON.parse(jsonText) as PlanOutput;
+    } catch {
+      return NextResponse.json(
+        { error: "Model did not return valid JSON", raw },
+        { status: 502 }
+      );
+    }
+
+    // 4) Return structured plan
+    // 4) Enforce constraints (prevent hallucinated SKUs/suppliers)
+    const validSkus = new Set(input.skus.map((s) => s.sku));
+    const validSuppliers = new Set(input.suppliers.map((s) => s.supplierId));
+
+    plan.orders = (plan.orders ?? [])
+      .filter((o) => validSuppliers.has(o.supplierId))
+      .map((o) => ({
+        ...o,
+        items: (o.items ?? []).filter(
+          (it) =>
+            validSkus.has(it.sku) &&
+            Number.isFinite(it.orderUnits) &&
+            it.orderUnits > 0
+        ),
+      }))
+      .filter((o) => o.items.length > 0);
+
+    // 5) Return structured plan
+    return NextResponse.json(plan);
   } catch (err: any) {
     console.error("Gemini call failed:", err);
     return NextResponse.json(
