@@ -39,6 +39,26 @@ export async function POST(req: Request) {
       );
     }
 
+    // Compute today's date in the restaurant timezone (YYYY-MM-DD)
+    function todayISODateInTZ(timeZone: string) {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(new Date());
+
+      const y = parts.find((p) => p.type === "year")?.value;
+      const m = parts.find((p) => p.type === "month")?.value;
+      const d = parts.find((p) => p.type === "day")?.value;
+
+      // Fallback (shouldn't happen, but keeps things safe)
+      if (!y || !m || !d) return new Date().toISOString().slice(0, 10);
+      return `${y}-${m}-${d}`;
+    }
+
+    const todayOrderDate = todayISODateInTZ(input.restaurant.timezone);
+
     // 2) Tell Gemini to output STRICT JSON for PlanOutput
     const prompt =
       `You are Mozi, an AI purchasing assistant for a single-location restaurant.\n` +
@@ -120,6 +140,8 @@ export async function POST(req: Request) {
       .filter((o) => validSuppliers.has(o.supplierId))
       .map((o) => ({
         ...o,
+        // Force orderDate to be today in the restaurant timezone (removes "random date" issue)
+        orderDate: todayOrderDate,
         items: (o.items ?? []).filter(
           (it) =>
             validSkus.has(it.sku) &&
@@ -128,6 +150,12 @@ export async function POST(req: Request) {
         ),
       }))
       .filter((o) => o.items.length > 0);
+
+    // Force generatedAt to be the server's actual time (prevents model "random dates")
+    plan.generatedAt = new Date().toISOString();
+
+    // Ensure horizonDays is consistent with input (model can still provide it, but we enforce)
+    plan.horizonDays = input.restaurant.planningHorizonDays;
 
     // 5) Return structured plan
     return NextResponse.json(plan);
