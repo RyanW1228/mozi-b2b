@@ -1,3 +1,4 @@
+// src/app/locations/[locationId]/inventory/page.tsx
 "use client";
 
 import { useEffect, useState } from "react";
@@ -8,11 +9,11 @@ type InventoryRow = {
   onHandUnits: number;
 };
 
-<Link href="/" style={{ display: "inline-block", marginTop: 8 }}>
-  ← Back to Purchase Plan
-</Link>;
-
-export default function InventoryPage() {
+export default function InventoryPage({
+  params,
+}: {
+  params: { locationId: string };
+}) {
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
@@ -21,8 +22,15 @@ export default function InventoryPage() {
     setLoading(true);
     setMsg("");
     try {
-      const res = await fetch("/api/inventory");
+      const res = await fetch(
+        `/api/inventory?locationId=${encodeURIComponent(params.locationId)}`
+      );
       const data = (await res.json()) as InventoryRow[];
+      if (!res.ok) {
+        setMsg(JSON.stringify(data, null, 2));
+        setRows([]);
+        return;
+      }
       setRows(data);
     } catch (e: any) {
       setMsg(String(e));
@@ -32,28 +40,35 @@ export default function InventoryPage() {
   }
 
   async function saveRow(sku: string, onHandUnits: number) {
-    const res = await fetch("/api/inventory", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sku, onHandUnits }),
-    });
+    setMsg("");
+    const res = await fetch(
+      `/api/inventory?locationId=${encodeURIComponent(params.locationId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sku, onHandUnits }),
+      }
+    );
 
     const data = await res.json();
     if (!res.ok) setMsg(JSON.stringify(data, null, 2));
-    else setMsg(`Saved ${sku}`);
+    else setMsg(`Saved ${sku} for ${params.locationId}`);
   }
 
   useEffect(() => {
     refresh();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.locationId]);
 
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", maxWidth: 900 }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700 }}>Inventory</h1>
+      <h1 style={{ fontSize: 28, fontWeight: 700 }}>
+        Inventory • {params.locationId}
+      </h1>
 
-      <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
         <Link
-          href="/"
+          href={`/locations/${params.locationId}`}
           style={{
             padding: "8px 12px",
             borderRadius: 10,
@@ -65,6 +80,21 @@ export default function InventoryPage() {
           }}
         >
           ← Back to Purchase Plan
+        </Link>
+
+        <Link
+          href="/locations"
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            textDecoration: "none",
+            color: "inherit",
+            display: "inline-block",
+            fontWeight: 600,
+          }}
+        >
+          Locations
         </Link>
       </div>
 

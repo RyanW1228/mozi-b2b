@@ -1,4 +1,4 @@
-// src/app/lib/stateStore.ts
+// src/lib/stateStore.ts
 import type { PlanInput } from "@/lib/types";
 
 // NOTE:
@@ -7,7 +7,9 @@ import type { PlanInput } from "@/lib/types";
 
 export type RestaurantState = PlanInput;
 
-let state: RestaurantState = {
+// Seed template used to initialize new locations.
+// We will clone it and override restaurant.id per location.
+const SEED_STATE: RestaurantState = {
   restaurant: {
     id: "demo_restaurant_1",
     name: "Demo Restaurant",
@@ -69,16 +71,43 @@ let state: RestaurantState = {
   },
 };
 
-export function getState() {
-  return state;
+// In-memory per-location map
+const statesByLocationId = new Map<string, RestaurantState>();
+
+function cloneSeedForLocation(locationId: string): RestaurantState {
+  // Deep clone to prevent cross-location mutation through shared references
+  const cloned = structuredClone(SEED_STATE) as RestaurantState;
+  cloned.restaurant.id = locationId;
+  // Optional: name can default to location id if not set elsewhere
+  if (!cloned.restaurant.name) cloned.restaurant.name = locationId;
+  return cloned;
 }
 
-export function setState(next: RestaurantState) {
-  state = next;
+export function getState(locationId: string): RestaurantState {
+  const existing = statesByLocationId.get(locationId);
+  if (existing) return existing;
+
+  const created = cloneSeedForLocation(locationId);
+  statesByLocationId.set(locationId, created);
+  return created;
 }
 
-export function patchInventory(sku: string, onHandUnits: number) {
-  const inventory = [...state.inventory];
+export function setState(locationId: string, next: RestaurantState) {
+  // Ensure state is scoped correctly
+  const normalized = {
+    ...next,
+    restaurant: { ...next.restaurant, id: locationId },
+  };
+  statesByLocationId.set(locationId, normalized);
+}
+
+export function patchInventory(
+  locationId: string,
+  sku: string,
+  onHandUnits: number
+) {
+  const current = getState(locationId);
+  const inventory = [...current.inventory];
   const idx = inventory.findIndex((i) => i.sku === sku);
 
   if (idx >= 0) {
@@ -87,5 +116,6 @@ export function patchInventory(sku: string, onHandUnits: number) {
     inventory.push({ sku, onHandUnits });
   }
 
-  state = { ...state, inventory };
+  const next = { ...current, inventory };
+  statesByLocationId.set(locationId, next);
 }

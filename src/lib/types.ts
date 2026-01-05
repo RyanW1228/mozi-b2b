@@ -97,3 +97,34 @@ export type PlanOutput = {
     warnings?: string[]; // e.g. missing costs, missing inventory
   };
 };
+
+// ---------------------------------------------------------------------------
+// Execution-layer types (deterministic; separate from model planning output)
+// ---------------------------------------------------------------------------
+
+export type PaymentIntent = {
+  intentId: string; // unique id for audit + idempotency
+  createdAt: string; // ISO timestamp
+  buyer: { id: string; timezone: string };
+
+  // Optional linkage back to the plan that produced it
+  planGeneratedAt?: string;
+
+  // Pending window for human override (autonomy proceeds after this)
+  pendingUntil: string; // ISO timestamp
+
+  // What would be paid if executed
+  transfers: Array<{
+    supplierId: string;
+    amountUsd: number; // v1 accounting unit
+    memo?: string;
+    items?: Array<{ sku: string; units: number; unitCostUsd?: number }>;
+  }>;
+
+  // Deterministic validation metadata
+  validation: {
+    budgetCapUsd?: number;
+    totalUsd: number;
+    warnings?: string[];
+  };
+};
