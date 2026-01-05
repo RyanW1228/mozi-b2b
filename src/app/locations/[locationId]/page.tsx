@@ -1,15 +1,21 @@
 // src/app/locations/[locationId]/page.tsx
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
+import { useParams } from "next/navigation";
 
-export default function LocationPage({
-  params,
-}: {
-  params: { locationId: string };
-}) {
+export default function LocationPage() {
+  const params = useParams<{ locationId: string }>();
+
+  const locationId = useMemo(() => {
+    const v = params?.locationId;
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v[0];
+    return "";
+  }, [params]);
+
   const [loading, setLoading] = useState(false);
   const [plan, setPlan] = useState<PlanOutput | null>(null);
   const [error, setError] = useState<string>("");
@@ -20,15 +26,15 @@ export default function LocationPage({
   const [notes, setNotes] = useState<string>("Normal week");
 
   async function generate() {
+    if (!locationId) return;
+
     setLoading(true);
     setError("");
     setPlan(null);
 
     try {
-      // v1: still using your existing single-location /api/state.
-      // Later: change /api/state to accept locationId and return location-scoped state.
       const stateRes = await fetch(
-        `/api/state?locationId=${encodeURIComponent(params.locationId)}`
+        `/api/state?locationId=${encodeURIComponent(locationId)}`
       );
 
       if (!stateRes.ok) {
@@ -46,7 +52,7 @@ export default function LocationPage({
         ...baseInput,
         restaurant: {
           ...baseInput.restaurant,
-          id: params.locationId, // scope by location in v1 (at least via id)
+          id: locationId,
           planningHorizonDays: horizonDays,
         },
         ownerPrefs: {
@@ -67,7 +73,7 @@ export default function LocationPage({
 
       const data = await res.json();
       if (!res.ok) {
-        setError(`HTTP ${res.status}\n` + JSON.stringify(data, null, 2));
+        setError(`PLAN HTTP ${res.status}\n` + JSON.stringify(data, null, 2));
       } else {
         setPlan(data as PlanOutput);
       }
@@ -78,6 +84,24 @@ export default function LocationPage({
     }
   }
 
+  if (!locationId) {
+    return (
+      <main style={{ padding: 24, fontFamily: "system-ui" }}>
+        <Link href="/locations" style={{ textDecoration: "none" }}>
+          ← Locations
+        </Link>
+
+        <h1 style={{ fontSize: 28, fontWeight: 700, marginTop: 10 }}>
+          Location
+        </h1>
+
+        <div style={{ marginTop: 12, color: "#a00" }}>
+          Missing locationId in route params.
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main style={{ padding: 24, fontFamily: "system-ui" }}>
       <Link href="/locations" style={{ textDecoration: "none" }}>
@@ -85,7 +109,7 @@ export default function LocationPage({
       </Link>
 
       <h1 style={{ fontSize: 28, fontWeight: 700, marginTop: 10 }}>
-        Location: {params.locationId}
+        Location: {locationId}
       </h1>
 
       <p style={{ marginTop: 8, maxWidth: 700 }}>
@@ -178,7 +202,7 @@ export default function LocationPage({
         </button>
 
         <Link
-          href={`/locations/${params.locationId}/inventory`}
+          href={`/locations/${locationId}/inventory`}
           style={{
             padding: "10px 14px",
             borderRadius: 10,

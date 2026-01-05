@@ -12,6 +12,8 @@ function getLocationIdFromUrl(url: string): string | null {
 
 export async function GET(req: Request) {
   const locationId = getLocationIdFromUrl(req.url);
+  console.log("[api/inventory][GET]", { locationId });
+
   if (!locationId) {
     return NextResponse.json(
       { error: "Missing locationId in query string" },
@@ -25,6 +27,8 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   const locationId = getLocationIdFromUrl(req.url);
+  console.log("[api/inventory][GET]", { locationId });
+
   if (!locationId) {
     return NextResponse.json(
       { error: "Missing locationId in query string" },

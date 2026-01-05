@@ -15,5 +15,15 @@ const LOCATIONS: LocationSummary[] = [
 ];
 
 export async function GET() {
+  // Hard fail if any location is missing an id (prevents silent undefined routing)
+  for (const loc of LOCATIONS) {
+    if (!loc.id || typeof loc.id !== "string") {
+      return NextResponse.json(
+        { error: "Invalid location: missing id", badLocation: loc },
+        { status: 500 }
+      );
+    }
+  }
+
   return NextResponse.json({ locations: LOCATIONS });
 }
