@@ -2,7 +2,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BrowserProvider,
   Contract,
@@ -123,6 +123,8 @@ export default function Home() {
 
   const [address, setAddress] = useState<string | null>(null);
   const [chainIdHex, setChainIdHex] = useState<string | null>(null);
+  const addressRef = useRef<string | null>(null);
+  const chainIdHexRef = useRef<string | null>(null);
 
   const [ethBalance, setEthBalance] = useState<string | null>(null);
   const [tokenBalance, setTokenBalance] = useState<string | null>(null);
@@ -158,6 +160,14 @@ export default function Home() {
 
   const isCorrectChain =
     !!chainIdHex && chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
+
+  useEffect(() => {
+    addressRef.current = address;
+  }, [address]);
+
+  useEffect(() => {
+    chainIdHexRef.current = chainIdHex;
+  }, [chainIdHex]);
 
   useEffect(() => {
     if (!hasProvider) return;
@@ -247,6 +257,17 @@ export default function Home() {
     opacity: disabled ? 0.65 : 1,
   });
 
+  const btnRefreshNeutral = (disabled?: boolean): React.CSSProperties => ({
+    padding: "10px 14px",
+    borderRadius: 10,
+    background: "#f8fafc", // soft grey fill
+    color: COLORS.text,
+    border: "1.5px solid #cbd5e1", // darker outline
+    fontWeight: 800,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.6 : 1,
+  });
+
   const pill = (bg: string, active: boolean): React.CSSProperties => ({
     padding: "10px 14px",
     borderRadius: 10,
@@ -256,6 +277,21 @@ export default function Home() {
     fontWeight: 900,
     cursor: "pointer",
   });
+
+  function shouldSuppressWalletError(e: any) {
+    const msg = String(e?.message ?? e);
+
+    // Common user-rejection / cancellation messages across wallets
+    return (
+      msg.includes("User rejected") ||
+      msg.includes("user rejected") ||
+      msg.includes("denied") ||
+      msg.includes("rejected") ||
+      msg.includes("canceled") ||
+      msg.includes("cancelled") ||
+      msg.includes("ACTION_REJECTED") // ethers v6
+    );
+  }
 
   async function connect() {
     if (!hasProvider) {
@@ -532,7 +568,9 @@ export default function Home() {
 
       await refreshBalances();
     } catch (e: any) {
-      setError(e?.message ?? String(e));
+      if (!shouldSuppressWalletError(e)) {
+        setError(e?.message ?? String(e));
+      }
     } finally {
       setIsMinting(false);
     }
@@ -596,7 +634,9 @@ export default function Home() {
       // Refresh displayed balances
       await refreshBalances();
     } catch (e: any) {
-      setError(e?.message ?? String(e));
+      if (!shouldSuppressWalletError(e)) {
+        setError(e?.message ?? String(e));
+      }
     } finally {
       setIsDepositing(false);
     }
@@ -635,7 +675,9 @@ export default function Home() {
 
       await refreshBalances();
     } catch (e: any) {
-      setError(e?.message ?? String(e));
+      if (!shouldSuppressWalletError(e)) {
+        setError(e?.message ?? String(e));
+      }
     } finally {
       setIsWithdrawing(false);
     }
@@ -669,7 +711,7 @@ export default function Home() {
     const onAccountsChanged = (accounts: string[]) => {
       const next = accounts?.[0] ?? null;
       setAddress(next);
-      saveWallet(next, chainIdHex);
+      saveWallet(next, chainIdHexRef.current);
 
       setEthBalance(null);
       setTokenBalance(null);
@@ -681,7 +723,7 @@ export default function Home() {
 
     const onChainChanged = (c: string) => {
       setChainIdHex(c);
-      saveWallet(address, c);
+      saveWallet(addressRef.current, c);
 
       setEthBalance(null);
       setTokenBalance(null);
@@ -844,221 +886,287 @@ export default function Home() {
         </section>
 
         {/* Treasury */}
-        <section style={cardStyle}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 12,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
-            <div>
-              <div style={{ fontWeight: 900 }}>Mozi Treasury</div>
-            </div>
-
-            <button
-              onClick={refreshBalances}
-              disabled={!address || isRefreshing}
-              style={btnWarning(!address || isRefreshing)}
-            >
-              {isRefreshing ? "Refreshing…" : "Refresh"}
-            </button>
-          </div>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "220px 1fr",
-              rowGap: 8,
-              columnGap: 12,
-              padding: 12,
-              borderRadius: 12,
-              border: `1px solid ${COLORS.border}`,
-              background: "#fbfdff",
-            }}
-          >
-            <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-              Available to Withdraw ({tokenSymbol ?? cfg.tokenLabel})
-            </div>
-            <div style={{ fontWeight: 900 }}>{availableToWithdraw ?? "…"}</div>
-
-            <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-              Locked ({tokenSymbol ?? cfg.tokenLabel})
-            </div>
-            <div style={{ fontWeight: 900 }}>{lockedMnee ?? "…"}</div>
-          </div>
-
-          <div
-            style={{
-              marginTop: 2,
-              padding: 12,
-              borderRadius: 12,
-              border: `1px solid ${COLORS.border}`,
-              background: "#eef2ff",
-              display: "flex",
-              gap: 10,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ fontWeight: 900, color: "#1e3a8a" }}>
-              Fund Mozi Treasury
-            </div>
-
-            <input
-              value={depositAmount}
-              onChange={(e) => setDepositAmount(e.target.value)}
-              placeholder="Amount (e.g., 100)"
+        {address && (
+          <section style={cardStyle}>
+            <div
               style={{
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: `1px solid ${COLORS.border}`,
-                minWidth: 180,
-                outline: "none",
-                background: "#ffffff",
-                color: COLORS.text,
-                fontWeight: 700,
-                boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
               }}
-            />
-
-            <button
-              onClick={depositToTreasury}
-              disabled={
-                isDepositing ||
-                !address ||
-                !TREASURY_HUB_ADDRESS ||
-                !isCorrectChain
-              }
-              style={btnPrimary(
-                isDepositing ||
-                  !address ||
-                  !TREASURY_HUB_ADDRESS ||
-                  !isCorrectChain
-              )}
             >
-              {isDepositing ? "Depositing…" : "Deposit to Treasury"}
-            </button>
-
-            {!address && (
-              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-                (Connect wallet first)
+              <div>
+                <div style={{ fontWeight: 900 }}>Mozi Treasury</div>
               </div>
-            )}
 
-            {address && !isCorrectChain && (
-              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-                (Switch to {cfg.name} first)
-              </div>
-            )}
-          </div>
+              <button
+                onClick={refreshBalances}
+                disabled={!address || isRefreshing}
+                style={btnRefreshNeutral(!address || isRefreshing)}
+              >
+                {isRefreshing ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
 
-          <div
-            style={{
-              marginTop: 10,
-              padding: 12,
-              borderRadius: 12,
-              border: `1px solid ${COLORS.border}`,
-              background: "#fefce8",
-              display: "flex",
-              gap: 10,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ fontWeight: 900, color: "#92400e" }}>Withdraw</div>
-
-            <input
-              value={withdrawAmount}
-              onChange={(e) => setWithdrawAmount(e.target.value)}
-              placeholder="Amount (e.g., 100)"
+            <div
               style={{
-                padding: "10px 12px",
-                borderRadius: 10,
+                display: "grid",
+                gridTemplateColumns: "220px 1fr",
+                rowGap: 8,
+                columnGap: 12,
+                padding: 12,
+                borderRadius: 12,
                 border: `1px solid ${COLORS.border}`,
-                minWidth: 180,
-                outline: "none",
-                background: "#ffffff",
-                color: COLORS.text,
-                fontWeight: 700,
-                boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+                background: "#fbfdff",
               }}
-            />
+            >
+              {/* Row: Available label (left) + value (right) + denomination pill (top-right) */}
+              <div
+                style={{
+                  gridColumn: "1 / -1",
+                  display: "grid",
+                  gridTemplateColumns: "220px 1fr auto",
+                  alignItems: "center",
+                  columnGap: 12,
+                }}
+              >
+                <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                  Available to Withdraw
+                </div>
 
-            <button
-              onClick={withdrawFromTreasury}
-              disabled={
-                isWithdrawing ||
-                !address ||
-                !TREASURY_HUB_ADDRESS ||
-                !isCorrectChain
-              }
-              style={btnPrimary(
-                isWithdrawing ||
+                <div style={{ fontWeight: 900 }}>
+                  {availableToWithdraw ?? "…"}
+                </div>
+
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 800,
+                    color: COLORS.subtext,
+                    padding: "5px 9px",
+                    borderRadius: 999,
+                    border: `1px solid ${COLORS.border}`,
+                    background: "#ffffff",
+                    whiteSpace: "nowrap",
+                    justifySelf: "end",
+                  }}
+                >
+                  Denominated in {tokenSymbol ?? cfg.tokenLabel}
+                </div>
+              </div>
+              {/* Locked row: label left, value right */}
+              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                Locked
+              </div>
+              <div style={{ fontWeight: 900 }}>{lockedMnee ?? "…"}</div>
+            </div>
+
+            <div
+              style={{
+                marginTop: 2,
+                padding: 12,
+                borderRadius: 12,
+                border: `1px solid ${COLORS.border}`,
+                background: "#eef2ff",
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ fontWeight: 900, color: "#1e3a8a" }}>
+                Fund Mozi Treasury
+              </div>
+
+              <input
+                value={depositAmount}
+                onChange={(e) => setDepositAmount(e.target.value)}
+                placeholder="Amount (e.g., 100)"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: `1px solid ${COLORS.border}`,
+                  minWidth: 180,
+                  outline: "none",
+                  background: "#ffffff",
+                  color: COLORS.text,
+                  fontWeight: 700,
+                  boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+                }}
+              />
+
+              <button
+                onClick={depositToTreasury}
+                disabled={
+                  isDepositing ||
                   !address ||
                   !TREASURY_HUB_ADDRESS ||
                   !isCorrectChain
+                }
+                style={btnPrimary(
+                  isDepositing ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain
+                )}
+              >
+                {isDepositing ? "Depositing…" : "Deposit to Treasury"}
+              </button>
+
+              {!address && (
+                <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                  (Connect wallet first)
+                </div>
               )}
-            >
-              {isWithdrawing ? "Withdrawing…" : "Withdraw"}
-            </button>
 
-            <button
-              onClick={async () => {
-                if (!hasProvider || !address) return;
-                if (!isCorrectChain) {
-                  setError(`Switch to ${cfg.name} to withdraw.`);
-                  return;
-                }
-                if (!TREASURY_HUB_ADDRESS) {
-                  setError(
-                    "Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local"
-                  );
-                  return;
-                }
+              {address && !isCorrectChain && (
+                <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                  (Switch to {cfg.name} first)
+                </div>
+              )}
+            </div>
 
-                try {
-                  setError(null);
-                  setIsWithdrawing(true);
-
-                  const ethereum = (window as any).ethereum;
-                  const provider = new BrowserProvider(ethereum);
-                  const signer = await provider.getSigner();
-
-                  const hub = new Contract(
-                    TREASURY_HUB_ADDRESS,
-                    TREASURY_HUB_ABI,
-                    signer
-                  );
-                  const tx = await (hub as any).withdrawAvailable();
-                  await tx.wait();
-
-                  await refreshBalances();
-                } catch (e: any) {
-                  setError(e?.message ?? String(e));
-                } finally {
-                  setIsWithdrawing(false);
-                }
+            <div
+              style={{
+                marginTop: 10,
+                padding: 12,
+                borderRadius: 12,
+                border: `1px solid ${COLORS.border}`,
+                background: "#fefce8",
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+                flexWrap: "wrap",
               }}
-              disabled={
-                isWithdrawing ||
-                !address ||
-                !TREASURY_HUB_ADDRESS ||
-                !isCorrectChain
-              }
-              style={btnOutline(
-                isWithdrawing ||
+            >
+              <div style={{ fontWeight: 900, color: "#92400e" }}>Withdraw</div>
+
+              <input
+                value={withdrawAmount}
+                onChange={(e) => setWithdrawAmount(e.target.value)}
+                placeholder="Amount (e.g., 100)"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: `1px solid ${COLORS.border}`,
+                  minWidth: 180,
+                  outline: "none",
+                  background: "#ffffff",
+                  color: COLORS.text,
+                  fontWeight: 700,
+                  boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+                }}
+              />
+
+              <button
+                onClick={withdrawFromTreasury}
+                disabled={
+                  isWithdrawing ||
                   !address ||
                   !TREASURY_HUB_ADDRESS ||
                   !isCorrectChain
-              )}
-            >
-              Withdraw Available
-            </button>
-          </div>
-        </section>
+                }
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: COLORS.warning, // matches Withdraw section
+                  color: COLORS.buttonTextLight,
+                  border: "none",
+                  fontWeight: 900,
+                  cursor:
+                    isWithdrawing ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain
+                      ? "not-allowed"
+                      : "pointer",
+                  opacity:
+                    isWithdrawing ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain
+                      ? 0.65
+                      : 1,
+                }}
+              >
+                {isWithdrawing ? "Withdrawing…" : "Withdraw"}
+              </button>
+
+              <button
+                onClick={async () => {
+                  if (!hasProvider || !address) return;
+                  if (!isCorrectChain) {
+                    setError(`Switch to ${cfg.name} to withdraw.`);
+                    return;
+                  }
+                  if (!TREASURY_HUB_ADDRESS) {
+                    setError(
+                      "Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local"
+                    );
+                    return;
+                  }
+
+                  try {
+                    setError(null);
+                    setIsWithdrawing(true);
+
+                    const ethereum = (window as any).ethereum;
+                    const provider = new BrowserProvider(ethereum);
+                    const signer = await provider.getSigner();
+
+                    const hub = new Contract(
+                      TREASURY_HUB_ADDRESS,
+                      TREASURY_HUB_ABI,
+                      signer
+                    );
+                    const tx = await (hub as any).withdrawAvailable();
+                    await tx.wait();
+
+                    await refreshBalances();
+                  } catch (e: any) {
+                    if (!shouldSuppressWalletError(e)) {
+                      setError(e?.message ?? String(e));
+                    }
+                  } finally {
+                    setIsWithdrawing(false);
+                  }
+                }}
+                disabled={
+                  isWithdrawing ||
+                  !address ||
+                  !TREASURY_HUB_ADDRESS ||
+                  !isCorrectChain
+                }
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: "#92400e", // dark amber fill
+                  color: "#ffffff", // white text
+                  border: "none",
+                  fontWeight: 900,
+                  cursor:
+                    isWithdrawing ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain
+                      ? "not-allowed"
+                      : "pointer",
+                  opacity:
+                    isWithdrawing ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain
+                      ? 0.65
+                      : 1,
+                }}
+              >
+                Withdraw Available
+              </button>
+            </div>
+          </section>
+        )}
 
         {/* Wallet */}
         <section style={cardStyle}>
@@ -1090,21 +1198,11 @@ export default function Home() {
                 <button
                   onClick={refreshBalances}
                   disabled={isRefreshing}
-                  style={{
-                    padding: "10px 14px",
-                    borderRadius: 10,
-
-                    background: "#f8fafc", // light neutral
-                    border: `1px solid ${COLORS.border}`,
-                    color: COLORS.text,
-
-                    fontWeight: 800,
-                    cursor: isRefreshing ? "not-allowed" : "pointer",
-                    opacity: isRefreshing ? 0.6 : 1,
-                  }}
+                  style={btnRefreshNeutral(isRefreshing)}
                 >
                   {isRefreshing ? "Refreshing…" : "Refresh"}
                 </button>
+
                 <button
                   onClick={logout}
                   disabled={isSwitchingNetwork}
@@ -1179,7 +1277,7 @@ export default function Home() {
                 </div>
 
                 <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-                  ETH
+                  {env === "testing" ? "Sepolia ETH" : "ETH"}
                 </div>
                 <div style={{ fontWeight: 900 }}>{ethBalance ?? "…"}</div>
 
