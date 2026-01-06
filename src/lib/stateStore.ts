@@ -23,8 +23,18 @@ const SEED_STATE: RestaurantState = {
     criticalSkus: ["chicken_breast", "ground_beef"],
   },
   suppliers: [
-    { supplierId: "meatco", name: "MeatCo", leadTimeDays: 2 },
-    { supplierId: "produceco", name: "ProduceCo", leadTimeDays: 1 },
+    {
+      supplierId: "meatco",
+      name: "MeatCo",
+      leadTimeDays: 2,
+      payoutAddress: "0x0000000000000000000000000000000000000001",
+    },
+    {
+      supplierId: "produceco",
+      name: "ProduceCo",
+      leadTimeDays: 1,
+      payoutAddress: "0x0000000000000000000000000000000000000002",
+    },
   ],
   skus: [
     {

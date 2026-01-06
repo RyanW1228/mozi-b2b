@@ -5,6 +5,8 @@ import { useMemo, useState } from "react";
 import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { buildPaymentIntentFromPlan } from "@/lib/pricing";
+import { isAddress } from "ethers";
 
 const COLORS = {
   text: "#0f172a",
@@ -52,6 +54,9 @@ export default function LocationPage() {
   const [horizonDays, setHorizonDays] = useState<number>(7);
   const [notes, setNotes] = useState<string>("Normal week");
 
+  const [paymentIntent, setPaymentIntent] = useState<any>(null);
+  const [executeResp, setExecuteResp] = useState<any>(null);
+
   const cardStyle: React.CSSProperties = {
     marginTop: 16,
     padding: 16,
@@ -94,6 +99,8 @@ export default function LocationPage() {
     setLoading(true);
     setError("");
     setPlan(null);
+    setPaymentIntent(null);
+    setExecuteResp(null);
 
     try {
       const stateRes = await fetch(
@@ -139,6 +146,56 @@ export default function LocationPage() {
         setError(`PLAN HTTP ${res.status}\n` + JSON.stringify(data, null, 2));
       } else {
         setPlan(data as PlanOutput);
+
+        const pi = buildPaymentIntentFromPlan({
+          input,
+          plan: data as PlanOutput,
+        });
+        console.log("PAYMENT_INTENT", pi);
+        setPaymentIntent(pi);
+        setExecuteResp(null);
+
+        // --- TEMP EXECUTE STEP (calls your /api/execute route) ---
+
+        // 1) Read connected wallet address from localStorage (same key as homepage)
+        const ownerAddress =
+          typeof window !== "undefined"
+            ? window.localStorage.getItem("mozi_wallet_address")
+            : null;
+
+        // 2) Validate it
+        if (!ownerAddress || !isAddress(ownerAddress)) {
+          setError(
+            "No valid wallet found. Go to the homepage, connect wallet, then come back here."
+          );
+          return;
+        }
+
+        // 3) Call execute API with the shape it expects: { ownerAddress, paymentIntent }
+        const execRes = await fetch(
+          `/api/execute?locationId=${encodeURIComponent(locationId)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ownerAddress,
+              input, // <-- include the PlanInput
+              plan: data, // <-- include the PlanOutput (RAW from /api/plan)
+              paymentIntent: pi, // <-- keep this too (harmless + useful for debugging)
+            }),
+          }
+        );
+
+        const execJson = await execRes.json();
+        console.log("EXECUTE_RESPONSE", execJson);
+        setExecuteResp(execJson);
+
+        if (!execRes.ok) {
+          setError(
+            `EXECUTE HTTP ${execRes.status}\n` +
+              JSON.stringify(execJson, null, 2)
+          );
+        }
       }
     } catch (e: any) {
       setError(String(e));
@@ -470,6 +527,24 @@ export default function LocationPage() {
                 </div>
               ) : null}
             </section>
+
+            {paymentIntent ? (
+              <section style={{ ...cardStyle, whiteSpace: "pre-wrap" }}>
+                <div style={{ fontWeight: 950 }}>Payment Intent (debug)</div>
+                <pre style={{ margin: 0, fontSize: 12 }}>
+                  {JSON.stringify(paymentIntent, null, 2)}
+                </pre>
+              </section>
+            ) : null}
+
+            {executeResp ? (
+              <section style={{ ...cardStyle, whiteSpace: "pre-wrap" }}>
+                <div style={{ fontWeight: 950 }}>Execute Response (debug)</div>
+                <pre style={{ margin: 0, fontSize: 12 }}>
+                  {JSON.stringify(executeResp, null, 2)}
+                </pre>
+              </section>
+            ) : null}
 
             {/* Orders */}
             {plan.orders.map((order, idx) => (

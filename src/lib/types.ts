@@ -29,10 +29,11 @@ export type PlanInput = {
     supplierId: string;
     name: string;
     leadTimeDays: number;
+    payoutAddress: string; // <-- ADD THIS (EVM address where supplier will claim/receive)
     orderDaysOfWeek?: Array<
       "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
-    >; // optional
-    minOrderUsd?: number; // optional
+    >;
+    minOrderUsd?: number;
   }>;
 
   skus: Array<{
@@ -42,7 +43,9 @@ export type PlanInput = {
     unit: "each" | "lb" | "oz" | "g" | "kg" | "case";
     shelfLifeDays: number;
     supplierId: string; // who we buy it from in v1
-    unitCostUsd?: number; // optional, improves profit calc later
+
+    // EXECUTION: required for computing payment amounts
+    unitCostUsd: number; // since 1 mMNEE = $1
   }>;
 
   inventory: Array<{

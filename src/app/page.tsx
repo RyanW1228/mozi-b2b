@@ -59,6 +59,7 @@ const ERC20_READ_ABI = [
 const MOCK_MINT_ABI = ["function mint(address to, uint256 amount)"] as const;
 
 const TREASURY_HUB_ABI = [
+  "function token() view returns (address)",
   "function deposit(uint256 amount) external",
   "function withdraw(uint256 amount) external",
   "function withdrawAvailable() external",
@@ -66,6 +67,9 @@ const TREASURY_HUB_ABI = [
   "function reservedOf(address owner) view returns (uint256)",
   "function availableToWithdraw(address owner) view returns (uint256)",
   "function setAgent(address agent, bool allowed) external",
+
+  // ✅ add this
+  "function isAgentFor(address owner, address agent) view returns (bool)",
 ] as const;
 
 const ERC20_APPROVE_ABI = [
@@ -75,8 +79,11 @@ const ERC20_APPROVE_ABI = [
 const TREASURY_HUB_ADDRESS =
   process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
 
+const MOZI_AGENT_ADDRESS = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
+
 const LS_WALLET_ADDRESS = "mozi_wallet_address";
 const LS_WALLET_CHAIN = "mozi_wallet_chain";
+const LS_AUTONOMY_ENABLED = "mozi_autonomy_enabled";
 
 function saveWallet(addr: string | null, chain: string | null) {
   if (typeof window === "undefined") return;
@@ -155,6 +162,11 @@ export default function Home() {
   const [isWithdrawing, setIsWithdrawing] = useState(false);
 
   const [isDepositing, setIsDepositing] = useState(false);
+
+  const [agentEnabled, setAgentEnabled] = useState<boolean | null>(null);
+  const [isTogglingAgent, setIsTogglingAgent] = useState(false);
+
+  const AGENT_ADDRESS = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
 
   const cfg = env === "testing" ? TESTING : PRODUCTION;
 
@@ -507,6 +519,7 @@ export default function Home() {
       // Treasury token balance (how much token is in the MoziTreasury contract)
       // Treasury balances (your balance inside the HUB)
       // Treasury hub balances for THIS owner (connected wallet)
+      // Treasury hub balances for THIS owner (connected wallet)
       if (TREASURY_HUB_ADDRESS && address) {
         try {
           const hub = new Contract(
@@ -515,22 +528,31 @@ export default function Home() {
             provider
           );
 
-          const [rawAvail, rawReserved] = await Promise.all([
+          const [rawAvail, rawReserved, allowed] = await Promise.all([
             (hub as any).availableToWithdraw(address) as Promise<bigint>,
             (hub as any).reservedOf(address) as Promise<bigint>,
+            MOZI_AGENT_ADDRESS
+              ? ((hub as any).isAgentFor(
+                  address,
+                  MOZI_AGENT_ADDRESS
+                ) as Promise<boolean>)
+              : Promise.resolve(false),
           ]);
 
           setAvailableToWithdraw(
             trimTo6Decimals(formatUnits(rawAvail, decimals))
           );
           setLockedMnee(trimTo6Decimals(formatUnits(rawReserved, decimals)));
+          setAgentEnabled(Boolean(allowed));
         } catch {
           setAvailableToWithdraw(null);
           setLockedMnee(null);
+          setAgentEnabled(null);
         }
       } else {
         setAvailableToWithdraw(null);
         setLockedMnee(null);
+        setAgentEnabled(null);
       }
     } catch (e: any) {
       setError(e?.message ?? String(e));
@@ -680,6 +702,46 @@ export default function Home() {
       }
     } finally {
       setIsWithdrawing(false);
+    }
+  }
+
+  async function setAutonomy(nextAllowed: boolean) {
+    if (!hasProvider || !address) return;
+
+    if (!isCorrectChain) {
+      setError(`Switch to ${cfg.name} to change autonomy.`);
+      return;
+    }
+
+    if (!TREASURY_HUB_ADDRESS) {
+      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
+      return;
+    }
+
+    if (!MOZI_AGENT_ADDRESS) {
+      setError("Missing NEXT_PUBLIC_MOZI_AGENT_ADDRESS in .env.local");
+      return;
+    }
+
+    try {
+      setError(null);
+      setIsTogglingAgent(true);
+
+      const ethereum = (window as any).ethereum;
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+
+      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
+      const tx = await (hub as any).setAgent(MOZI_AGENT_ADDRESS, nextAllowed);
+      await tx.wait();
+
+      await refreshBalances();
+    } catch (e: any) {
+      if (!shouldSuppressWalletError(e)) {
+        setError(e?.message ?? String(e));
+      }
+    } finally {
+      setIsTogglingAgent(false);
     }
   }
 
@@ -899,6 +961,87 @@ export default function Home() {
             >
               <div>
                 <div style={{ fontWeight: 900 }}>Mozi Treasury</div>
+
+                <div
+                  style={{
+                    marginTop: 6,
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                    AI autonomy
+                  </div>
+
+                  <button
+                    onClick={() => setAutonomy(true)}
+                    disabled={
+                      isTogglingAgent ||
+                      !address ||
+                      !TREASURY_HUB_ADDRESS ||
+                      !isCorrectChain ||
+                      !MOZI_AGENT_ADDRESS ||
+                      agentEnabled === true
+                    }
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: 999,
+                      border: "1px solid #cbd5e1",
+                      background: agentEnabled === true ? "#0f172a" : "#f8fafc",
+                      color: agentEnabled === true ? "#ffffff" : COLORS.text,
+                      fontWeight: 900,
+                      cursor: "pointer",
+                      opacity:
+                        isTogglingAgent ||
+                        !isCorrectChain ||
+                        !MOZI_AGENT_ADDRESS ||
+                        agentEnabled === true
+                          ? 0.65
+                          : 1,
+                    }}
+                  >
+                    {agentEnabled === true ? "Enabled" : "Enable"}
+                  </button>
+
+                  <button
+                    onClick={() => setAutonomy(false)}
+                    disabled={
+                      isTogglingAgent ||
+                      !address ||
+                      !TREASURY_HUB_ADDRESS ||
+                      !isCorrectChain ||
+                      !MOZI_AGENT_ADDRESS ||
+                      agentEnabled === false
+                    }
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: 999,
+                      border: "1px solid #cbd5e1",
+                      background:
+                        agentEnabled === false ? "#0f172a" : "#f8fafc",
+                      color: agentEnabled === false ? "#ffffff" : COLORS.text,
+                      fontWeight: 900,
+                      cursor: "pointer",
+                      opacity:
+                        isTogglingAgent ||
+                        !isCorrectChain ||
+                        !MOZI_AGENT_ADDRESS ||
+                        agentEnabled === false
+                          ? 0.65
+                          : 1,
+                    }}
+                  >
+                    {agentEnabled === false ? "Disabled" : "Disable"}
+                  </button>
+
+                  {isTogglingAgent && (
+                    <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                      Updating…
+                    </div>
+                  )}
+                </div>
               </div>
 
               <button
