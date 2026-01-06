@@ -6,6 +6,33 @@ import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 
+const COLORS = {
+  text: "#0f172a",
+  subtext: "#64748b",
+  card: "#ffffff",
+  border: "#e5e7eb",
+
+  primary: "#2563eb",
+  buttonTextLight: "#ffffff",
+
+  dangerText: "#991b1b",
+  dangerBg: "#fef2f2",
+  dangerBorder: "#fecaca",
+
+  warnText: "#92400e",
+  warnBg: "#fffbeb",
+  warnBorder: "#fde68a",
+
+  greenText: "#065f46",
+  greenBg: "#f0fdf4",
+  greenBorder: "#bbf7d0",
+};
+
+function shortenId(id: string) {
+  if (!id) return "—";
+  return id.length <= 14 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
 export default function LocationPage() {
   const params = useParams<{ locationId: string }>();
 
@@ -24,6 +51,42 @@ export default function LocationPage() {
     useState<PlanInput["ownerPrefs"]["strategy"]>("balanced");
   const [horizonDays, setHorizonDays] = useState<number>(7);
   const [notes, setNotes] = useState<string>("Normal week");
+
+  const cardStyle: React.CSSProperties = {
+    marginTop: 16,
+    padding: 16,
+    background: COLORS.card,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 14,
+    boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  };
+
+  const btnPrimary = (disabled?: boolean): React.CSSProperties => ({
+    padding: "10px 14px",
+    borderRadius: 12,
+    background: COLORS.primary,
+    color: COLORS.buttonTextLight,
+    border: "none",
+    fontWeight: 900,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.65 : 1,
+  });
+
+  const btnSoft = (disabled?: boolean): React.CSSProperties => ({
+    padding: "10px 14px",
+    borderRadius: 12,
+    background: "rgba(255,255,255,0.75)",
+    border: `1px solid ${COLORS.border}`,
+    color: COLORS.text,
+    fontWeight: 900,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.65 : 1,
+    textDecoration: "none",
+    display: "inline-block",
+  });
 
   async function generate() {
     if (!locationId) return;
@@ -86,266 +149,482 @@ export default function LocationPage() {
 
   if (!locationId) {
     return (
-      <main style={{ padding: 24, fontFamily: "system-ui" }}>
-        <Link href="/locations" style={{ textDecoration: "none" }}>
-          ← Locations
-        </Link>
+      <div
+        style={{
+          minHeight: "100vh",
+          width: "100%",
+          backgroundColor: "#dbeafe",
+          backgroundImage: [
+            "radial-gradient(1400px 750px at 50% -220px, rgba(37,99,235,0.35) 0%, rgba(37,99,235,0.18) 42%, rgba(219,234,254,0) 75%)",
+            "radial-gradient(1100px 650px at 15% 25%, rgba(59,130,246,0.22) 0%, rgba(219,234,254,0) 62%)",
+            "linear-gradient(180deg, #dbeafe 0%, #e0e7ff 45%, #eaf2ff 100%)",
+          ].join(", "),
+          backgroundRepeat: "no-repeat",
+          backgroundSize: "200% 200%",
+          animation: "moziBgDrift 60s ease-in-out infinite",
+          display: "flex",
+          justifyContent: "center",
+          padding: "32px 16px",
+          color: COLORS.text,
+          fontFamily: "system-ui",
+        }}
+      >
+        <style>{`
+          @keyframes moziBgDrift {
+            0%   { background-position: 50% 0%, 0% 30%, 0% 0%; }
+            50%  { background-position: 60% 12%, 15% 40%, 0% 0%; }
+            100% { background-position: 50% 0%, 0% 30%, 0% 0%; }
+          }
+        `}</style>
 
-        <h1 style={{ fontSize: 28, fontWeight: 700, marginTop: 10 }}>
-          Location
-        </h1>
+        <main style={{ maxWidth: 900, width: "100%", padding: 24 }}>
+          <header
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr auto 1fr",
+              alignItems: "center",
+              marginBottom: 24,
+            }}
+          >
+            <div>
+              <Link href="/locations" style={btnSoft(false)}>
+                ← Locations
+              </Link>
+            </div>
 
-        <div style={{ marginTop: 12, color: "#a00" }}>
-          Missing locationId in route params.
-        </div>
-      </main>
+            <h1
+              style={{
+                fontSize: 30,
+                fontWeight: 950,
+                letterSpacing: -0.4,
+                margin: 0,
+                textAlign: "center",
+              }}
+            >
+              Location
+            </h1>
+
+            <div />
+          </header>
+
+          <section
+            style={{
+              ...cardStyle,
+              border: `1px solid ${COLORS.dangerBorder}`,
+              background: COLORS.dangerBg,
+              color: COLORS.dangerText,
+              fontWeight: 800,
+            }}
+          >
+            Missing locationId in route params.
+          </section>
+        </main>
+      </div>
     );
   }
 
   return (
-    <main style={{ padding: 24, fontFamily: "system-ui" }}>
-      <Link href="/locations" style={{ textDecoration: "none" }}>
-        ← Locations
-      </Link>
+    <div
+      style={{
+        minHeight: "100vh",
+        width: "100%",
+        backgroundColor: "#dbeafe",
+        backgroundImage: [
+          "radial-gradient(1400px 750px at 50% -220px, rgba(37,99,235,0.35) 0%, rgba(37,99,235,0.18) 42%, rgba(219,234,254,0) 75%)",
+          "radial-gradient(1100px 650px at 15% 25%, rgba(59,130,246,0.22) 0%, rgba(219,234,254,0) 62%)",
+          "linear-gradient(180deg, #dbeafe 0%, #e0e7ff 45%, #eaf2ff 100%)",
+        ].join(", "),
+        backgroundRepeat: "no-repeat",
+        backgroundSize: "200% 200%",
+        animation: "moziBgDrift 60s ease-in-out infinite",
+        display: "flex",
+        justifyContent: "center",
+        padding: "32px 16px",
+        color: COLORS.text,
+        fontFamily: "system-ui",
+      }}
+    >
+      <style>{`
+        @keyframes moziBgDrift {
+          0%   { background-position: 50% 0%, 0% 30%, 0% 0%; }
+          50%  { background-position: 60% 12%, 15% 40%, 0% 0%; }
+          100% { background-position: 50% 0%, 0% 30%, 0% 0%; }
+        }
+      `}</style>
 
-      <h1 style={{ fontSize: 28, fontWeight: 700, marginTop: 10 }}>
-        Location: {locationId}
-      </h1>
-
-      <p style={{ marginTop: 8, maxWidth: 700 }}>
-        Generate a purchase plan for this location via <code>/api/plan</code>.
-      </p>
-
-      <div
-        style={{
-          marginTop: 16,
-          padding: 16,
-          borderRadius: 12,
-          border: "1px solid #eee",
-          maxWidth: 700,
-          display: "grid",
-          gap: 12,
-        }}
-      >
-        <div style={{ display: "grid", gap: 6 }}>
-          <label style={{ fontWeight: 600 }}>Strategy</label>
-          <select
-            value={strategy}
-            onChange={(e) =>
-              setStrategy(e.target.value as PlanInput["ownerPrefs"]["strategy"])
-            }
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-            }}
-          >
-            <option value="min_waste">min_waste (minimize waste)</option>
-            <option value="balanced">balanced</option>
-            <option value="min_stockouts">
-              min_stockouts (avoid stockouts)
-            </option>
-          </select>
-        </div>
-
-        <div style={{ display: "grid", gap: 6 }}>
-          <label style={{ fontWeight: 600 }}>Planning horizon (days)</label>
-          <input
-            type="number"
-            min={1}
-            max={30}
-            value={horizonDays}
-            onChange={(e) => setHorizonDays(Number(e.target.value))}
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-            }}
-          />
-        </div>
-
-        <div style={{ display: "grid", gap: 6 }}>
-          <label style={{ fontWeight: 600 }}>Notes (context)</label>
-          <input
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            placeholder='e.g. "Football weekend"'
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-            }}
-          />
-        </div>
-      </div>
-
-      <div
-        style={{
-          marginTop: 16,
-          display: "flex",
-          gap: 10,
-          alignItems: "center",
-        }}
-      >
-        <button
-          onClick={generate}
-          disabled={loading}
+      <main style={{ maxWidth: 900, width: "100%", padding: 24 }}>
+        {/* Header */}
+        <header
           style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            cursor: loading ? "not-allowed" : "pointer",
-            fontWeight: 600,
+            display: "grid",
+            gridTemplateColumns: "1fr auto 1fr",
+            alignItems: "center",
+            marginBottom: 24,
           }}
         >
-          {loading ? "Generating..." : "Generate Purchase Plan"}
-        </button>
-
-        <Link
-          href={`/locations/${locationId}/inventory`}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            textDecoration: "none",
-            color: "inherit",
-            display: "inline-block",
-            fontWeight: 600,
-          }}
-        >
-          Inventory
-        </Link>
-      </div>
-
-      {error ? (
-        <pre
-          style={{
-            marginTop: 16,
-            padding: 16,
-            borderRadius: 12,
-            border: "1px solid #f3c",
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          {error}
-        </pre>
-      ) : plan ? (
-        <div style={{ marginTop: 16, display: "grid", gap: 16, maxWidth: 900 }}>
-          <div
-            style={{
-              padding: 16,
-              borderRadius: 12,
-              border: "1px solid #eee",
-              display: "grid",
-              gap: 8,
-            }}
-          >
-            <div style={{ fontWeight: 700, fontSize: 18 }}>Purchase Plan</div>
-            <div style={{ color: "#555" }}>
-              Generated: {plan.generatedAt} • Horizon: {plan.horizonDays} days
-            </div>
-
-            {plan.summary?.keyDrivers?.length ? (
-              <div style={{ marginTop: 8 }}>
-                <div style={{ fontWeight: 600 }}>Key drivers</div>
-                <ul style={{ marginTop: 6 }}>
-                  {plan.summary.keyDrivers.map((d, i) => (
-                    <li key={i}>{d}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            {plan.summary?.warnings?.length ? (
-              <div style={{ marginTop: 8 }}>
-                <div style={{ fontWeight: 600 }}>Warnings</div>
-                <ul style={{ marginTop: 6 }}>
-                  {plan.summary.warnings.map((w, i) => (
-                    <li key={i} style={{ color: "#a00" }}>
-                      {w}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
+          <div style={{ display: "flex", gap: 10 }}>
+            <Link href="/locations" style={btnSoft(false)}>
+              ← Locations
+            </Link>
           </div>
 
-          {plan.orders.map((order, idx) => (
+          <div style={{ textAlign: "center" }}>
             <div
-              key={idx}
               style={{
-                padding: 16,
-                borderRadius: 12,
-                border: "1px solid #eee",
+                fontSize: 30,
+                fontWeight: 950,
+                letterSpacing: -0.4,
+                margin: 0,
               }}
             >
-              <div style={{ fontWeight: 800 }}>
-                Supplier: {order.supplierId}
-              </div>
-              <div style={{ color: "#555", marginTop: 4 }}>
-                Order date: {order.orderDate}
+              Location
+            </div>
+            <div
+              style={{ marginTop: 6, color: COLORS.subtext, fontWeight: 800 }}
+            >
+              {shortenId(locationId)}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <Link
+              href={`/locations/${locationId}/inventory`}
+              style={btnSoft(false)}
+            >
+              Inventory
+            </Link>
+          </div>
+        </header>
+
+        {/* Controls */}
+        <section style={cardStyle}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 950 }}>Generate purchase plan</div>
+            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+              Deterministic controls → /api/plan
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 12,
+            }}
+          >
+            <div style={{ display: "grid", gap: 6 }}>
+              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
+                Strategy
+              </label>
+              <select
+                value={strategy}
+                onChange={(e) =>
+                  setStrategy(
+                    e.target.value as PlanInput["ownerPrefs"]["strategy"]
+                  )
+                }
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "rgba(255,255,255,0.85)",
+                  color: COLORS.text,
+                  fontWeight: 800,
+                  outline: "none",
+                }}
+              >
+                <option value="min_waste">min_waste (minimize waste)</option>
+                <option value="balanced">balanced</option>
+                <option value="min_stockouts">
+                  min_stockouts (avoid stockouts)
+                </option>
+              </select>
+            </div>
+
+            <div style={{ display: "grid", gap: 6 }}>
+              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
+                Planning horizon (days)
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={horizonDays}
+                onChange={(e) => setHorizonDays(Number(e.target.value))}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "rgba(255,255,255,0.85)",
+                  color: COLORS.text,
+                  fontWeight: 800,
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            <div style={{ display: "grid", gap: 6, gridColumn: "1 / -1" }}>
+              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
+                Notes (context)
+              </label>
+              <input
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder='e.g. "Football weekend"'
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "rgba(255,255,255,0.85)",
+                  color: COLORS.text,
+                  fontWeight: 800,
+                  outline: "none",
+                }}
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              gap: 10,
+              alignItems: "center",
+              justifyContent: "flex-end",
+              flexWrap: "wrap",
+              paddingTop: 4,
+            }}
+          >
+            <button
+              onClick={generate}
+              disabled={loading}
+              style={btnPrimary(loading)}
+            >
+              {loading ? "Generating…" : "Generate Plan"}
+            </button>
+          </div>
+        </section>
+
+        {/* Error */}
+        {error ? (
+          <section
+            style={{
+              ...cardStyle,
+              border: `1px solid ${COLORS.dangerBorder}`,
+              background: COLORS.dangerBg,
+              color: COLORS.dangerText,
+              fontWeight: 800,
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {error}
+          </section>
+        ) : plan ? (
+          <div style={{ marginTop: 16, display: "grid", gap: 16 }}>
+            {/* Summary */}
+            <section style={cardStyle}>
+              <div style={{ fontWeight: 950, fontSize: 18 }}>Purchase Plan</div>
+              <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                Generated: {plan.generatedAt} • Horizon: {plan.horizonDays} days
               </div>
 
-              <div style={{ marginTop: 12, overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", padding: 8 }}>SKU</th>
-                      <th style={{ textAlign: "right", padding: 8 }}>Units</th>
-                      <th style={{ textAlign: "left", padding: 8 }}>Risk</th>
-                      <th style={{ textAlign: "right", padding: 8 }}>Conf.</th>
-                      <th style={{ textAlign: "left", padding: 8 }}>Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {order.items.map((it, j) => (
-                      <tr key={j}>
-                        <td
-                          style={{ padding: 8, borderTop: "1px solid #f5f5f5" }}
-                        >
-                          {it.sku}
-                        </td>
-                        <td
-                          style={{
-                            padding: 8,
-                            borderTop: "1px solid #f5f5f5",
-                            textAlign: "right",
-                          }}
-                        >
-                          {it.orderUnits}
-                        </td>
-                        <td
-                          style={{ padding: 8, borderTop: "1px solid #f5f5f5" }}
-                        >
-                          {it.riskNote ?? "—"}
-                        </td>
-                        <td
-                          style={{
-                            padding: 8,
-                            borderTop: "1px solid #f5f5f5",
-                            textAlign: "right",
-                          }}
-                        >
-                          {typeof it.confidence === "number"
-                            ? it.confidence.toFixed(2)
-                            : "—"}
-                        </td>
-                        <td
-                          style={{ padding: 8, borderTop: "1px solid #f5f5f5" }}
-                        >
-                          {it.reason}
-                        </td>
-                      </tr>
+              {plan.summary?.keyDrivers?.length ? (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ fontWeight: 900 }}>Key drivers</div>
+                  <ul style={{ marginTop: 8, color: COLORS.text }}>
+                    {plan.summary.keyDrivers.map((d, i) => (
+                      <li key={i} style={{ marginTop: 6 }}>
+                        {d}
+                      </li>
                     ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div style={{ marginTop: 16, color: "#555" }}>No output yet.</div>
-      )}
-    </main>
+                  </ul>
+                </div>
+              ) : null}
+
+              {plan.summary?.warnings?.length ? (
+                <div
+                  style={{
+                    marginTop: 8,
+                    padding: 12,
+                    borderRadius: 12,
+                    border: `1px solid ${COLORS.warnBorder}`,
+                    background: COLORS.warnBg,
+                    color: COLORS.warnText,
+                  }}
+                >
+                  <div style={{ fontWeight: 900 }}>Warnings</div>
+                  <ul style={{ marginTop: 8 }}>
+                    {plan.summary.warnings.map((w, i) => (
+                      <li key={i} style={{ marginTop: 6 }}>
+                        {w}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </section>
+
+            {/* Orders */}
+            {plan.orders.map((order, idx) => (
+              <section key={idx} style={cardStyle}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
+                    alignItems: "baseline",
+                  }}
+                >
+                  <div style={{ fontWeight: 950 }}>
+                    Supplier:{" "}
+                    <span
+                      style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
+                    >
+                      {order.supplierId}
+                    </span>
+                  </div>
+                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                    Order date: {order.orderDate}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 10,
+                    overflowX: "auto",
+                    border: `1px solid ${COLORS.border}`,
+                    borderRadius: 12,
+                    background: "rgba(255,255,255,0.75)",
+                  }}
+                >
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            fontWeight: 950,
+                          }}
+                        >
+                          SKU
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "right",
+                            padding: 12,
+                            fontWeight: 950,
+                          }}
+                        >
+                          Units
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            fontWeight: 950,
+                          }}
+                        >
+                          Risk
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "right",
+                            padding: 12,
+                            fontWeight: 950,
+                          }}
+                        >
+                          Conf.
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            fontWeight: 950,
+                          }}
+                        >
+                          Reason
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {order.items.map((it, j) => (
+                        <tr key={j}>
+                          <td
+                            style={{
+                              padding: 12,
+                              borderTop: "1px solid #eef2f7",
+                            }}
+                          >
+                            {it.sku}
+                          </td>
+                          <td
+                            style={{
+                              padding: 12,
+                              borderTop: "1px solid #eef2f7",
+                              textAlign: "right",
+                              fontWeight: 900,
+                            }}
+                          >
+                            {it.orderUnits}
+                          </td>
+                          <td
+                            style={{
+                              padding: 12,
+                              borderTop: "1px solid #eef2f7",
+                            }}
+                          >
+                            {it.riskNote ?? "—"}
+                          </td>
+                          <td
+                            style={{
+                              padding: 12,
+                              borderTop: "1px solid #eef2f7",
+                              textAlign: "right",
+                            }}
+                          >
+                            {typeof it.confidence === "number"
+                              ? it.confidence.toFixed(2)
+                              : "—"}
+                          </td>
+                          <td
+                            style={{
+                              padding: 12,
+                              borderTop: "1px solid #eef2f7",
+                            }}
+                          >
+                            {it.reason}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            ))}
+          </div>
+        ) : (
+          <section
+            style={{
+              ...cardStyle,
+              border: `1px solid ${COLORS.greenBorder}`,
+              background: COLORS.greenBg,
+              color: COLORS.greenText,
+              fontWeight: 900,
+            }}
+          >
+            No output yet — generate a plan to see proposed orders.
+          </section>
+        )}
+      </main>
+    </div>
   );
 }
