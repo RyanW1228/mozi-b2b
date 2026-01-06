@@ -58,6 +58,44 @@ const ERC20_READ_ABI = [
 
 const MOCK_MINT_ABI = ["function mint(address to, uint256 amount)"] as const;
 
+const TREASURY_HUB_ABI = [
+  "function deposit(uint256 amount) external",
+  "function withdraw(uint256 amount) external",
+  "function withdrawAvailable() external",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function reservedOf(address owner) view returns (uint256)",
+  "function availableToWithdraw(address owner) view returns (uint256)",
+  "function setAgent(address agent, bool allowed) external",
+] as const;
+
+const ERC20_APPROVE_ABI = [
+  "function approve(address spender, uint256 amount) returns (bool)",
+] as const;
+
+const TREASURY_HUB_ADDRESS =
+  process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
+
+const LS_WALLET_ADDRESS = "mozi_wallet_address";
+const LS_WALLET_CHAIN = "mozi_wallet_chain";
+
+function saveWallet(addr: string | null, chain: string | null) {
+  if (typeof window === "undefined") return;
+  if (addr) window.localStorage.setItem(LS_WALLET_ADDRESS, addr);
+  else window.localStorage.removeItem(LS_WALLET_ADDRESS);
+
+  if (chain) window.localStorage.setItem(LS_WALLET_CHAIN, chain);
+  else window.localStorage.removeItem(LS_WALLET_CHAIN);
+}
+
+function loadWallet() {
+  if (typeof window === "undefined")
+    return { addr: null as string | null, chain: null as string | null };
+  return {
+    addr: window.localStorage.getItem(LS_WALLET_ADDRESS),
+    chain: window.localStorage.getItem(LS_WALLET_CHAIN),
+  };
+}
+
 function shorten(addr: string) {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
@@ -101,10 +139,67 @@ export default function Home() {
   const [mintAmount, setMintAmount] = useState<string>("1000");
   const [isMinting, setIsMinting] = useState(false);
 
+  // Treasury UI
+  const [availableToWithdraw, setAvailableToWithdraw] = useState<string | null>(
+    null
+  );
+  const [lockedMnee, setLockedMnee] = useState<string | null>(null);
+
+  const [treasuryAvailable, setTreasuryAvailable] = useState<string | null>(
+    null
+  );
+  const [depositAmount, setDepositAmount] = useState<string>("100");
+  const [withdrawAmount, setWithdrawAmount] = useState<string>("100");
+  const [isWithdrawing, setIsWithdrawing] = useState(false);
+
+  const [isDepositing, setIsDepositing] = useState(false);
+
   const cfg = env === "testing" ? TESTING : PRODUCTION;
 
   const isCorrectChain =
     !!chainIdHex && chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
+
+  useEffect(() => {
+    if (!hasProvider) return;
+
+    const ethereum = (window as any).ethereum;
+
+    (async () => {
+      const saved = loadWallet();
+      if (!saved.addr) return;
+
+      try {
+        // IMPORTANT: confirm the wallet is actually connected to this site
+        const accounts: string[] = await ethereum.request({
+          method: "eth_accounts",
+        });
+        const normalized = accounts.map((x) => x.toLowerCase());
+        const ok = normalized.includes(saved.addr.toLowerCase());
+
+        if (!ok) {
+          // saved address is stale (user disconnected / switched browser / etc.)
+          saveWallet(null, null);
+          return;
+        }
+
+        const c: string = await ethereum.request({ method: "eth_chainId" });
+
+        setAddress(saved.addr);
+        setChainIdHex(c);
+        saveWallet(saved.addr, c);
+
+        // optional: refresh once restored
+        setEthBalance(null);
+        setTokenBalance(null);
+        setTokenSymbol(null);
+        await refreshBalances();
+      } catch {
+        // If anything fails, just clear saved state
+        saveWallet(null, null);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasProvider]);
 
   // Shared styles
   const cardStyle: React.CSSProperties = {
@@ -141,6 +236,17 @@ export default function Home() {
     opacity: disabled ? 0.65 : 1,
   });
 
+  const btnWarning = (disabled?: boolean): React.CSSProperties => ({
+    padding: "10px 14px",
+    borderRadius: 10,
+    background: COLORS.warning,
+    color: COLORS.buttonTextLight,
+    border: "none",
+    fontWeight: 900,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.65 : 1,
+  });
+
   const pill = (bg: string, active: boolean): React.CSSProperties => ({
     padding: "10px 14px",
     borderRadius: 10,
@@ -171,9 +277,22 @@ export default function Home() {
           params: [{ eth_accounts: {} }],
         });
       } catch (permErr: any) {
-        // If user cancels the permissions prompt, stop cleanly.
-        setError(permErr?.message ?? "Wallet connection canceled.");
-        return;
+        // Some wallets/providers don't support this method. If it's unsupported,
+        // just continue to eth_requestAccounts instead of failing.
+        const msg = String(permErr?.message ?? permErr);
+
+        const unsupported =
+          msg.includes("wallet_requestPermissions") ||
+          msg.includes("Method not found") ||
+          msg.includes("does not exist") ||
+          msg.includes("-32601");
+
+        if (!unsupported) {
+          // User likely canceled / rejected permissions prompt
+          setError(permErr?.message ?? "Wallet connection canceled.");
+          return;
+        }
+        // else: ignore and continue
       }
 
       const accounts: string[] = await ethereum.request({
@@ -185,6 +304,7 @@ export default function Home() {
 
       setAddress(a);
       setChainIdHex(c);
+      saveWallet(a, c);
 
       // Optional: immediately refresh once connected
       if (a) {
@@ -208,6 +328,7 @@ export default function Home() {
     setTokenBalance(null);
     setTokenSymbol(null);
     setError(null);
+    saveWallet(null, null);
   }
 
   async function switchToEnvChain(mode: "auto" | "manual" = "manual") {
@@ -321,14 +442,60 @@ export default function Home() {
 
       const token = new Contract(cfg.tokenAddress, ERC20_READ_ABI, provider);
 
-      const [decimals, symbol, raw] = await Promise.all([
-        token.decimals() as Promise<number>,
-        token.symbol() as Promise<string>,
-        token.balanceOf(address) as Promise<bigint>,
-      ]);
+      // Be defensive: some ABIs / ethers setups can make decimals() unavailable at runtime.
+      // Fallback to 18 + cfg.tokenLabel so Refresh never crashes.
+      let decimals = 18;
+      let symbol = cfg.tokenLabel;
+
+      try {
+        if (typeof (token as any).decimals === "function") {
+          decimals = await (token as any).decimals();
+        }
+      } catch {
+        decimals = 18;
+      }
+
+      try {
+        if (typeof (token as any).symbol === "function") {
+          symbol = await (token as any).symbol();
+        }
+      } catch {
+        symbol = cfg.tokenLabel;
+      }
+
+      const raw = (await token.balanceOf(address)) as bigint;
 
       setTokenSymbol(symbol || cfg.tokenLabel);
       setTokenBalance(trimTo6Decimals(formatUnits(raw, decimals)));
+
+      // Treasury token balance (how much token is in the MoziTreasury contract)
+      // Treasury balances (your balance inside the HUB)
+      // Treasury hub balances for THIS owner (connected wallet)
+      if (TREASURY_HUB_ADDRESS && address) {
+        try {
+          const hub = new Contract(
+            TREASURY_HUB_ADDRESS,
+            TREASURY_HUB_ABI,
+            provider
+          );
+
+          const [rawAvail, rawReserved] = await Promise.all([
+            (hub as any).availableToWithdraw(address) as Promise<bigint>,
+            (hub as any).reservedOf(address) as Promise<bigint>,
+          ]);
+
+          setAvailableToWithdraw(
+            trimTo6Decimals(formatUnits(rawAvail, decimals))
+          );
+          setLockedMnee(trimTo6Decimals(formatUnits(rawReserved, decimals)));
+        } catch {
+          setAvailableToWithdraw(null);
+          setLockedMnee(null);
+        }
+      } else {
+        setAvailableToWithdraw(null);
+        setLockedMnee(null);
+      }
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -371,6 +538,109 @@ export default function Home() {
     }
   }
 
+  async function depositToTreasury() {
+    // Only makes sense when connected
+    if (!hasProvider || !address) return;
+
+    // Must be on correct chain for the selected env
+    if (!isCorrectChain) {
+      setError(`Switch to ${cfg.name} to deposit.`);
+      return;
+    }
+
+    // Must have token + treasury configured
+    if (!cfg.tokenAddress) {
+      setError(
+        env === "testing"
+          ? "Missing NEXT_PUBLIC_MOCK_MNEE_ADDRESS in .env.local"
+          : "Missing NEXT_PUBLIC_MNEE_MAINNET_ADDRESS in .env.local"
+      );
+      return;
+    }
+
+    if (!TREASURY_HUB_ADDRESS) {
+      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
+      return;
+    }
+
+    try {
+      setError(null);
+      setIsDepositing(true);
+
+      const ethereum = (window as any).ethereum;
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+
+      // IMPORTANT: we assume 18 decimals (MockMNEE should be 18)
+      const amt = parseUnits(depositAmount || "0", 18);
+      if (amt <= BigInt(0)) {
+        setError("Deposit amount must be > 0");
+        return;
+      }
+
+      // 1) Approve treasury to pull tokens
+      const token = new Contract(
+        cfg.tokenAddress,
+        ["function approve(address,uint256) returns (bool)"],
+        signer
+      );
+      const approveTx = await (token as any).approve(TREASURY_HUB_ADDRESS, amt);
+      await approveTx.wait();
+
+      // 2) Deposit into treasury (treasury pulls via transferFrom)
+      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
+      const depTx = await (hub as any).deposit(amt);
+
+      await depTx.wait();
+
+      // Refresh displayed balances
+      await refreshBalances();
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setIsDepositing(false);
+    }
+  }
+
+  async function withdrawFromTreasury() {
+    if (!hasProvider || !address) return;
+
+    if (!isCorrectChain) {
+      setError(`Switch to ${cfg.name} to withdraw.`);
+      return;
+    }
+
+    if (!TREASURY_HUB_ADDRESS) {
+      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
+      return;
+    }
+
+    try {
+      setError(null);
+      setIsWithdrawing(true);
+
+      const ethereum = (window as any).ethereum;
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+
+      const amt = parseUnits(withdrawAmount || "0", 18);
+      if (amt <= BigInt(0)) {
+        setError("Withdraw amount must be > 0");
+        return;
+      }
+
+      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
+      const tx = await (hub as any).withdraw(amt);
+      await tx.wait();
+
+      await refreshBalances();
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setIsWithdrawing(false);
+    }
+  }
+
   // Persist env choice locally (UI-only toggle)
   useEffect(() => {
     const saved =
@@ -399,25 +669,26 @@ export default function Home() {
     const onAccountsChanged = (accounts: string[]) => {
       const next = accounts?.[0] ?? null;
       setAddress(next);
-      if (next) refreshBalances();
+      saveWallet(next, chainIdHex);
+
       setEthBalance(null);
       setTokenBalance(null);
       setTokenSymbol(null);
       setError(null);
+
+      if (next) refreshBalances();
     };
 
     const onChainChanged = (c: string) => {
       setChainIdHex(c);
+      saveWallet(address, c);
+
       setEthBalance(null);
       setTokenBalance(null);
       setTokenSymbol(null);
       setError(null);
 
-      // Don’t flash the button; refresh immediately.
       setShowSwitchNetwork(false);
-
-      // Refresh balances for the new chain
-      // (safe: refreshBalances checks address/hasProvider)
       refreshBalances();
     };
 
@@ -572,6 +843,223 @@ export default function Home() {
           )}
         </section>
 
+        {/* Treasury */}
+        <section style={cardStyle}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 900 }}>Mozi Treasury</div>
+            </div>
+
+            <button
+              onClick={refreshBalances}
+              disabled={!address || isRefreshing}
+              style={btnWarning(!address || isRefreshing)}
+            >
+              {isRefreshing ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "220px 1fr",
+              rowGap: 8,
+              columnGap: 12,
+              padding: 12,
+              borderRadius: 12,
+              border: `1px solid ${COLORS.border}`,
+              background: "#fbfdff",
+            }}
+          >
+            <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+              Available to Withdraw ({tokenSymbol ?? cfg.tokenLabel})
+            </div>
+            <div style={{ fontWeight: 900 }}>{availableToWithdraw ?? "…"}</div>
+
+            <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+              Locked ({tokenSymbol ?? cfg.tokenLabel})
+            </div>
+            <div style={{ fontWeight: 900 }}>{lockedMnee ?? "…"}</div>
+          </div>
+
+          <div
+            style={{
+              marginTop: 2,
+              padding: 12,
+              borderRadius: 12,
+              border: `1px solid ${COLORS.border}`,
+              background: "#eef2ff",
+              display: "flex",
+              gap: 10,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 900, color: "#1e3a8a" }}>
+              Fund Mozi Treasury
+            </div>
+
+            <input
+              value={depositAmount}
+              onChange={(e) => setDepositAmount(e.target.value)}
+              placeholder="Amount (e.g., 100)"
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: `1px solid ${COLORS.border}`,
+                minWidth: 180,
+                outline: "none",
+                background: "#ffffff",
+                color: COLORS.text,
+                fontWeight: 700,
+                boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+              }}
+            />
+
+            <button
+              onClick={depositToTreasury}
+              disabled={
+                isDepositing ||
+                !address ||
+                !TREASURY_HUB_ADDRESS ||
+                !isCorrectChain
+              }
+              style={btnPrimary(
+                isDepositing ||
+                  !address ||
+                  !TREASURY_HUB_ADDRESS ||
+                  !isCorrectChain
+              )}
+            >
+              {isDepositing ? "Depositing…" : "Deposit to Treasury"}
+            </button>
+
+            {!address && (
+              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                (Connect wallet first)
+              </div>
+            )}
+
+            {address && !isCorrectChain && (
+              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
+                (Switch to {cfg.name} first)
+              </div>
+            )}
+          </div>
+
+          <div
+            style={{
+              marginTop: 10,
+              padding: 12,
+              borderRadius: 12,
+              border: `1px solid ${COLORS.border}`,
+              background: "#fefce8",
+              display: "flex",
+              gap: 10,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 900, color: "#92400e" }}>Withdraw</div>
+
+            <input
+              value={withdrawAmount}
+              onChange={(e) => setWithdrawAmount(e.target.value)}
+              placeholder="Amount (e.g., 100)"
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: `1px solid ${COLORS.border}`,
+                minWidth: 180,
+                outline: "none",
+                background: "#ffffff",
+                color: COLORS.text,
+                fontWeight: 700,
+                boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+              }}
+            />
+
+            <button
+              onClick={withdrawFromTreasury}
+              disabled={
+                isWithdrawing ||
+                !address ||
+                !TREASURY_HUB_ADDRESS ||
+                !isCorrectChain
+              }
+              style={btnPrimary(
+                isWithdrawing ||
+                  !address ||
+                  !TREASURY_HUB_ADDRESS ||
+                  !isCorrectChain
+              )}
+            >
+              {isWithdrawing ? "Withdrawing…" : "Withdraw"}
+            </button>
+
+            <button
+              onClick={async () => {
+                if (!hasProvider || !address) return;
+                if (!isCorrectChain) {
+                  setError(`Switch to ${cfg.name} to withdraw.`);
+                  return;
+                }
+                if (!TREASURY_HUB_ADDRESS) {
+                  setError(
+                    "Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local"
+                  );
+                  return;
+                }
+
+                try {
+                  setError(null);
+                  setIsWithdrawing(true);
+
+                  const ethereum = (window as any).ethereum;
+                  const provider = new BrowserProvider(ethereum);
+                  const signer = await provider.getSigner();
+
+                  const hub = new Contract(
+                    TREASURY_HUB_ADDRESS,
+                    TREASURY_HUB_ABI,
+                    signer
+                  );
+                  const tx = await (hub as any).withdrawAvailable();
+                  await tx.wait();
+
+                  await refreshBalances();
+                } catch (e: any) {
+                  setError(e?.message ?? String(e));
+                } finally {
+                  setIsWithdrawing(false);
+                }
+              }}
+              disabled={
+                isWithdrawing ||
+                !address ||
+                !TREASURY_HUB_ADDRESS ||
+                !isCorrectChain
+              }
+              style={btnOutline(
+                isWithdrawing ||
+                  !address ||
+                  !TREASURY_HUB_ADDRESS ||
+                  !isCorrectChain
+              )}
+            >
+              Withdraw Available
+            </button>
+          </div>
+        </section>
+
         {/* Wallet */}
         <section style={cardStyle}>
           <div
@@ -675,7 +1163,7 @@ export default function Home() {
                     fontWeight: 800,
                   }}
                 >
-                  {shorten(address)}
+                  {address}
                 </div>
 
                 <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
