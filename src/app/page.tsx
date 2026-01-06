@@ -9,6 +9,7 @@ import {
   formatEther,
   formatUnits,
   parseUnits,
+  isAddress,
 } from "ethers";
 
 const COLORS = {
@@ -166,6 +167,9 @@ export default function Home() {
   const [agentEnabled, setAgentEnabled] = useState<boolean | null>(null);
   const [isTogglingAgent, setIsTogglingAgent] = useState(false);
 
+  const [showAutonomyInfo, setShowAutonomyInfo] = useState(false);
+  const autonomyInfoWrapRef = useRef<HTMLDivElement | null>(null);
+
   const AGENT_ADDRESS = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
 
   const cfg = env === "testing" ? TESTING : PRODUCTION;
@@ -176,6 +180,30 @@ export default function Home() {
   useEffect(() => {
     addressRef.current = address;
   }, [address]);
+
+  useEffect(() => {
+    function onDown(e: MouseEvent | TouchEvent) {
+      if (!showAutonomyInfo) return;
+      const el = autonomyInfoWrapRef.current;
+      if (!el) return;
+      if (e.target instanceof Node && el.contains(e.target)) return;
+      setShowAutonomyInfo(false);
+    }
+
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setShowAutonomyInfo(false);
+    }
+
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("touchstart", onDown);
+    document.addEventListener("keydown", onKey);
+
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("touchstart", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [showAutonomyInfo]);
 
   useEffect(() => {
     chainIdHexRef.current = chainIdHex;
@@ -516,11 +544,26 @@ export default function Home() {
       setTokenSymbol(symbol || cfg.tokenLabel);
       setTokenBalance(trimTo6Decimals(formatUnits(raw, decimals)));
 
-      // Treasury token balance (how much token is in the MoziTreasury contract)
-      // Treasury balances (your balance inside the HUB)
-      // Treasury hub balances for THIS owner (connected wallet)
-      // Treasury hub balances for THIS owner (connected wallet)
       if (TREASURY_HUB_ADDRESS && address) {
+        // ✅ Validate addresses BEFORE passing them to ethers
+        if (!isAddress(TREASURY_HUB_ADDRESS)) {
+          setAvailableToWithdraw(null);
+          setLockedMnee(null);
+          setAgentEnabled(null);
+          setError(`Invalid TREASURY_HUB_ADDRESS: ${TREASURY_HUB_ADDRESS}`);
+          return;
+        }
+
+        const agentOk = MOZI_AGENT_ADDRESS
+          ? isAddress(MOZI_AGENT_ADDRESS)
+          : false;
+        if (MOZI_AGENT_ADDRESS && !agentOk) {
+          // Still allow showing balances; just treat autonomy as unknown.
+          setAgentEnabled(null);
+          setError(`Invalid MOZI_AGENT_ADDRESS: ${MOZI_AGENT_ADDRESS}`);
+          // Do NOT return; continue reading balances without isAgentFor
+        }
+
         try {
           const hub = new Contract(
             TREASURY_HUB_ADDRESS,
@@ -531,7 +574,7 @@ export default function Home() {
           const [rawAvail, rawReserved, allowed] = await Promise.all([
             (hub as any).availableToWithdraw(address) as Promise<bigint>,
             (hub as any).reservedOf(address) as Promise<bigint>,
-            MOZI_AGENT_ADDRESS
+            agentOk
               ? ((hub as any).isAgentFor(
                   address,
                   MOZI_AGENT_ADDRESS
@@ -544,10 +587,13 @@ export default function Home() {
           );
           setLockedMnee(trimTo6Decimals(formatUnits(rawReserved, decimals)));
           setAgentEnabled(Boolean(allowed));
-        } catch {
+        } catch (e: any) {
           setAvailableToWithdraw(null);
           setLockedMnee(null);
           setAgentEnabled(null);
+
+          const msg = e?.shortMessage || e?.reason || e?.message || String(e);
+          setError(`Treasury read failed: ${msg}`);
         }
       } else {
         setAvailableToWithdraw(null);
@@ -947,6 +993,232 @@ export default function Home() {
           )}
         </section>
 
+        {/* AI Autonomy */}
+        {address && (
+          <section style={cardStyle}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontWeight: 900 }}>AI Autonomy</div>
+
+                {/* Info bubble + popover */}
+                <div
+                  ref={autonomyInfoWrapRef}
+                  style={{
+                    position: "relative",
+                    display: "inline-flex",
+                    alignItems: "center",
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setShowAutonomyInfo((v) => !v)}
+                    aria-label="What does AI autonomy mean?"
+                    aria-expanded={showAutonomyInfo}
+                    style={{
+                      width: 20,
+                      height: 20,
+                      borderRadius: "50%",
+                      background: "#e5e7eb",
+                      color: "#1f2937",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 12,
+                      fontWeight: 900,
+                      cursor: "pointer",
+                      userSelect: "none",
+                      border: "1px solid #cbd5e1",
+                      padding: 0,
+                      lineHeight: "20px",
+                    }}
+                  >
+                    ?
+                  </button>
+
+                  {showAutonomyInfo && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        top: 28,
+                        left: 0,
+                        zIndex: 50,
+                        width: 320,
+                        maxWidth: "min(320px, 80vw)",
+                        background: "#ffffff",
+                        border: "1px solid #e5e7eb",
+                        borderRadius: 12,
+                        boxShadow: "0 10px 20px rgba(0,0,0,0.12)",
+                        padding: 12,
+                      }}
+                    >
+                      {/* Little arrow */}
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: -6,
+                          left: 10,
+                          width: 12,
+                          height: 12,
+                          background: "#ffffff",
+                          borderLeft: "1px solid #e5e7eb",
+                          borderTop: "1px solid #e5e7eb",
+                          transform: "rotate(45deg)",
+                        }}
+                      />
+
+                      <div style={{ fontWeight: 900, marginBottom: 6 }}>
+                        What happens?
+                      </div>
+
+                      <div
+                        style={{
+                          color: COLORS.subtext,
+                          fontWeight: 700,
+                          fontSize: 13,
+                        }}
+                      >
+                        When enabled, Mozi can reserve funds and execute
+                        payments after the pending window unless you cancel/edit
+                        the order before execution.
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 10,
+                          display: "flex",
+                          justifyContent: "flex-end",
+                        }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setShowAutonomyInfo(false)}
+                          style={{
+                            padding: "8px 12px",
+                            borderRadius: 10,
+                            border: "none",
+                            background: COLORS.danger, // red fill
+                            color: COLORS.buttonTextLight, // white text
+                            fontWeight: 900,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Close
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                {agentEnabled === null ? (
+                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                    Loading…
+                  </div>
+                ) : (
+                  <div style={{ color: COLORS.subtext, fontWeight: 900 }}>
+                    {agentEnabled ? "Enabled" : "Disabled"}
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setAutonomy(agentEnabled ? false : true)}
+                  disabled={
+                    isTogglingAgent ||
+                    !address ||
+                    !TREASURY_HUB_ADDRESS ||
+                    !isCorrectChain ||
+                    !MOZI_AGENT_ADDRESS
+                  }
+                  style={{
+                    width: 58,
+                    height: 34,
+                    borderRadius: 999,
+                    border: "1px solid #cbd5e1",
+                    background: agentEnabled ? "#0f172a" : "#e5e7eb",
+                    padding: 4,
+                    cursor:
+                      isTogglingAgent ||
+                      !TREASURY_HUB_ADDRESS ||
+                      !isCorrectChain ||
+                      !MOZI_AGENT_ADDRESS
+                        ? "not-allowed"
+                        : "pointer",
+                    opacity:
+                      isTogglingAgent ||
+                      !TREASURY_HUB_ADDRESS ||
+                      !isCorrectChain ||
+                      !MOZI_AGENT_ADDRESS
+                        ? 0.6
+                        : 1,
+                    transition: "background 150ms ease",
+                    position: "relative",
+                  }}
+                  aria-label="Toggle AI autonomy"
+                >
+                  <div
+                    style={{
+                      width: 26,
+                      height: 26,
+                      borderRadius: 999,
+                      background: "#ffffff",
+                      position: "absolute",
+                      top: 3,
+                      left: agentEnabled ? 29 : 3,
+                      transition: "left 150ms ease",
+                      boxShadow: "0 1px 2px rgba(0,0,0,0.12)",
+                    }}
+                  />
+                </button>
+
+                {isTogglingAgent && (
+                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                    Updating…
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {!isCorrectChain && (
+              <div
+                style={{
+                  color: "#92400e",
+                  background: "#fffbeb",
+                  border: "1px solid #fde68a",
+                  padding: 10,
+                  borderRadius: 12,
+                  fontWeight: 700,
+                }}
+              >
+                Switch to <b>{cfg.name}</b> to change autonomy.
+              </div>
+            )}
+
+            {!MOZI_AGENT_ADDRESS && (
+              <div
+                style={{
+                  color: "#92400e",
+                  background: "#fffbeb",
+                  border: "1px solid #fde68a",
+                  padding: 10,
+                  borderRadius: 12,
+                  fontWeight: 700,
+                }}
+              >
+                Missing <b>NEXT_PUBLIC_MOZI_AGENT_ADDRESS</b> in .env.local.
+              </div>
+            )}
+          </section>
+        )}
+
         {/* Treasury */}
         {address && (
           <section style={cardStyle}>
@@ -961,87 +1233,6 @@ export default function Home() {
             >
               <div>
                 <div style={{ fontWeight: 900 }}>Mozi Treasury</div>
-
-                <div
-                  style={{
-                    marginTop: 6,
-                    display: "flex",
-                    gap: 10,
-                    alignItems: "center",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                    AI autonomy
-                  </div>
-
-                  <button
-                    onClick={() => setAutonomy(true)}
-                    disabled={
-                      isTogglingAgent ||
-                      !address ||
-                      !TREASURY_HUB_ADDRESS ||
-                      !isCorrectChain ||
-                      !MOZI_AGENT_ADDRESS ||
-                      agentEnabled === true
-                    }
-                    style={{
-                      padding: "8px 12px",
-                      borderRadius: 999,
-                      border: "1px solid #cbd5e1",
-                      background: agentEnabled === true ? "#0f172a" : "#f8fafc",
-                      color: agentEnabled === true ? "#ffffff" : COLORS.text,
-                      fontWeight: 900,
-                      cursor: "pointer",
-                      opacity:
-                        isTogglingAgent ||
-                        !isCorrectChain ||
-                        !MOZI_AGENT_ADDRESS ||
-                        agentEnabled === true
-                          ? 0.65
-                          : 1,
-                    }}
-                  >
-                    {agentEnabled === true ? "Enabled" : "Enable"}
-                  </button>
-
-                  <button
-                    onClick={() => setAutonomy(false)}
-                    disabled={
-                      isTogglingAgent ||
-                      !address ||
-                      !TREASURY_HUB_ADDRESS ||
-                      !isCorrectChain ||
-                      !MOZI_AGENT_ADDRESS ||
-                      agentEnabled === false
-                    }
-                    style={{
-                      padding: "8px 12px",
-                      borderRadius: 999,
-                      border: "1px solid #cbd5e1",
-                      background:
-                        agentEnabled === false ? "#0f172a" : "#f8fafc",
-                      color: agentEnabled === false ? "#ffffff" : COLORS.text,
-                      fontWeight: 900,
-                      cursor: "pointer",
-                      opacity:
-                        isTogglingAgent ||
-                        !isCorrectChain ||
-                        !MOZI_AGENT_ADDRESS ||
-                        agentEnabled === false
-                          ? 0.65
-                          : 1,
-                    }}
-                  >
-                    {agentEnabled === false ? "Disabled" : "Disable"}
-                  </button>
-
-                  {isTogglingAgent && (
-                    <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                      Updating…
-                    </div>
-                  )}
-                </div>
               </div>
 
               <button
