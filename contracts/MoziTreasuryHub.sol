@@ -22,6 +22,12 @@ contract MoziTreasuryHub {
     // Owner -> total reserved in pending orders (not withdrawable)
     mapping(address => uint256) public reservedOf;
 
+    // Owner mode: if true, require explicit intent approval before execution
+    mapping(address => bool) public requireApprovalForExecution;
+
+    // Owner -> intent ref -> approved?
+    mapping(address => mapping(bytes32 => bool)) public isIntentApproved;
+
     struct PendingOrder {
         address owner; // whose treasury this draws from
         address supplier;
@@ -44,6 +50,13 @@ contract MoziTreasuryHub {
     event Withdrawn(address indexed owner, address indexed to, uint256 amount);
 
     event AgentSet(address indexed owner, address indexed agent, bool allowed);
+
+    event RequireApprovalSet(address indexed owner, bool required);
+    event IntentApprovalSet(
+        address indexed owner,
+        bytes32 indexed ref,
+        bool approved
+    );
 
     event OrderProposed(
         uint256 indexed orderId,
@@ -105,6 +118,19 @@ contract MoziTreasuryHub {
         require(agent != address(0), "agent=0");
         isAgentFor[msg.sender][agent] = allowed;
         emit AgentSet(msg.sender, agent, allowed);
+    }
+
+    // Owner sets whether execution requires explicit approval (Manual vs Autonomous)
+    function setRequireApprovalForExecution(bool required) external {
+        requireApprovalForExecution[msg.sender] = required;
+        emit RequireApprovalSet(msg.sender, required);
+    }
+
+    // Owner approves (or un-approves) an entire intent by ref
+    function setIntentApproval(bytes32 ref, bool approved) external {
+        require(ref != bytes32(0), "ref=0");
+        isIntentApproved[msg.sender][ref] = approved;
+        emit IntentApprovalSet(msg.sender, ref, approved);
     }
 
     // -------------------------
@@ -181,6 +207,11 @@ contract MoziTreasuryHub {
         require(!o.canceled, "canceled");
         require(!o.executed, "executed");
         require(block.timestamp >= o.executeAfter, "too early");
+
+        // Manual mode: owner must approve the whole intent (ref) before execution
+        if (requireApprovalForExecution[o.owner]) {
+            require(isIntentApproved[o.owner][o.ref], "intent not approved");
+        }
 
         o.executed = true;
 

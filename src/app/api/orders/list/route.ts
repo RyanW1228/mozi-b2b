@@ -1,8 +1,39 @@
-//src/app/api/orders/list/route.ts
-
+// src/app/api/orders/list/route.ts
 import { NextResponse } from "next/server";
 import { getHubRead, MoziEnv } from "@/lib/server/moziHub";
 import { isAddress, keccak256, toUtf8Bytes } from "ethers";
+
+export const runtime = "nodejs";
+
+type HubOrder = {
+  orderId: string;
+  owner: string;
+  supplier: string;
+  amount: string;
+  executeAfter: number;
+  canceled: boolean;
+  executed: boolean;
+  ref: string; // bytes32 intent id
+  restaurantId: string; // bytes32 hashed locationId
+};
+
+type Intent = {
+  ref: string;
+  owner: string;
+  restaurantId: string;
+  executeAfter: number;
+  canceled: boolean;
+  executed: boolean;
+  approved: boolean;
+  items: Array<{
+    orderId: string;
+    supplier: string;
+    amount: string;
+    executeAfter: number;
+    canceled: boolean;
+    executed: boolean;
+  }>;
+};
 
 export async function GET(req: Request) {
   try {
@@ -25,10 +56,9 @@ export async function GET(req: Request) {
 
     const hub = getHubRead(env);
 
-    // How many orders exist (0..nextOrderId-1)
     const nextOrderId = (await (hub as any).nextOrderId()) as bigint;
 
-    // Scan only last N for speed (avoid BigInt literals for ES2019 compatibility)
+    // Scan last N for speed
     const LIMIT = 50;
     const nextNum = Number(nextOrderId);
     const startNum = Math.max(0, nextNum - LIMIT);
@@ -36,7 +66,7 @@ export async function GET(req: Request) {
     const ids: number[] = [];
     for (let id = startNum; id < nextNum; id++) ids.push(id);
 
-    const orders = await Promise.all(
+    const orders: HubOrder[] = await Promise.all(
       ids.map(async (id) => {
         const o = await (hub as any).pendingOrders(BigInt(id));
         return {
@@ -47,12 +77,13 @@ export async function GET(req: Request) {
           executeAfter: Number(o.executeAfter),
           canceled: Boolean(o.canceled),
           executed: Boolean(o.executed),
-          ref: o.ref as string,
-          restaurantId: o.restaurantId as string,
+          ref: (o.ref as string) ?? "0x",
+          restaurantId: (o.restaurantId as string) ?? "0x",
         };
       })
     );
 
+    // Filters
     let filtered = owner
       ? orders.filter((x) => x.owner.toLowerCase() === owner.toLowerCase())
       : orders;
@@ -63,13 +94,82 @@ export async function GET(req: Request) {
       );
     }
 
-    // newest first
+    // newest first (per-order)
     filtered.sort((a, b) => Number(b.orderId) - Number(a.orderId));
+
+    // Group into intents by ref
+    const byRef = new Map<string, Omit<Intent, "approved">>();
+
+    for (const o of filtered) {
+      const key = (o.ref || "").toLowerCase();
+      if (!key || key === "0x") continue;
+
+      const existing = byRef.get(key);
+      if (!existing) {
+        byRef.set(key, {
+          ref: o.ref,
+          owner: o.owner,
+          restaurantId: o.restaurantId,
+          executeAfter: o.executeAfter,
+          canceled: o.canceled,
+          executed: o.executed,
+          items: [
+            {
+              orderId: o.orderId,
+              supplier: o.supplier,
+              amount: o.amount,
+              executeAfter: o.executeAfter,
+              canceled: o.canceled,
+              executed: o.executed,
+            },
+          ],
+        });
+      } else {
+        existing.items.push({
+          orderId: o.orderId,
+          supplier: o.supplier,
+          amount: o.amount,
+          executeAfter: o.executeAfter,
+          canceled: o.canceled,
+          executed: o.executed,
+        });
+
+        // intent-level summary
+        existing.executeAfter = Math.min(existing.executeAfter, o.executeAfter);
+        existing.canceled = existing.canceled || Boolean(o.canceled);
+        existing.executed =
+          existing.executed && Boolean(o.executed) && !Boolean(o.canceled);
+      }
+    }
+
+    const rawIntents = Array.from(byRef.values());
+
+    // For each intent, ask chain if approved
+    const intents: Intent[] = await Promise.all(
+      rawIntents.map(async (i) => {
+        let approved = false;
+        try {
+          approved = Boolean(
+            await (hub as any).isIntentApproved(i.owner, i.ref)
+          );
+        } catch {
+          approved = false;
+        }
+        return { ...i, approved };
+      })
+    );
+
+    // newest first by max orderId within the intent
+    intents.sort((a, b) => {
+      const maxA = Math.max(...a.items.map((x) => Number(x.orderId)));
+      const maxB = Math.max(...b.items.map((x) => Number(x.orderId)));
+      return maxB - maxA;
+    });
 
     return NextResponse.json({
       ok: true,
       nextOrderId: nextOrderId.toString(),
-      orders: filtered,
+      intents,
     });
   } catch (e: any) {
     const msg = e?.shortMessage || e?.reason || e?.message || String(e);

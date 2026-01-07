@@ -1,12 +1,19 @@
 // src/app/locations/[locationId]/page.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { buildPaymentIntentFromPlan } from "@/lib/pricing";
-import { isAddress, keccak256, toUtf8Bytes } from "ethers";
+import {
+  BrowserProvider,
+  Contract,
+  isAddress,
+  keccak256,
+  toUtf8Bytes,
+} from "ethers";
+import { MOZI_TREASURY_HUB_ABI } from "@/lib/abis/moziTreasuryHub";
 
 const COLORS = {
   text: "#0f172a",
@@ -29,6 +36,9 @@ const COLORS = {
   greenBg: "#f0fdf4",
   greenBorder: "#bbf7d0",
 };
+
+const TREASURY_HUB_ADDRESS =
+  process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
 
 function shortenId(id: string) {
   if (!id) return "—";
@@ -64,70 +74,42 @@ export default function LocationPage() {
   const [executeResp, setExecuteResp] = useState<any>(null);
 
   // -------------------------
-  // On-chain orders (read-only)
+  // On-chain orders (grouped by intent ref)
   // -------------------------
-  type HubOrderRow = {
-    orderId: string;
+  type IntentRow = {
+    ref: string;
     owner: string;
-    supplier: string;
-    amount: string; // raw uint256 string
-    executeAfter: number; // unix seconds
+    restaurantId: string;
+    executeAfter: number;
     canceled: boolean;
     executed: boolean;
-    ref: string;
-    restaurantId: string;
+    approved: boolean;
+    items: Array<{
+      orderId: string;
+      supplier: string;
+      amount: string; // raw uint256 string
+      executeAfter: number;
+      canceled: boolean;
+      executed: boolean;
+    }>;
   };
 
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState<string>("");
-  const [hubOrders, setHubOrders] = useState<HubOrderRow[]>([]);
+  const [intents, setIntents] = useState<IntentRow[]>([]);
 
-  const [aiProposing, setAiProposing] = useState(false);
+  // Manual vs Autonomous (from chain)
+  const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
 
-  async function aiProposeOrders() {
-    const owner = getSavedOwnerAddress();
-    const env = getSavedEnv();
+  // UI state for approve button
+  const [approvingRef, setApprovingRef] = useState<string | null>(null);
 
-    if (!owner || !isAddress(owner)) {
-      setOrdersError(
-        "No valid wallet found. Go to the homepage, connect wallet, then come back."
-      );
-      return;
-    }
-
-    setAiProposing(true);
-    setOrdersError("");
-
-    try {
-      const res = await fetch(
-        `/api/agent/propose?locationId=${encodeURIComponent(locationId)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            env,
-            ownerAddress: owner,
-            pendingWindowHours: 24,
-          }),
-        }
-      );
-
-      const json = await res.json();
-      if (!res.ok || !json?.ok) {
-        setOrdersError(
-          `AI PROPOSE HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
-        );
-        return;
-      }
-
-      // refresh orders after success
-      await refreshOrders();
-    } catch (e: any) {
-      setOrdersError(String(e));
-    } finally {
-      setAiProposing(false);
-    }
-  }
+  // -------------------------
+  // Auto-propose (periodic)
+  // -------------------------
+  const [autoProposeEnabled, setAutoProposeEnabled] = useState(true);
+  const [autoProposeMsg, setAutoProposeMsg] = useState<string>("");
+  const autoProposeInFlight = useRef(false);
 
   function getSavedEnv(): "testing" | "production" {
     if (typeof window === "undefined") return "testing";
@@ -149,10 +131,64 @@ export default function LocationPage() {
     }
   }
 
-  function orderStatus(o: HubOrderRow) {
-    if (o.canceled) return "Canceled";
-    if (o.executed) return "Executed";
+  function intentStatus(i: IntentRow) {
+    if (i.canceled) return "Canceled";
+    if (i.executed) return "Executed";
+    if (i.approved) return "Approved";
     return "Pending";
+  }
+
+  async function autoProposeNow() {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    if (!locationId) return;
+
+    if (!owner || !isAddress(owner)) {
+      setAutoProposeMsg("Connect wallet on homepage first.");
+      return;
+    }
+
+    if (autoProposeInFlight.current) return;
+    autoProposeInFlight.current = true;
+
+    try {
+      setAutoProposeMsg("Auto-propose: proposing…");
+
+      const res = await fetch(
+        `/api/orders/propose?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            env,
+            ownerAddress: owner,
+            pendingWindowHours: 24,
+
+            // keep proposer aligned with the UI controls
+            strategy,
+            horizonDays,
+            notes,
+          }),
+        }
+      );
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.ok) {
+        setAutoProposeMsg(
+          `Auto-propose failed (HTTP ${res.status}): ${JSON.stringify(json)}`
+        );
+        return;
+      }
+
+      setAutoProposeMsg("Auto-propose: proposed ✔");
+      await refreshOrders();
+    } catch (e: any) {
+      setAutoProposeMsg(`Auto-propose error: ${String(e?.message ?? e)}`);
+    } finally {
+      autoProposeInFlight.current = false;
+    }
   }
 
   async function refreshOrders() {
@@ -160,7 +196,8 @@ export default function LocationPage() {
     const env = getSavedEnv();
 
     if (!owner || !isAddress(owner)) {
-      setHubOrders([]);
+      setIntents([]);
+      setRequireApproval(null);
       setOrdersError(
         "No valid wallet found. Go to the homepage, connect wallet, then come back."
       );
@@ -168,7 +205,8 @@ export default function LocationPage() {
     }
 
     if (!locationId) {
-      setHubOrders([]);
+      setIntents([]);
+      setRequireApproval(null);
       setOrdersError("Missing locationId.");
       return;
     }
@@ -177,6 +215,7 @@ export default function LocationPage() {
     setOrdersError("");
 
     try {
+      // 1) read intent groups from your API
       const url =
         `/api/orders/list?env=${encodeURIComponent(env)}` +
         `&owner=${encodeURIComponent(owner)}` +
@@ -186,28 +225,102 @@ export default function LocationPage() {
       const json = await res.json();
 
       if (!res.ok || !json?.ok) {
-        setHubOrders([]);
+        setIntents([]);
         setOrdersError(
           `ORDERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
         );
         return;
       }
 
-      const raw = (json.orders ?? []) as HubOrderRow[];
+      const raw = (json.intents ?? []) as IntentRow[];
 
-      // Hard guard: keep ONLY orders that belong to this location
+      // Hard guard: keep ONLY intents for this location (restaurantId)
       const scoped = raw.filter(
-        (o) =>
-          String(o.restaurantId || "").toLowerCase() ===
+        (i) =>
+          String(i.restaurantId || "").toLowerCase() ===
           String(locationRestaurantId || "").toLowerCase()
       );
 
-      setHubOrders(scoped);
+      setIntents(scoped);
+
+      // 2) read manual/autonomous mode from chain
+      if (
+        !TREASURY_HUB_ADDRESS ||
+        !isAddress(TREASURY_HUB_ADDRESS) ||
+        typeof window === "undefined" ||
+        !(window as any).ethereum
+      ) {
+        setRequireApproval(null);
+        return;
+      }
+
+      const provider = new BrowserProvider((window as any).ethereum);
+      const hub = new Contract(
+        TREASURY_HUB_ADDRESS,
+        MOZI_TREASURY_HUB_ABI,
+        provider
+      );
+
+      const req = (await (hub as any).requireApprovalForExecution(
+        owner
+      )) as boolean;
+
+      setRequireApproval(Boolean(req));
     } catch (e: any) {
-      setHubOrders([]);
+      setIntents([]);
+      setRequireApproval(null);
       setOrdersError(String(e));
     } finally {
       setOrdersLoading(false);
+    }
+  }
+
+  async function approveIntent(ref: string) {
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) {
+      setOrdersError(
+        "No valid wallet found. Connect wallet on homepage first."
+      );
+      return;
+    }
+    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
+      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
+      return;
+    }
+    if (typeof window === "undefined" || !(window as any).ethereum) {
+      setOrdersError("No injected wallet found (window.ethereum missing).");
+      return;
+    }
+
+    try {
+      setOrdersError("");
+      setApprovingRef(ref);
+
+      const provider = new BrowserProvider((window as any).ethereum);
+      const signer = await provider.getSigner();
+
+      // optional: sanity check signer matches saved owner
+      const signerAddr = await signer.getAddress();
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setOrdersError("Connected wallet does not match saved owner address.");
+        return;
+      }
+
+      const hub = new Contract(
+        TREASURY_HUB_ADDRESS,
+        MOZI_TREASURY_HUB_ABI,
+        signer
+      );
+
+      // Approve this intent ref
+      const tx = await (hub as any).setIntentApproval(ref, true);
+      await tx.wait();
+
+      await refreshOrders();
+    } catch (e: any) {
+      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
+    } finally {
+      setApprovingRef(null);
     }
   }
 
@@ -257,8 +370,20 @@ export default function LocationPage() {
     setExecuteResp(null);
 
     try {
+      const owner = getSavedOwnerAddress();
+      const env = getSavedEnv();
+
+      if (!owner || !isAddress(owner)) {
+        setError(
+          "No valid wallet found. Go to the homepage, connect wallet, then come back here."
+        );
+        return;
+      }
+
       const stateRes = await fetch(
-        `/api/state?locationId=${encodeURIComponent(locationId)}`
+        `/api/state?locationId=${encodeURIComponent(locationId)}` +
+          `&owner=${encodeURIComponent(owner)}` +
+          `&env=${encodeURIComponent(env)}`
       );
 
       if (!stateRes.ok) {
@@ -332,10 +457,10 @@ export default function LocationPage() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              ownerAddress,
-              input, // <-- include the PlanInput
-              plan: data, // <-- include the PlanOutput (RAW from /api/plan)
-              paymentIntent: pi, // <-- keep this too (harmless + useful for debugging)
+              ownerAddress: owner,
+              input,
+              plan: data,
+              paymentIntent: pi,
             }),
           }
         );
@@ -378,6 +503,23 @@ export default function LocationPage() {
     refreshOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
+
+  useEffect(() => {
+    if (!locationId) return;
+    if (!autoProposeEnabled) return;
+
+    // run once immediately, then every 60s while page is open
+    autoProposeNow();
+
+    const id = window.setInterval(() => {
+      autoProposeNow();
+    }, 60_000);
+
+    return () => window.clearInterval(id);
+
+    // IMPORTANT: include controls so the proposer uses the latest settings
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId, autoProposeEnabled, strategy, horizonDays, notes]);
 
   if (!locationId) {
     return (
@@ -539,12 +681,24 @@ export default function LocationPage() {
               flexWrap: "wrap",
             }}
           >
-            <div>
-              <div style={{ fontWeight: 950 }}>Orders</div>
-              <div
-                style={{ marginTop: 4, color: COLORS.subtext, fontWeight: 800 }}
+            <div
+              style={{
+                marginTop: 8,
+                display: "flex",
+                gap: 10,
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                onClick={() => setAutoProposeEnabled((v) => !v)}
+                style={btnSoft(false)}
               >
-                On-chain (Treasury Hub pendingOrders) • scoped to this location
+                Auto-propose: {autoProposeEnabled ? "ON" : "OFF"}
+              </button>
+
+              <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                {autoProposeMsg ||
+                  (autoProposeEnabled ? "Running every 60s" : "Paused")}
               </div>
             </div>
 
@@ -554,14 +708,6 @@ export default function LocationPage() {
               style={btnSoft(ordersLoading)}
             >
               {ordersLoading ? "Refreshing…" : "Refresh Orders"}
-            </button>
-
-            <button
-              onClick={aiProposeOrders}
-              disabled={aiProposing}
-              style={btnPrimary(aiProposing)}
-            >
-              {aiProposing ? "AI Proposing…" : "AI Propose Orders"}
             </button>
           </div>
 
@@ -579,116 +725,209 @@ export default function LocationPage() {
             >
               {ordersError}
             </div>
-          ) : hubOrders.length === 0 ? (
+          ) : intents.length === 0 ? (
             <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
               No orders found.
             </div>
           ) : (
-            <div
-              style={{
-                overflowX: "auto",
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 12,
-                background: "rgba(255,255,255,0.75)",
-              }}
-            >
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th
+            <div style={{ display: "grid", gap: 12 }}>
+              {intents.map((i) => {
+                const now = Math.floor(Date.now() / 1000);
+                const pending =
+                  !i.canceled && !i.executed && now < Number(i.executeAfter);
+
+                // Only show Approve in Manual mode
+                const showApprove = requireApproval === true;
+
+                // Can approve only if pending, not already approved/canceled/executed
+                const canApprove =
+                  showApprove &&
+                  pending &&
+                  !i.approved &&
+                  approvingRef !== i.ref;
+
+                return (
+                  <div
+                    key={i.ref}
+                    style={{
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: 12,
+                      padding: 12,
+                      background: "rgba(255,255,255,0.75)",
+                      display: "grid",
+                      gap: 10,
+                    }}
+                  >
+                    <div
                       style={{
-                        textAlign: "left",
-                        padding: 12,
-                        fontWeight: 950,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 12,
+                        alignItems: "center",
+                        flexWrap: "wrap",
                       }}
                     >
-                      Order
-                    </th>
-                    <th
+                      <div>
+                        <div style={{ fontWeight: 950 }}>
+                          Intent:{" "}
+                          <span
+                            style={{
+                              fontFamily: "ui-monospace, Menlo, monospace",
+                            }}
+                          >
+                            {shortenId(i.ref)}
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            marginTop: 4,
+                            color: COLORS.subtext,
+                            fontWeight: 800,
+                          }}
+                        >
+                          Execute after: {fmtWhen(i.executeAfter)} • Status:{" "}
+                          {intentStatus(i)}
+                        </div>
+                      </div>
+
+                      {showApprove ? (
+                        <button
+                          onClick={() => approveIntent(i.ref)}
+                          disabled={!canApprove}
+                          style={btnPrimary(!canApprove)}
+                        >
+                          {approvingRef === i.ref
+                            ? "Approving…"
+                            : "Approve Intent"}
+                        </button>
+                      ) : (
+                        <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                          Autonomous (no approval needed)
+                        </div>
+                      )}
+                    </div>
+
+                    <div
                       style={{
-                        textAlign: "left",
-                        padding: 12,
-                        fontWeight: 950,
+                        overflowX: "auto",
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 12,
+                        background: "rgba(255,255,255,0.85)",
                       }}
                     >
-                      Supplier
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        padding: 12,
-                        fontWeight: 950,
-                      }}
-                    >
-                      Execute After
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "left",
-                        padding: 12,
-                        fontWeight: 950,
-                      }}
-                    >
-                      Status
-                    </th>
-                    <th
-                      style={{
-                        textAlign: "right",
-                        padding: 12,
-                        fontWeight: 950,
-                      }}
-                    >
-                      Amount (raw)
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {hubOrders.map((o) => (
-                    <tr key={o.orderId}>
-                      <td
-                        style={{ padding: 12, borderTop: "1px solid #eef2f7" }}
+                      <table
+                        style={{ width: "100%", borderCollapse: "collapse" }}
                       >
-                        #{o.orderId}
-                      </td>
-                      <td
-                        style={{
-                          padding: 12,
-                          borderTop: "1px solid #eef2f7",
-                          fontFamily: "ui-monospace, Menlo, monospace",
-                          fontWeight: 800,
-                        }}
-                      >
-                        {o.supplier}
-                      </td>
-                      <td
-                        style={{ padding: 12, borderTop: "1px solid #eef2f7" }}
-                      >
-                        {fmtWhen(o.executeAfter)}
-                      </td>
-                      <td
-                        style={{
-                          padding: 12,
-                          borderTop: "1px solid #eef2f7",
-                          fontWeight: 900,
-                        }}
-                      >
-                        {orderStatus(o)}
-                      </td>
-                      <td
-                        style={{
-                          padding: 12,
-                          borderTop: "1px solid #eef2f7",
-                          textAlign: "right",
-                          fontFamily: "ui-monospace, Menlo, monospace",
-                          fontWeight: 800,
-                        }}
-                      >
-                        {o.amount}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                        <thead>
+                          <tr>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Order
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Supplier
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Execute After
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Status
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "right",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Amount (raw)
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {i.items.map((o) => (
+                            <tr key={o.orderId}>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                }}
+                              >
+                                #{o.orderId}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                  fontFamily: "ui-monospace, Menlo, monospace",
+                                  fontWeight: 800,
+                                }}
+                              >
+                                {o.supplier}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                }}
+                              >
+                                {fmtWhen(o.executeAfter)}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                  fontWeight: 900,
+                                }}
+                              >
+                                {o.canceled
+                                  ? "Canceled"
+                                  : o.executed
+                                  ? "Executed"
+                                  : "Pending"}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                  textAlign: "right",
+                                  fontFamily: "ui-monospace, Menlo, monospace",
+                                  fontWeight: 800,
+                                }}
+                              >
+                                {o.amount}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>

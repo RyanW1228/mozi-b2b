@@ -61,6 +61,38 @@ export async function POST(req: Request) {
 
     const todayOrderDate = todayISODateInTZ(input.restaurant.timezone);
 
+    // -------------------------
+    // Pipeline-aware inventory
+    // -------------------------
+    const pipeline =
+      (input as any)?.context?.pipelineBySku &&
+      typeof (input as any).context.pipelineBySku === "object"
+        ? ((input as any).context.pipelineBySku as Record<string, number>)
+        : {};
+
+    // Create a "prompt view" of skus that includes pipeline + effective on hand.
+    // This DOES NOT change your real stored state; it's only what we send to Gemini.
+    const skusForPrompt = (input.skus ?? []).map((s: any) => {
+      const sku = String(s?.sku ?? "");
+      const onHand = Number(s?.onHandUnits ?? 0);
+      const pipe = Number(pipeline[sku] ?? 0);
+      return {
+        ...s,
+        pipelineUnits: pipe,
+        effectiveOnHandUnits: onHand + pipe,
+      };
+    });
+
+    const inputForPrompt = {
+      ...input,
+      skus: skusForPrompt,
+      context: {
+        ...(input as any).context,
+        // keep pipeline visible for debugging inside the prompt too
+        pipelineBySku: pipeline,
+      },
+    };
+
     // 2) Tell Gemini to output STRICT JSON for PlanOutput
     const prompt =
       `You are Mozi, an AI purchasing assistant for a single-location restaurant.\n` +
@@ -88,8 +120,18 @@ export async function POST(req: Request) {
       `  "summary": { "keyDrivers": string[], "warnings"?: string[] }\n` +
       `}\n\n` +
       `Use these inputs (JSON):\n` +
-      `${JSON.stringify(input, null, 2)}\n\n` +
+      `${JSON.stringify(inputForPrompt, null, 2)}\n\n` +
+      `IMPORTANT INVENTORY RULE:\n` +
+      `- Each input.skus[*] now includes:\n` +
+      `  - onHandUnits (physical in-house)\n` +
+      `  - pipelineUnits (already ordered, not arrived)\n` +
+      `  - effectiveOnHandUnits = onHandUnits + pipelineUnits\n` +
+      `- When deciding orderUnits, you MUST use effectiveOnHandUnits (not onHandUnits).\n\n` +
       `Rules:\n` +
+      `- Inventory math: effectiveOnHandUnits = onHandUnits + pipelineUnits.\n` +
+      `- Treat pipelineUnits as already purchased (do NOT reorder as if it doesn't exist).\n` +
+      `- If effectiveOnHandUnits covers expected usage through the horizon, orderUnits MUST be omitted.\n` +
+      `- If a SKU has avgDailyUsage (or similar), treat "covers expected usage through the horizon" as: effectiveOnHandUnits >= avgDailyUsage * horizonDays.\n` +
       `- Only recommend SKUs that exist in input.skus[*].sku.\n` +
       `- supplierId must match one of input.suppliers[*].supplierId.\n` +
       `- Use horizonDays = input.restaurant.planningHorizonDays.\n` +

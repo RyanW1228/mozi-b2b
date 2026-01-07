@@ -1,16 +1,10 @@
-//src/app/api/agent/propose/route.ts
+// src/app/api/orders/broadcast/route.ts
+import { NextResponse } from "next/server";
+import { isAddress, JsonRpcProvider, Wallet } from "ethers";
+
 export const runtime = "nodejs";
 
-import { NextResponse } from "next/server";
-import { isAddress, JsonRpcProvider, Wallet, Contract } from "ethers";
-import { MOZI_TREASURY_HUB_ABI } from "@/lib/abis/moziTreasuryHub";
-
-const TREASURY_HUB_ADDRESS =
-  process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
-
-const MOZI_AGENT_ADDRESS = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
-
-// We only need "to" + "data" from your /api/execute response
+// We only need "to" + "data" from /api/execute response
 type ExecuteCall = {
   to: string;
   data: string;
@@ -74,7 +68,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) Ask your existing execute route to build the calls
+    // 1) Ask /api/execute to build the encoded calls
     const executeUrl =
       `${new URL(req.url).origin}/api/execute?locationId=` +
       encodeURIComponent(locationId);
@@ -85,9 +79,7 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         ownerAddress,
         pendingWindowHours: body.pendingWindowHours ?? 24,
-        // IMPORTANT: your /api/execute ignores client input and uses getState(locationId)
-        // so we don't need to send input/plan/paymentIntent from here.
-        plan: { orders: [] }, // placeholder only if your route requires it; remove if not needed
+        plan: { orders: [] }, // keep if your execute route expects it
       }),
     });
 
@@ -117,55 +109,10 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2) Broadcast the calls as the agent wallet
-    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS",
-        },
-        { status: 500 }
-      );
-    }
-
-    if (!MOZI_AGENT_ADDRESS || !isAddress(MOZI_AGENT_ADDRESS)) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Missing/invalid NEXT_PUBLIC_MOZI_AGENT_ADDRESS",
-        },
-        { status: 500 }
-      );
-    }
-
+    // 2) Broadcast as the agent wallet
     const provider = new JsonRpcProvider(SEPOLIA_RPC_URL);
     const agent = new Wallet(AGENT_PRIVATE_KEY, provider);
 
-    // ✅ HARD GUARD: autonomy must be enabled on-chain for this owner
-    const hubRead = new Contract(
-      TREASURY_HUB_ADDRESS,
-      MOZI_TREASURY_HUB_ABI,
-      provider
-    );
-
-    const allowed = (await (hubRead as any).isAgentFor(
-      ownerAddress,
-      MOZI_AGENT_ADDRESS
-    )) as boolean;
-
-    if (!allowed) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            "Autonomy is disabled for this owner. Enable AI Autonomy on the homepage (setAgent) before proposing.",
-        },
-        { status: 403 }
-      );
-    }
-
-    // Sending raw calldata: easiest via wallet.sendTransaction({to, data})
-    // (No value, hub method is non-payable.)
     const txs: { to: string; hash: string }[] = [];
     for (const c of calls) {
       if (!c?.to || !isAddress(c.to) || !c?.data) {
@@ -175,11 +122,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const tx = await agent.sendTransaction({
-        to: c.to,
-        data: c.data,
-      });
-
+      const tx = await agent.sendTransaction({ to: c.to, data: c.data });
       txs.push({ to: c.to, hash: tx.hash });
       await tx.wait();
     }
@@ -190,6 +133,7 @@ export async function POST(req: Request) {
       locationId,
       ownerAddress,
       agentAddress: agent.address,
+      hub,
       txs,
     });
   } catch (e: any) {
