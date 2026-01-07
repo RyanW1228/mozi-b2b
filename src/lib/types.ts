@@ -12,9 +12,12 @@ export type PlanInput = {
   restaurant: {
     id: string;
     name?: string;
-    timezone: string; // e.g. "America/New_York"
+    timezone: string;
     cadence: OrderCadence;
-    planningHorizonDays: number; // e.g. 7
+    planningHorizonDays: number;
+
+    // ✅ who funds orders for this location (treasury owner)
+    ownerAddress?: string;
   };
 
   ownerPrefs: {

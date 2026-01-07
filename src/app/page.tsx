@@ -177,6 +177,11 @@ export default function Home() {
   const isCorrectChain =
     !!chainIdHex && chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
 
+  // Hard guard: only allow enabling autonomy if treasury has funds (available or locked)
+  const hasTreasuryFunds =
+    (availableToWithdraw !== null && availableToWithdraw !== "0") ||
+    (lockedMnee !== null && lockedMnee !== "0");
+
   useEffect(() => {
     addressRef.current = address;
   }, [address]);
@@ -1125,18 +1130,26 @@ export default function Home() {
                   </div>
                 ) : (
                   <div style={{ color: COLORS.subtext, fontWeight: 900 }}>
-                    {agentEnabled ? "Enabled" : "Disabled"}
+                    {agentEnabled ? "Autonomous" : "Manual"}
                   </div>
                 )}
 
                 <button
-                  onClick={() => setAutonomy(agentEnabled ? false : true)}
+                  onClick={() => {
+                    // Prevent enabling autonomy when treasury is empty
+                    if (!agentEnabled && !hasTreasuryFunds) {
+                      setError("Fund Mozi Treasury before enabling autonomy.");
+                      return;
+                    }
+                    setAutonomy(agentEnabled ? false : true);
+                  }}
                   disabled={
                     isTogglingAgent ||
                     !address ||
                     !TREASURY_HUB_ADDRESS ||
                     !isCorrectChain ||
-                    !MOZI_AGENT_ADDRESS
+                    !MOZI_AGENT_ADDRESS ||
+                    (!agentEnabled && !hasTreasuryFunds)
                   }
                   style={{
                     width: 58,
@@ -1186,6 +1199,21 @@ export default function Home() {
                 )}
               </div>
             </div>
+
+            {agentEnabled === false && !hasTreasuryFunds && (
+              <div
+                style={{
+                  color: "#92400e",
+                  background: "#fffbeb",
+                  border: "1px solid #fde68a",
+                  padding: 10,
+                  borderRadius: 12,
+                  fontWeight: 700,
+                }}
+              >
+                Fund <b>Mozi Treasury</b> before enabling autonomy.
+              </div>
+            )}
 
             {!isCorrectChain && (
               <div

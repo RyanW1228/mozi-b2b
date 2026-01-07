@@ -1,12 +1,12 @@
 // src/app/locations/[locationId]/page.tsx
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { buildPaymentIntentFromPlan } from "@/lib/pricing";
-import { isAddress } from "ethers";
+import { isAddress, keccak256, toUtf8Bytes } from "ethers";
 
 const COLORS = {
   text: "#0f172a",
@@ -45,6 +45,12 @@ export default function LocationPage() {
     return "";
   }, [params]);
 
+  // bytes32 restaurantId used on-chain (matches your execute route)
+  const locationRestaurantId = useMemo(() => {
+    if (!locationId) return "";
+    return keccak256(toUtf8Bytes(locationId));
+  }, [locationId]);
+
   const [loading, setLoading] = useState(false);
   const [plan, setPlan] = useState<PlanOutput | null>(null);
   const [error, setError] = useState<string>("");
@@ -56,6 +62,154 @@ export default function LocationPage() {
 
   const [paymentIntent, setPaymentIntent] = useState<any>(null);
   const [executeResp, setExecuteResp] = useState<any>(null);
+
+  // -------------------------
+  // On-chain orders (read-only)
+  // -------------------------
+  type HubOrderRow = {
+    orderId: string;
+    owner: string;
+    supplier: string;
+    amount: string; // raw uint256 string
+    executeAfter: number; // unix seconds
+    canceled: boolean;
+    executed: boolean;
+    ref: string;
+    restaurantId: string;
+  };
+
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [ordersError, setOrdersError] = useState<string>("");
+  const [hubOrders, setHubOrders] = useState<HubOrderRow[]>([]);
+
+  const [aiProposing, setAiProposing] = useState(false);
+
+  async function aiProposeOrders() {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    if (!owner || !isAddress(owner)) {
+      setOrdersError(
+        "No valid wallet found. Go to the homepage, connect wallet, then come back."
+      );
+      return;
+    }
+
+    setAiProposing(true);
+    setOrdersError("");
+
+    try {
+      const res = await fetch(
+        `/api/agent/propose?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            env,
+            ownerAddress: owner,
+            pendingWindowHours: 24,
+          }),
+        }
+      );
+
+      const json = await res.json();
+      if (!res.ok || !json?.ok) {
+        setOrdersError(
+          `AI PROPOSE HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+        return;
+      }
+
+      // refresh orders after success
+      await refreshOrders();
+    } catch (e: any) {
+      setOrdersError(String(e));
+    } finally {
+      setAiProposing(false);
+    }
+  }
+
+  function getSavedEnv(): "testing" | "production" {
+    if (typeof window === "undefined") return "testing";
+    const v = window.localStorage.getItem("mozi_env");
+    return v === "production" ? "production" : "testing";
+  }
+
+  function getSavedOwnerAddress(): string | null {
+    if (typeof window === "undefined") return null;
+    return window.localStorage.getItem("mozi_wallet_address");
+  }
+
+  function fmtWhen(ts: number) {
+    if (!ts) return "—";
+    try {
+      return new Date(ts * 1000).toLocaleString();
+    } catch {
+      return String(ts);
+    }
+  }
+
+  function orderStatus(o: HubOrderRow) {
+    if (o.canceled) return "Canceled";
+    if (o.executed) return "Executed";
+    return "Pending";
+  }
+
+  async function refreshOrders() {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    if (!owner || !isAddress(owner)) {
+      setHubOrders([]);
+      setOrdersError(
+        "No valid wallet found. Go to the homepage, connect wallet, then come back."
+      );
+      return;
+    }
+
+    if (!locationId) {
+      setHubOrders([]);
+      setOrdersError("Missing locationId.");
+      return;
+    }
+
+    setOrdersLoading(true);
+    setOrdersError("");
+
+    try {
+      const url =
+        `/api/orders/list?env=${encodeURIComponent(env)}` +
+        `&owner=${encodeURIComponent(owner)}` +
+        `&locationId=${encodeURIComponent(locationId)}`;
+
+      const res = await fetch(url);
+      const json = await res.json();
+
+      if (!res.ok || !json?.ok) {
+        setHubOrders([]);
+        setOrdersError(
+          `ORDERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+        return;
+      }
+
+      const raw = (json.orders ?? []) as HubOrderRow[];
+
+      // Hard guard: keep ONLY orders that belong to this location
+      const scoped = raw.filter(
+        (o) =>
+          String(o.restaurantId || "").toLowerCase() ===
+          String(locationRestaurantId || "").toLowerCase()
+      );
+
+      setHubOrders(scoped);
+    } catch (e: any) {
+      setHubOrders([]);
+      setOrdersError(String(e));
+    } finally {
+      setOrdersLoading(false);
+    }
+  }
 
   const cardStyle: React.CSSProperties = {
     marginTop: 16,
@@ -203,6 +357,27 @@ export default function LocationPage() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    // On first load, bind this location to the connected owner wallet (if available)
+    const owner = getSavedOwnerAddress();
+    if (!locationId || !owner || !isAddress(owner)) return;
+
+    fetch(`/api/state/owner?locationId=${encodeURIComponent(locationId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ownerAddress: owner }),
+    }).catch(() => {
+      // silent (MVP)
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
+
+  useEffect(() => {
+    // Read-only load on first render for this location page
+    refreshOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
 
   if (!locationId) {
     return (
@@ -352,6 +527,171 @@ export default function LocationPage() {
             </Link>
           </div>
         </header>
+
+        {/* On-chain Orders (read-only) */}
+        <section style={cardStyle}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 950 }}>Orders</div>
+              <div
+                style={{ marginTop: 4, color: COLORS.subtext, fontWeight: 800 }}
+              >
+                On-chain (Treasury Hub pendingOrders) • scoped to this location
+              </div>
+            </div>
+
+            <button
+              onClick={refreshOrders}
+              disabled={ordersLoading}
+              style={btnSoft(ordersLoading)}
+            >
+              {ordersLoading ? "Refreshing…" : "Refresh Orders"}
+            </button>
+
+            <button
+              onClick={aiProposeOrders}
+              disabled={aiProposing}
+              style={btnPrimary(aiProposing)}
+            >
+              {aiProposing ? "AI Proposing…" : "AI Propose Orders"}
+            </button>
+          </div>
+
+          {ordersError ? (
+            <div
+              style={{
+                border: `1px solid ${COLORS.warnBorder}`,
+                background: COLORS.warnBg,
+                color: COLORS.warnText,
+                borderRadius: 12,
+                padding: 12,
+                fontWeight: 800,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {ordersError}
+            </div>
+          ) : hubOrders.length === 0 ? (
+            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+              No orders found.
+            </div>
+          ) : (
+            <div
+              style={{
+                overflowX: "auto",
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 12,
+                background: "rgba(255,255,255,0.75)",
+              }}
+            >
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <th
+                      style={{
+                        textAlign: "left",
+                        padding: 12,
+                        fontWeight: 950,
+                      }}
+                    >
+                      Order
+                    </th>
+                    <th
+                      style={{
+                        textAlign: "left",
+                        padding: 12,
+                        fontWeight: 950,
+                      }}
+                    >
+                      Supplier
+                    </th>
+                    <th
+                      style={{
+                        textAlign: "left",
+                        padding: 12,
+                        fontWeight: 950,
+                      }}
+                    >
+                      Execute After
+                    </th>
+                    <th
+                      style={{
+                        textAlign: "left",
+                        padding: 12,
+                        fontWeight: 950,
+                      }}
+                    >
+                      Status
+                    </th>
+                    <th
+                      style={{
+                        textAlign: "right",
+                        padding: 12,
+                        fontWeight: 950,
+                      }}
+                    >
+                      Amount (raw)
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hubOrders.map((o) => (
+                    <tr key={o.orderId}>
+                      <td
+                        style={{ padding: 12, borderTop: "1px solid #eef2f7" }}
+                      >
+                        #{o.orderId}
+                      </td>
+                      <td
+                        style={{
+                          padding: 12,
+                          borderTop: "1px solid #eef2f7",
+                          fontFamily: "ui-monospace, Menlo, monospace",
+                          fontWeight: 800,
+                        }}
+                      >
+                        {o.supplier}
+                      </td>
+                      <td
+                        style={{ padding: 12, borderTop: "1px solid #eef2f7" }}
+                      >
+                        {fmtWhen(o.executeAfter)}
+                      </td>
+                      <td
+                        style={{
+                          padding: 12,
+                          borderTop: "1px solid #eef2f7",
+                          fontWeight: 900,
+                        }}
+                      >
+                        {orderStatus(o)}
+                      </td>
+                      <td
+                        style={{
+                          padding: 12,
+                          borderTop: "1px solid #eef2f7",
+                          textAlign: "right",
+                          fontFamily: "ui-monospace, Menlo, monospace",
+                          fontWeight: 800,
+                        }}
+                      >
+                        {o.amount}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
 
         {/* Controls */}
         <section style={cardStyle}>

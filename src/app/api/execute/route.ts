@@ -71,7 +71,7 @@ export async function POST(req: Request) {
 
     // bytes32 metadata
     const ref = keccak256(toUtf8Bytes(paymentIntent.intentId));
-    const restaurantId = keccak256(toUtf8Bytes(input.restaurant.id));
+    const restaurantId = keccak256(toUtf8Bytes(locationId));
 
     // supplierId -> payout address
     const supplierPayout = new Map(

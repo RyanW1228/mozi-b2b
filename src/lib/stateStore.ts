@@ -16,6 +16,7 @@ const SEED_STATE: RestaurantState = {
     timezone: "America/New_York",
     cadence: "weekly",
     planningHorizonDays: 7,
+    ownerAddress: undefined,
   },
   ownerPrefs: {
     strategy: "balanced",
@@ -27,13 +28,13 @@ const SEED_STATE: RestaurantState = {
       supplierId: "meatco",
       name: "MeatCo",
       leadTimeDays: 2,
-      payoutAddress: "0x0000000000000000000000000000000000000001",
+      payoutAddress: "0xEd97C42cAA7eACd3F10aeC5B800f7a3e970437F8",
     },
     {
       supplierId: "produceco",
       name: "ProduceCo",
       leadTimeDays: 1,
-      payoutAddress: "0x0000000000000000000000000000000000000002",
+      payoutAddress: "0x13706179d0408038ae3Bfc6a2FF19AD9Ac718935",
     },
   ],
   skus: [
@@ -127,5 +128,18 @@ export function patchInventory(
   }
 
   const next = { ...current, inventory };
+  statesByLocationId.set(locationId, next);
+}
+
+export function setOwnerAddress(locationId: string, ownerAddress: string) {
+  const current = getState(locationId);
+  const next: RestaurantState = {
+    ...current,
+    restaurant: {
+      ...current.restaurant,
+      id: locationId,
+      ownerAddress,
+    },
+  };
   statesByLocationId.set(locationId, next);
 }
