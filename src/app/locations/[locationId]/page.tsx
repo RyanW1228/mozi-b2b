@@ -72,6 +72,22 @@ async function fetchJsonWithTimeout(
   }
 }
 
+function sanitizeIntDraft(input: string) {
+  // digits only; allow empty while typing
+  return input.replace(/[^\d]/g, "");
+}
+
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function draftToClampedInt(draft: string, min: number, max: number) {
+  if (!draft) return min; // if user leaves blank, snap to min
+  const n = parseInt(draft, 10);
+  if (!Number.isFinite(n) || Number.isNaN(n)) return min;
+  return clampInt(Math.floor(n), min, max);
+}
+
 function safeNum(x: any): number | null {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
@@ -200,6 +216,8 @@ export default function LocationPage() {
   const [strategy, setStrategy] =
     useState<PlanInput["ownerPrefs"]["strategy"]>("balanced");
   const [horizonDays, setHorizonDays] = useState<number>(7);
+  // Draft text value so typing is smooth (like inventory inputs)
+  const [horizonDaysDraft, setHorizonDaysDraft] = useState<string>("7");
   const [notes, setNotes] = useState<string>("Normal week");
 
   const [paymentIntent, setPaymentIntent] = useState<any>(null);
@@ -702,6 +720,31 @@ export default function LocationPage() {
   }, [locationId]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const s = window.localStorage.getItem("mozi_plan_strategy");
+    const h = window.localStorage.getItem("mozi_plan_horizon_days");
+    const n = window.localStorage.getItem("mozi_plan_notes");
+
+    if (s === "min_waste" || s === "balanced" || s === "min_stockouts") {
+      setStrategy(s);
+    }
+
+    if (h) {
+      const parsed = parseInt(h, 10);
+      if (Number.isFinite(parsed)) {
+        setHorizonDays(Math.max(5, Math.min(30, parsed)));
+      }
+    }
+
+    if (typeof n === "string") setNotes(n);
+  }, []);
+
+  useEffect(() => {
+    setHorizonDaysDraft(String(horizonDays));
+  }, [horizonDays]);
+
+  useEffect(() => {
     // Read-only load on first render for this location page
     refreshOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -886,59 +929,84 @@ export default function LocationPage() {
               alignItems: "center",
               justifyContent: "space-between",
               gap: 12,
-              marginBottom: 8, // 🔧 tight spacing under header
+              marginBottom: 8,
             }}
           >
-            <div style={{ fontWeight: 950, fontSize: 16 }}>Purchase Plan</div>
+            {/* Left: title + ? bubble right next to it */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ fontWeight: 950, fontSize: 16 }}>Purchase Plan</div>
 
-            <HelpDot title="Explain plan settings">
-              <div style={{ fontWeight: 950, marginBottom: 8 }}>
-                Plan settings
-              </div>
+              <HelpDot title="Explain plan settings">
+                <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                  Plan settings
+                </div>
 
-              <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
-                <div>
-                  <div style={{ fontWeight: 950 }}>Strategy</div>
-                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                    How Mozi trades off waste vs. stockouts when choosing
-                    quantities.
-                    <div style={{ marginTop: 6 }}>
-                      <span style={{ fontWeight: 900 }}>
-                        {strategyLabel("min_waste")}
-                      </span>
-                      : order less, accept higher stockout risk •{" "}
-                      <span style={{ fontWeight: 900 }}>
-                        {strategyLabel("balanced")}
-                      </span>
-                      : default tradeoff •{" "}
-                      <span style={{ fontWeight: 900 }}>
-                        {strategyLabel("min_stockouts")}
-                      </span>
-                      : order more, accept higher waste risk
+                <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
+                  <div>
+                    <div style={{ fontWeight: 950 }}>Strategy</div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                      How Mozi trades off waste vs. stockouts when choosing
+                      quantities.
+                      <div style={{ marginTop: 6 }}>
+                        <span style={{ fontWeight: 900 }}>
+                          {strategyLabel("min_waste")}
+                        </span>
+                        : order less, accept higher stockout risk •{" "}
+                        <span style={{ fontWeight: 900 }}>
+                          {strategyLabel("balanced")}
+                        </span>
+                        : default tradeoff •{" "}
+                        <span style={{ fontWeight: 900 }}>
+                          {strategyLabel("min_stockouts")}
+                        </span>
+                        : order more, accept higher waste risk
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ fontWeight: 950 }}>Planning Horizon</div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                      How far into the future Mozi looks when deciding what to
+                      order today. A longer horizon means Mozi considers
+                      upcoming demand and deliveries further out; a shorter
+                      horizon makes it focus more on the near term.
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ fontWeight: 950 }}>Additional Context</div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                      Short notes that adjust assumptions (events, seasonality,
+                      promos, unusual weeks). Example: “Football weekend” can
+                      bias expected demand.
                     </div>
                   </div>
                 </div>
+              </HelpDot>
+            </div>
 
-                <div>
-                  <div style={{ fontWeight: 950 }}>Planning Horizon</div>
-                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                    How far into the future Mozi looks when deciding what to
-                    order today. A longer horizon means Mozi considers upcoming
-                    demand and deliveries further out; a shorter horizon makes
-                    it focus more on the near term.
-                  </div>
-                </div>
+            {/* Right: Save button */}
+            <button
+              type="button"
+              onClick={() => {
+                if (typeof window === "undefined") return;
 
-                <div>
-                  <div style={{ fontWeight: 950 }}>Additional Context</div>
-                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                    Short notes that adjust assumptions (events, seasonality,
-                    promos, unusual weeks). Example: “Football weekend” can bias
-                    expected demand.
-                  </div>
-                </div>
-              </div>
-            </HelpDot>
+                window.localStorage.setItem("mozi_plan_strategy", strategy);
+                window.localStorage.setItem(
+                  "mozi_plan_horizon_days",
+                  String(horizonDays)
+                );
+                window.localStorage.setItem("mozi_plan_notes", notes);
+
+                // optional: quick feedback without adding new UI state
+                // (if you want a real status message, tell me and I'll wire it)
+              }}
+              style={btnSoft(false)}
+              title="Save plan settings"
+            >
+              Save
+            </button>
           </div>
 
           <div
@@ -982,11 +1050,18 @@ export default function LocationPage() {
                 Planning Horizon
               </label>
               <input
-                type="number"
-                min={1}
-                max={30}
-                value={horizonDays}
-                onChange={(e) => setHorizonDays(Number(e.target.value))}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={horizonDaysDraft}
+                onChange={(e) => {
+                  setHorizonDaysDraft(sanitizeIntDraft(e.target.value));
+                }}
+                onBlur={() => {
+                  const normalized = draftToClampedInt(horizonDaysDraft, 5, 30);
+                  setHorizonDays(normalized);
+                  setHorizonDaysDraft(String(normalized));
+                }}
+                onFocus={(e) => e.currentTarget.select()}
                 style={{
                   padding: "10px 12px",
                   borderRadius: 12,
@@ -995,6 +1070,7 @@ export default function LocationPage() {
                   color: COLORS.text,
                   fontWeight: 800,
                   outline: "none",
+                  fontSize: 16, // nicer to type (matches inventory idea)
                 }}
               />
             </div>

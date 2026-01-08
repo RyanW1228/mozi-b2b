@@ -35,9 +35,9 @@ export async function POST(req: Request) {
     }
 
     const body = (await req.json()) as {
-      ownerAddress: string; // restaurant owner's wallet (the treasury owner)
+      ownerAddress: string;
       plan: PlanOutput;
-      pendingWindowHours?: number; // optional override
+      pendingWindowHours?: number;
     };
 
     const ownerAddress = body?.ownerAddress;
@@ -54,26 +54,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid plan" }, { status: 400 });
     }
 
-    // Deterministic input comes from server state for this location
     const input = getState(locationId);
 
-    // Build PaymentIntent on the server (prevents client tampering)
     const paymentIntent = buildPaymentIntentFromPlan({
       input,
       plan,
       pendingWindowHours: body.pendingWindowHours ?? 24,
     });
 
-    // executeAfter = pendingUntil (autonomy can execute once window ends)
     const executeAfter = Math.floor(
       Date.parse(paymentIntent.pendingUntil) / 1000
     );
 
-    // bytes32 metadata
     const ref = keccak256(toUtf8Bytes(paymentIntent.intentId));
     const restaurantId = keccak256(toUtf8Bytes(locationId));
 
-    // supplierId -> payout address
     const supplierPayout = new Map(
       input.suppliers.map((s) => [s.supplierId, s.payoutAddress])
     );
@@ -86,11 +81,8 @@ export async function POST(req: Request) {
         );
       }
 
-      // 1 mMNEE == $1, token has 18 decimals (we’ll assume 18 for now)
       const amountToken = parseUnits(t.amountUsd.toFixed(2), 18);
 
-      // Encode calldata for proposeOrderFor(owner, supplier, amount, executeAfter, ref, restaurantId)
-      // We return encoded data so you can inspect before sending.
       const iface = new (require("ethers").Interface)(MOZI_TREASURY_HUB_ABI);
       const data = iface.encodeFunctionData("proposeOrderFor", [
         ownerAddress,
@@ -116,7 +108,6 @@ export async function POST(req: Request) {
       paymentIntent,
       hub: TREASURY_HUB_ADDRESS,
       calls,
-      note: "These are ENCODED calls only (not broadcast). Next step is signing + sending with an agent key.",
     });
   } catch (e: any) {
     return NextResponse.json(

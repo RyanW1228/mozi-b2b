@@ -58,8 +58,16 @@ export async function GET(req: Request) {
 
     const nextOrderId = (await (hub as any).nextOrderId()) as bigint;
 
-    // Scan last N for speed
-    const LIMIT = 50;
+    // Scan last N for speed (configurable via ?limit=)
+    const limitParam = searchParams.get("limit");
+    const DEFAULT_LIMIT = 200;
+    const MAX_LIMIT = 500;
+
+    const LIMIT = Math.min(
+      MAX_LIMIT,
+      Math.max(1, Number(limitParam) || DEFAULT_LIMIT)
+    );
+
     const nextNum = Number(nextOrderId);
     const startNum = Math.max(0, nextNum - LIMIT);
 
@@ -87,12 +95,6 @@ export async function GET(req: Request) {
     let filtered = owner
       ? orders.filter((x) => x.owner.toLowerCase() === owner.toLowerCase())
       : orders;
-
-    if (restaurantIdFilter) {
-      filtered = filtered.filter(
-        (x) => x.restaurantId.toLowerCase() === restaurantIdFilter.toLowerCase()
-      );
-    }
 
     // newest first (per-order)
     filtered.sort((a, b) => Number(b.orderId) - Number(a.orderId));
