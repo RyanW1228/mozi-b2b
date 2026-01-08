@@ -51,9 +51,17 @@ export default function InventoryPage() {
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [savingSku, setSavingSku] = useState<string | null>(null);
+  // Draft text values for numeric inputs (so typing is smooth)
+  const [draftUnits, setDraftUnits] = useState<Record<string, string>>({});
 
   const [msg, setMsg] = useState<string>("");
   const [msgKind, setMsgKind] = useState<"success" | "error" | "warn" | "">("");
+
+  const [showHelp, setShowHelp] = useState(false);
+
+  const [showAddItem, setShowAddItem] = useState(false);
+  const [newSku, setNewSku] = useState("");
+  const [newUnitsDraft, setNewUnitsDraft] = useState<string>("0");
 
   const cardStyle: React.CSSProperties = {
     marginTop: 16,
@@ -161,7 +169,11 @@ export default function InventoryPage() {
         return;
       }
 
-      setRows(data as InventoryRow[]);
+      const next = data as InventoryRow[];
+      setRows(next);
+      setDraftUnits(
+        Object.fromEntries(next.map((r) => [r.sku, String(r.onHandUnits ?? 0)]))
+      );
       if (!(data as InventoryRow[])?.length) {
         setMessage("warn", "No inventory rows returned for this location yet.");
       }
@@ -172,12 +184,62 @@ export default function InventoryPage() {
     }
   }
 
+  function normalizeSku(input: string) {
+    return (
+      input
+        .trim()
+        .toLowerCase()
+        // replace spaces and any non-alphanumeric chars with underscores
+        .replace(/[^a-z0-9]+/g, "_")
+        // remove leading/trailing underscores
+        .replace(/^_+|_+$/g, "")
+    );
+  }
+
+  function sanitizeUnitsDraft(input: string) {
+    // keep only digits; allow empty while typing
+    return input.replace(/[^\d]/g, "");
+  }
+
+  function draftToNonNegInt(draft: string) {
+    if (!draft) return 0;
+    // parse base-10, clamp to >= 0, force integer
+    const n = parseInt(draft, 10);
+    if (!Number.isFinite(n) || Number.isNaN(n)) return 0;
+    return Math.max(0, Math.floor(n));
+  }
+
+  function addLocalRow() {
+    const raw = newSku;
+    const sku = normalizeSku(raw);
+
+    if (!sku) {
+      setMessage("warn", "SKU must contain at least one letter or number.");
+      return;
+    }
+
+    // prevent duplicates
+    const exists = rows.some((r) => r.sku === sku);
+    if (exists) {
+      setMessage("warn", `SKU "${sku}" already exists.`);
+      return;
+    }
+
+    const units = draftToNonNegInt(newUnitsDraft);
+
+    setRows((prev) => [{ sku, onHandUnits: units }, ...prev]);
+    setDraftUnits((prev) => ({ ...prev, [sku]: String(units) }));
+
+    setNewSku("");
+    setNewUnitsDraft("0");
+    setShowAddItem(false);
+    setMessage("success", `Added ${sku}. Click Save to persist.`);
+  }
+
   async function saveRow(sku: string, onHandUnits: number) {
     if (!locationId) return;
 
     setSavingSku(sku);
-    setMsg("");
-    setMsgKind("");
 
     try {
       const res = await fetch(
@@ -200,6 +262,58 @@ export default function InventoryPage() {
       setMessage("error", String(e));
     } finally {
       setSavingSku(null);
+    }
+  }
+
+  async function deleteRow(sku: string) {
+    if (!locationId) return;
+
+    // Optimistic UI: remove locally first (no lag)
+    const prevRows = rows;
+    const prevDraft = draftUnits;
+
+    setRows((prev) => prev.filter((r) => r.sku !== sku));
+    setDraftUnits((prev) => {
+      const next = { ...prev };
+      delete next[sku];
+      return next;
+    });
+
+    try {
+      const res = await fetch(
+        `/api/inventory?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sku }),
+        }
+      );
+
+      // some APIs return 204 No Content; don't assume json always exists
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {}
+
+      if (!res.ok) {
+        // rollback if server rejects
+        setRows(prevRows);
+        setDraftUnits(prevDraft);
+        setMessage(
+          "error",
+          data
+            ? JSON.stringify(data, null, 2)
+            : `Failed to delete SKU "${sku}".`
+        );
+        return;
+      }
+
+      setMessage("success", `Deleted ${sku}.`);
+    } catch (e: any) {
+      // rollback on network error
+      setRows(prevRows);
+      setDraftUnits(prevDraft);
+      setMessage("error", String(e));
     }
   }
 
@@ -247,12 +361,7 @@ export default function InventoryPage() {
               marginBottom: 24,
             }}
           >
-            <div>
-              <Link href="/locations" style={btnSoft(false)}>
-                ← Locations
-              </Link>
-            </div>
-
+            <div />
             <h1
               style={{
                 fontSize: 30,
@@ -327,9 +436,6 @@ export default function InventoryPage() {
             <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
               ← Purchase Plan
             </Link>
-            <Link href="/locations" style={btnSoft(false)}>
-              Locations
-            </Link>
           </div>
 
           <div style={{ textAlign: "center" }}>
@@ -343,21 +449,6 @@ export default function InventoryPage() {
             >
               Inventory
             </div>
-            <div
-              style={{ marginTop: 6, color: COLORS.subtext, fontWeight: 800 }}
-            >
-              {shortenId(locationId)}
-            </div>
-          </div>
-
-          <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <button
-              onClick={refresh}
-              disabled={loading}
-              style={btnPrimary(loading)}
-            >
-              {loading ? "Refreshing…" : "Refresh"}
-            </button>
           </div>
         </header>
 
@@ -372,16 +463,85 @@ export default function InventoryPage() {
             style={{
               display: "flex",
               justifyContent: "space-between",
-              alignItems: "baseline",
+              alignItems: "center",
               gap: 12,
               flexWrap: "wrap",
             }}
           >
-            <div style={{ fontWeight: 950 }}>On-hand counts</div>
-            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-              Edit values and save per SKU
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontWeight: 950 }}>On-hand counts</div>
+
+              {/* Help icon */}
+              <button
+                onClick={() => setShowHelp((v) => !v)}
+                style={{
+                  width: 22,
+                  height: 22,
+                  borderRadius: "50%",
+                  border: `1px solid ${COLORS.border}`,
+                  background: "rgba(255,255,255,0.9)",
+                  color: COLORS.subtext,
+                  fontWeight: 900,
+                  cursor: "pointer",
+                  lineHeight: "20px",
+                  textAlign: "center",
+                  padding: 0,
+                }}
+                aria-label="What is SKU and units?"
+              >
+                ?
+              </button>
             </div>
+
+            <button
+              onClick={async () => {
+                setMsg("");
+                setMsgKind("");
+                try {
+                  for (const r of rows) {
+                    await saveRow(r.sku, r.onHandUnits);
+                  }
+                  setMessage("success", "Saved all inventory updates.");
+                } catch (e: any) {
+                  setMessage("error", String(e));
+                }
+              }}
+              disabled={loading || rows.length === 0}
+              style={btnPrimary(loading || rows.length === 0)}
+            >
+              Save
+            </button>
           </div>
+
+          {showHelp && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 12,
+                borderRadius: 12,
+                background: "rgba(255,255,255,0.85)",
+                border: `1px solid ${COLORS.border}`,
+                color: COLORS.text,
+                fontWeight: 800,
+                fontSize: 14,
+                lineHeight: 1.45,
+              }}
+            >
+              <div>
+                <strong>SKU</strong> (Stock Keeping Unit) is the unique
+                identifier for each product you track in inventory (for example:{" "}
+                <code>chicken_breast</code>,<code>romaine_lettuce</code>, or{" "}
+                <code>coke_12oz</code>).
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <strong>Units</strong> represent how many physical items you
+                currently have on hand for that SKU. A unit is whatever your
+                restaurant uses to count that product — for example: individual
+                items, packages, cases, or pounds — as defined in your inventory
+                system.
+              </div>
+            </div>
+          )}
 
           <div
             style={{
@@ -405,12 +565,16 @@ export default function InventoryPage() {
                     On Hand
                   </th>
                   <th
-                    style={{ textAlign: "right", padding: 12, fontWeight: 950 }}
-                  >
-                    Actions
-                  </th>
+                    style={{
+                      textAlign: "right",
+                      padding: "12px 6px", // tighter
+                      fontWeight: 950,
+                      width: 1, // shrink to content
+                    }}
+                  />
                 </tr>
               </thead>
+
               <tbody>
                 {rows.map((r) => (
                   <tr key={r.sku}>
@@ -433,20 +597,40 @@ export default function InventoryPage() {
                       }}
                     >
                       <input
-                        type="number"
-                        value={r.onHandUnits}
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        value={draftUnits[r.sku] ?? String(r.onHandUnits ?? 0)}
                         onChange={(e) => {
-                          const v = Number(e.target.value);
+                          const cleaned = sanitizeUnitsDraft(e.target.value);
+                          setDraftUnits((prev) => ({
+                            ...prev,
+                            [r.sku]: cleaned,
+                          }));
+                        }}
+                        onBlur={() => {
+                          const normalized = draftToNonNegInt(
+                            draftUnits[r.sku] ?? ""
+                          );
                           setRows((prev) =>
                             prev.map((x) =>
-                              x.sku === r.sku ? { ...x, onHandUnits: v } : x
+                              x.sku === r.sku
+                                ? { ...x, onHandUnits: normalized }
+                                : x
                             )
                           );
+                          setDraftUnits((prev) => ({
+                            ...prev,
+                            [r.sku]: String(normalized),
+                          }));
                         }}
-                        style={inputStyle}
+                        onFocus={(e) => e.currentTarget.select()}
+                        style={{
+                          ...inputStyle,
+                          width: 150, // easier to type
+                          fontSize: 16, // nicer on mobile
+                        }}
                       />
                     </td>
-
                     <td
                       style={{
                         padding: 12,
@@ -456,14 +640,36 @@ export default function InventoryPage() {
                       }}
                     >
                       <button
-                        onClick={() => saveRow(r.sku, r.onHandUnits)}
-                        disabled={!!savingSku && savingSku !== r.sku}
+                        type="button"
+                        onClick={() => {
+                          if (confirm(`Delete "${r.sku}"?`)) deleteRow(r.sku);
+                        }}
+                        aria-label={`Delete ${r.sku}`}
+                        title="Delete item"
                         style={{
-                          ...btnSoft(!!savingSku && savingSku !== r.sku),
-                          background: "rgba(255,255,255,0.85)",
+                          width: 28,
+                          height: 28,
+                          borderRadius: 10,
+                          border: `1px solid ${COLORS.dangerBorder}`,
+                          background: COLORS.dangerBg,
+                          color: COLORS.dangerText,
+                          fontWeight: 950,
+                          cursor: "pointer",
+                          lineHeight: "26px",
+                          padding: 0,
+                        }}
+                        onMouseEnter={(e) => {
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.transform = "translateY(-1px)";
+                        }}
+                        onMouseLeave={(e) => {
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.transform = "translateY(0px)";
                         }}
                       >
-                        {savingSku === r.sku ? "Saving…" : "Save"}
+                        ×
                       </button>
                     </td>
                   </tr>
@@ -486,6 +692,134 @@ export default function InventoryPage() {
                 ) : null}
               </tbody>
             </table>
+          </div>
+          {/* Add-item form (toggles when you click the +) */}
+          {showAddItem && (
+            <div
+              style={{
+                marginTop: 10,
+                padding: 12,
+                borderRadius: 12,
+                border: `1px solid ${COLORS.border}`,
+                background: "rgba(255,255,255,0.85)",
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ fontWeight: 900, color: COLORS.subtext }}>
+                Add item
+              </div>
+
+              <input
+                value={newSku}
+                onChange={(e) => setNewSku(e.target.value)}
+                placeholder="SKU (e.g., chicken_breast)"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "rgba(255,255,255,0.9)",
+                  color: COLORS.text,
+                  fontWeight: 800,
+                  outline: "none",
+                  minWidth: 240,
+                }}
+              />
+
+              <input
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={newUnitsDraft}
+                onChange={(e) =>
+                  setNewUnitsDraft(sanitizeUnitsDraft(e.target.value))
+                }
+                onBlur={() => {
+                  const normalized = draftToNonNegInt(newUnitsDraft);
+                  setNewUnitsDraft(String(normalized));
+                }}
+                onFocus={(e) => e.currentTarget.select()}
+                style={{
+                  ...inputStyle,
+                  width: 150,
+                  fontSize: 16,
+                }}
+              />
+
+              <button
+                type="button"
+                onClick={addLocalRow}
+                style={btnPrimary(false)}
+              >
+                Add
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowAddItem(false)}
+                style={btnSoft(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {/* + Add Item (icon only, bottom-centered like Locations page) */}
+          <div
+            style={{
+              marginTop: 16,
+              display: "flex",
+              justifyContent: "center",
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setShowAddItem((v) => !v)}
+              aria-label="Add inventory item"
+              title="Add inventory item"
+              style={{
+                width: 56,
+                height: 56,
+                borderRadius: "50%",
+                background: COLORS.primary, // solid circle
+                border: "none",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow: "0 4px 12px rgba(37,99,235,0.35)",
+                transition: "transform 120ms ease, box-shadow 120ms ease",
+                cursor: "pointer",
+              }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.transform =
+                  "translateY(-1px)";
+                (e.currentTarget as HTMLButtonElement).style.boxShadow =
+                  "0 10px 24px rgba(37,99,235,0.4)";
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.transform =
+                  "translateY(0px)";
+                (e.currentTarget as HTMLButtonElement).style.boxShadow =
+                  "0 4px 12px rgba(37,99,235,0.35)";
+              }}
+            >
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+                style={{ display: "block" }}
+              >
+                <path
+                  d="M12 5v14M5 12h14"
+                  stroke="white"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
           </div>
         </section>
       </main>

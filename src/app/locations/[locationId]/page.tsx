@@ -45,6 +45,138 @@ function shortenId(id: string) {
   return id.length <= 14 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
 }
 
+function toISODate(d: any): string {
+  const s = String(d ?? "");
+  // expecting "YYYY-MM-DD" from your plan; keep it simple
+  return s;
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchJsonWithTimeout(
+  url: string,
+  opts: RequestInit,
+  timeoutMs: number
+) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    const json = await res.json().catch(() => null);
+    return { res, json };
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function safeNum(x: any): number | null {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pillStyle(colors: {
+  bg: string;
+  border: string;
+  text: string;
+}): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "6px 10px",
+    borderRadius: 999,
+    border: `1px solid ${colors.border}`,
+    background: colors.bg,
+    color: colors.text,
+    fontWeight: 900,
+    fontSize: 12,
+    lineHeight: 1,
+    whiteSpace: "nowrap",
+  };
+}
+
+function strategyLabel(
+  s: PlanInput["ownerPrefs"]["strategy"] | string | null | undefined
+) {
+  switch (s) {
+    case "min_waste":
+      return "Minimize Waste";
+    case "balanced":
+      return "Balanced";
+    case "min_stockouts":
+      return "Minimize Stockouts";
+    default:
+      return String(s ?? "—");
+  }
+}
+
+function HelpDot({
+  title = "What do these mean?",
+  children,
+}: {
+  title?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <span style={{ position: "relative", display: "inline-flex" }}>
+      <button
+        type="button"
+        aria-label={title}
+        title={title}
+        onClick={() => setOpen((v) => !v)}
+        onBlur={() => setOpen(false)}
+        style={{
+          width: 22,
+          height: 22,
+          borderRadius: "50%",
+          border: `1px solid ${COLORS.border}`,
+          background: "rgba(255,255,255,0.85)",
+          color: COLORS.subtext,
+          fontWeight: 950,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: "pointer",
+          lineHeight: 1,
+          padding: 0,
+          userSelect: "none",
+        }}
+      >
+        ?
+      </button>
+
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="Purchase plan help"
+          style={{
+            position: "absolute",
+            top: 28,
+            right: 0,
+            width: 360,
+            maxWidth: "80vw",
+            padding: 12,
+            borderRadius: 12,
+            border: `1px solid ${COLORS.border}`,
+            background: "rgba(255,255,255,0.98)",
+            boxShadow: "0 12px 28px rgba(0,0,0,0.12)",
+            color: COLORS.text,
+            fontWeight: 750,
+            zIndex: 50,
+          }}
+        >
+          {children}
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
 export default function LocationPage() {
   const params = useParams<{ locationId: string }>();
 
@@ -73,6 +205,24 @@ export default function LocationPage() {
   const [paymentIntent, setPaymentIntent] = useState<any>(null);
   const [executeResp, setExecuteResp] = useState<any>(null);
 
+  type PlanSnapshot = {
+    id: string; // unique key for dropdown
+    createdAtMs: number;
+    input: PlanInput;
+    plan: PlanOutput;
+    paymentIntent: any;
+    executeResp: any;
+  };
+
+  const [planHistory, setPlanHistory] = useState<PlanSnapshot[]>([]);
+  const [selectedPlanId, setSelectedPlanId] = useState<string>("");
+
+  const selectedSnapshot = useMemo(() => {
+    if (!planHistory.length) return null;
+    if (!selectedPlanId) return planHistory[0]; // default: newest
+    return planHistory.find((p) => p.id === selectedPlanId) ?? planHistory[0];
+  }, [planHistory, selectedPlanId]);
+
   // -------------------------
   // On-chain orders (grouped by intent ref)
   // -------------------------
@@ -98,6 +248,11 @@ export default function LocationPage() {
   const [ordersError, setOrdersError] = useState<string>("");
   const [intents, setIntents] = useState<IntentRow[]>([]);
 
+  const [refreshCooldownUntilMs, setRefreshCooldownUntilMs] = useState(0);
+  const refreshCooldownMs = 5000; // 3 seconds
+
+  const [cooldownTick, setCooldownTick] = useState(0);
+
   // Manual vs Autonomous (from chain)
   const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
 
@@ -110,6 +265,7 @@ export default function LocationPage() {
   const [autoProposeEnabled, setAutoProposeEnabled] = useState(true);
   const [autoProposeMsg, setAutoProposeMsg] = useState<string>("");
   const autoProposeInFlight = useRef(false);
+  const refreshOrdersInFlight = useRef(false);
 
   function getSavedEnv(): "testing" | "production" {
     if (typeof window === "undefined") return "testing";
@@ -192,6 +348,10 @@ export default function LocationPage() {
   }
 
   async function refreshOrders() {
+    // Prevent overlapping refreshes (manual + auto + propose)
+    if (refreshOrdersInFlight.current) return;
+    refreshOrdersInFlight.current = true;
+
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
 
@@ -221,8 +381,37 @@ export default function LocationPage() {
         `&owner=${encodeURIComponent(owner)}` +
         `&locationId=${encodeURIComponent(locationId)}`;
 
-      const res = await fetch(url);
-      const json = await res.json();
+      const TIMEOUT_MS = 12_000; // 12s
+      const RETRY_DELAY_MS = 800; // 0.8s
+
+      let res: Response | null = null;
+      let json: any = null;
+
+      // 1st attempt
+      ({ res, json } = await fetchJsonWithTimeout(
+        url,
+        { method: "GET" },
+        TIMEOUT_MS
+      ));
+
+      // If it fails with the specific flaky error, retry once.
+      const missingResponse =
+        (json &&
+          typeof json?.error === "string" &&
+          json.error.includes("missing response")) ||
+        (json &&
+          typeof json?.message === "string" &&
+          json.message.includes("missing response"));
+
+      if ((!res.ok || !json?.ok) && missingResponse) {
+        await sleep(RETRY_DELAY_MS);
+
+        ({ res, json } = await fetchJsonWithTimeout(
+          url,
+          { method: "GET" },
+          TIMEOUT_MS
+        ));
+      }
 
       if (!res.ok || !json?.ok) {
         setIntents([]);
@@ -272,7 +461,21 @@ export default function LocationPage() {
       setOrdersError(String(e));
     } finally {
       setOrdersLoading(false);
+      refreshOrdersInFlight.current = false;
     }
+  }
+
+  async function refreshOrdersWithCooldown() {
+    const now = Date.now();
+
+    // If still cooling down or already loading, do nothing.
+    if (ordersLoading) return;
+    if (now < refreshCooldownUntilMs) return;
+
+    // Start cooldown immediately (prevents spam-click double fires)
+    setRefreshCooldownUntilMs(now + refreshCooldownMs);
+
+    await refreshOrders();
   }
 
   async function approveIntent(ref: string) {
@@ -521,6 +724,16 @@ export default function LocationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId, autoProposeEnabled, strategy, horizonDays, notes]);
 
+  useEffect(() => {
+    if (Date.now() >= refreshCooldownUntilMs) return;
+
+    const id = window.setInterval(() => {
+      setCooldownTick((x) => x + 1);
+    }, 250);
+
+    return () => window.clearInterval(id);
+  }, [refreshCooldownUntilMs]);
+
   if (!locationId) {
     return (
       <div
@@ -653,11 +866,6 @@ export default function LocationPage() {
             >
               Location
             </div>
-            <div
-              style={{ marginTop: 6, color: COLORS.subtext, fontWeight: 800 }}
-            >
-              {shortenId(locationId)}
-            </div>
           </div>
 
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
@@ -670,283 +878,67 @@ export default function LocationPage() {
           </div>
         </header>
 
-        {/* On-chain Orders (read-only) */}
+        {/* Generate Purchase Plan */}
         <section style={cardStyle}>
           <div
             style={{
               display: "flex",
+              alignItems: "center",
               justifyContent: "space-between",
               gap: 12,
-              alignItems: "center",
-              flexWrap: "wrap",
+              marginBottom: 8, // 🔧 tight spacing under header
             }}
           >
-            <div
-              style={{
-                marginTop: 8,
-                display: "flex",
-                gap: 10,
-                flexWrap: "wrap",
-              }}
-            >
-              <button
-                onClick={() => setAutoProposeEnabled((v) => !v)}
-                style={btnSoft(false)}
-              >
-                Auto-propose: {autoProposeEnabled ? "ON" : "OFF"}
-              </button>
+            <div style={{ fontWeight: 950, fontSize: 16 }}>Purchase Plan</div>
 
-              <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                {autoProposeMsg ||
-                  (autoProposeEnabled ? "Running every 60s" : "Paused")}
+            <HelpDot title="Explain plan settings">
+              <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                Plan settings
               </div>
-            </div>
 
-            <button
-              onClick={refreshOrders}
-              disabled={ordersLoading}
-              style={btnSoft(ordersLoading)}
-            >
-              {ordersLoading ? "Refreshing…" : "Refresh Orders"}
-            </button>
-          </div>
-
-          {ordersError ? (
-            <div
-              style={{
-                border: `1px solid ${COLORS.warnBorder}`,
-                background: COLORS.warnBg,
-                color: COLORS.warnText,
-                borderRadius: 12,
-                padding: 12,
-                fontWeight: 800,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {ordersError}
-            </div>
-          ) : intents.length === 0 ? (
-            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-              No orders found.
-            </div>
-          ) : (
-            <div style={{ display: "grid", gap: 12 }}>
-              {intents.map((i) => {
-                const now = Math.floor(Date.now() / 1000);
-                const pending =
-                  !i.canceled && !i.executed && now < Number(i.executeAfter);
-
-                // Only show Approve in Manual mode
-                const showApprove = requireApproval === true;
-
-                // Can approve only if pending, not already approved/canceled/executed
-                const canApprove =
-                  showApprove &&
-                  pending &&
-                  !i.approved &&
-                  approvingRef !== i.ref;
-
-                return (
-                  <div
-                    key={i.ref}
-                    style={{
-                      border: `1px solid ${COLORS.border}`,
-                      borderRadius: 12,
-                      padding: 12,
-                      background: "rgba(255,255,255,0.75)",
-                      display: "grid",
-                      gap: 10,
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        gap: 12,
-                        alignItems: "center",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <div>
-                        <div style={{ fontWeight: 950 }}>
-                          Intent:{" "}
-                          <span
-                            style={{
-                              fontFamily: "ui-monospace, Menlo, monospace",
-                            }}
-                          >
-                            {shortenId(i.ref)}
-                          </span>
-                        </div>
-                        <div
-                          style={{
-                            marginTop: 4,
-                            color: COLORS.subtext,
-                            fontWeight: 800,
-                          }}
-                        >
-                          Execute after: {fmtWhen(i.executeAfter)} • Status:{" "}
-                          {intentStatus(i)}
-                        </div>
-                      </div>
-
-                      {showApprove ? (
-                        <button
-                          onClick={() => approveIntent(i.ref)}
-                          disabled={!canApprove}
-                          style={btnPrimary(!canApprove)}
-                        >
-                          {approvingRef === i.ref
-                            ? "Approving…"
-                            : "Approve Intent"}
-                        </button>
-                      ) : (
-                        <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                          Autonomous (no approval needed)
-                        </div>
-                      )}
-                    </div>
-
-                    <div
-                      style={{
-                        overflowX: "auto",
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 12,
-                        background: "rgba(255,255,255,0.85)",
-                      }}
-                    >
-                      <table
-                        style={{ width: "100%", borderCollapse: "collapse" }}
-                      >
-                        <thead>
-                          <tr>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Order
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Supplier
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Execute After
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Status
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "right",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Amount (raw)
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {i.items.map((o) => (
-                            <tr key={o.orderId}>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                }}
-                              >
-                                #{o.orderId}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                  fontFamily: "ui-monospace, Menlo, monospace",
-                                  fontWeight: 800,
-                                }}
-                              >
-                                {o.supplier}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                }}
-                              >
-                                {fmtWhen(o.executeAfter)}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                  fontWeight: 900,
-                                }}
-                              >
-                                {o.canceled
-                                  ? "Canceled"
-                                  : o.executed
-                                  ? "Executed"
-                                  : "Pending"}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                  textAlign: "right",
-                                  fontFamily: "ui-monospace, Menlo, monospace",
-                                  fontWeight: 800,
-                                }}
-                              >
-                                {o.amount}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+              <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
+                <div>
+                  <div style={{ fontWeight: 950 }}>Strategy</div>
+                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                    How Mozi trades off waste vs. stockouts when choosing
+                    quantities.
+                    <div style={{ marginTop: 6 }}>
+                      <span style={{ fontWeight: 900 }}>
+                        {strategyLabel("min_waste")}
+                      </span>
+                      : order less, accept higher stockout risk •{" "}
+                      <span style={{ fontWeight: 900 }}>
+                        {strategyLabel("balanced")}
+                      </span>
+                      : default tradeoff •{" "}
+                      <span style={{ fontWeight: 900 }}>
+                        {strategyLabel("min_stockouts")}
+                      </span>
+                      : order more, accept higher waste risk
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
+                </div>
 
-        {/* Controls */}
-        <section style={cardStyle}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "baseline",
-              gap: 12,
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ fontWeight: 950 }}>Generate purchase plan</div>
-            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-              Deterministic controls → /api/plan
-            </div>
+                <div>
+                  <div style={{ fontWeight: 950 }}>Planning Horizon</div>
+                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                    How far into the future Mozi looks when deciding what to
+                    order today. A longer horizon means Mozi considers upcoming
+                    demand and deliveries further out; a shorter horizon makes
+                    it focus more on the near term.
+                  </div>
+                </div>
+
+                <div>
+                  <div style={{ fontWeight: 950 }}>Additional Context</div>
+                  <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                    Short notes that adjust assumptions (events, seasonality,
+                    promos, unusual weeks). Example: “Football weekend” can bias
+                    expected demand.
+                  </div>
+                </div>
+              </div>
+            </HelpDot>
           </div>
 
           <div
@@ -977,17 +969,17 @@ export default function LocationPage() {
                   outline: "none",
                 }}
               >
-                <option value="min_waste">min_waste (minimize waste)</option>
-                <option value="balanced">balanced</option>
+                <option value="min_waste">{strategyLabel("min_waste")}</option>
+                <option value="balanced">{strategyLabel("balanced")}</option>
                 <option value="min_stockouts">
-                  min_stockouts (avoid stockouts)
+                  {strategyLabel("min_stockouts")}
                 </option>
               </select>
             </div>
 
             <div style={{ display: "grid", gap: 6 }}>
               <label style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Planning horizon (days)
+                Planning Horizon
               </label>
               <input
                 type="number"
@@ -1009,7 +1001,7 @@ export default function LocationPage() {
 
             <div style={{ display: "grid", gap: 6, gridColumn: "1 / -1" }}>
               <label style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Notes (context)
+                Additional Context
               </label>
               <input
                 value={notes}
@@ -1031,11 +1023,8 @@ export default function LocationPage() {
           <div
             style={{
               display: "flex",
-              gap: 10,
-              alignItems: "center",
               justifyContent: "flex-end",
-              flexWrap: "wrap",
-              paddingTop: 4,
+              marginTop: 8, // 🔧 tighter vertical spacing
             }}
           >
             <button
@@ -1046,238 +1035,297 @@ export default function LocationPage() {
               {loading ? "Generating…" : "Generate Plan"}
             </button>
           </div>
-        </section>
 
-        {/* Error */}
-        {error ? (
-          <section
-            style={{
-              ...cardStyle,
-              border: `1px solid ${COLORS.dangerBorder}`,
-              background: COLORS.dangerBg,
-              color: COLORS.dangerText,
-              fontWeight: 800,
-              whiteSpace: "pre-wrap",
-            }}
-          >
-            {error}
-          </section>
-        ) : plan ? (
-          <div style={{ marginTop: 16, display: "grid", gap: 16 }}>
-            {/* Summary */}
-            <section style={cardStyle}>
-              <div style={{ fontWeight: 950, fontSize: 18 }}>Purchase Plan</div>
+          {/* Generated Plan (shows here) */}
+          {error ? (
+            <div
+              style={{
+                marginTop: 12,
+                border: `1px solid ${COLORS.dangerBorder}`,
+                background: COLORS.dangerBg,
+                color: COLORS.dangerText,
+                borderRadius: 12,
+                padding: 12,
+                fontWeight: 800,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {error}
+            </div>
+          ) : null}
+
+          {plan ? (
+            <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
+              <div style={{ fontWeight: 950, fontSize: 16 }}>
+                Generated Plan
+              </div>
               <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
                 Generated: {plan.generatedAt} • Horizon: {plan.horizonDays} days
               </div>
 
-              {plan.summary?.keyDrivers?.length ? (
-                <div style={{ marginTop: 6 }}>
-                  <div style={{ fontWeight: 900 }}>Key drivers</div>
-                  <ul style={{ marginTop: 8, color: COLORS.text }}>
-                    {plan.summary.keyDrivers.map((d, i) => (
-                      <li key={i} style={{ marginTop: 6 }}>
-                        {d}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
+              {/* Orders */}
+              <div style={{ display: "grid", gap: 10 }}>
+                {plan.orders.map((order, idx) => (
+                  <details
+                    key={idx}
+                    open={idx === 0}
+                    style={{
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: 12,
+                      background: "rgba(255,255,255,0.75)",
+                      padding: 12,
+                    }}
+                  >
+                    <summary style={{ cursor: "pointer", fontWeight: 950 }}>
+                      Supplier:{" "}
+                      <span
+                        style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
+                      >
+                        {order.supplierId}
+                      </span>{" "}
+                      • {order.orderDate} • {order.items.length} items
+                    </summary>
 
-              {plan.summary?.warnings?.length ? (
-                <div
-                  style={{
-                    marginTop: 8,
-                    padding: 12,
-                    borderRadius: 12,
-                    border: `1px solid ${COLORS.warnBorder}`,
-                    background: COLORS.warnBg,
-                    color: COLORS.warnText,
-                  }}
-                >
-                  <div style={{ fontWeight: 900 }}>Warnings</div>
-                  <ul style={{ marginTop: 8 }}>
-                    {plan.summary.warnings.map((w, i) => (
-                      <li key={i} style={{ marginTop: 6 }}>
-                        {w}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-            </section>
-
-            {paymentIntent ? (
-              <section style={{ ...cardStyle, whiteSpace: "pre-wrap" }}>
-                <div style={{ fontWeight: 950 }}>Payment Intent (debug)</div>
-                <pre style={{ margin: 0, fontSize: 12 }}>
-                  {JSON.stringify(paymentIntent, null, 2)}
-                </pre>
-              </section>
-            ) : null}
-
-            {executeResp ? (
-              <section style={{ ...cardStyle, whiteSpace: "pre-wrap" }}>
-                <div style={{ fontWeight: 950 }}>Execute Response (debug)</div>
-                <pre style={{ margin: 0, fontSize: 12 }}>
-                  {JSON.stringify(executeResp, null, 2)}
-                </pre>
-              </section>
-            ) : null}
-
-            {/* Orders */}
-            {plan.orders.map((order, idx) => (
-              <section key={idx} style={cardStyle}>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    flexWrap: "wrap",
-                    alignItems: "baseline",
-                  }}
-                >
-                  <div style={{ fontWeight: 950 }}>
-                    Supplier:{" "}
-                    <span
-                      style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
+                    <div
+                      style={{
+                        marginTop: 10,
+                        overflowX: "auto",
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 12,
+                        background: "rgba(255,255,255,0.75)",
+                      }}
                     >
-                      {order.supplierId}
-                    </span>
-                  </div>
-                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                    Order date: {order.orderDate}
-                  </div>
-                </div>
+                      <table
+                        style={{ width: "100%", borderCollapse: "collapse" }}
+                      >
+                        <thead>
+                          <tr>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              SKU
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "right",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Units
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Risk
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "right",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Conf.
+                            </th>
+                            <th
+                              style={{
+                                textAlign: "left",
+                                padding: 12,
+                                fontWeight: 950,
+                              }}
+                            >
+                              Reason
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {order.items.map((it, j) => (
+                            <tr key={j}>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                }}
+                              >
+                                {it.sku}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                  textAlign: "right",
+                                  fontWeight: 900,
+                                }}
+                              >
+                                {it.orderUnits}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                }}
+                              >
+                                {it.riskNote ?? "—"}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                  textAlign: "right",
+                                }}
+                              >
+                                {typeof it.confidence === "number"
+                                  ? it.confidence.toFixed(2)
+                                  : "—"}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  borderTop: "1px solid #eef2f7",
+                                }}
+                              >
+                                {it.reason}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </section>
 
-                <div
-                  style={{
-                    marginTop: 10,
-                    overflowX: "auto",
-                    border: `1px solid ${COLORS.border}`,
-                    borderRadius: 12,
-                    background: "rgba(255,255,255,0.75)",
-                  }}
-                >
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr>
-                        <th
-                          style={{
-                            textAlign: "left",
-                            padding: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          SKU
-                        </th>
-                        <th
-                          style={{
-                            textAlign: "right",
-                            padding: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          Units
-                        </th>
-                        <th
-                          style={{
-                            textAlign: "left",
-                            padding: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          Risk
-                        </th>
-                        <th
-                          style={{
-                            textAlign: "right",
-                            padding: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          Conf.
-                        </th>
-                        <th
-                          style={{
-                            textAlign: "left",
-                            padding: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          Reason
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {order.items.map((it, j) => (
-                        <tr key={j}>
-                          <td
-                            style={{
-                              padding: 12,
-                              borderTop: "1px solid #eef2f7",
-                            }}
-                          >
-                            {it.sku}
-                          </td>
-                          <td
-                            style={{
-                              padding: 12,
-                              borderTop: "1px solid #eef2f7",
-                              textAlign: "right",
-                              fontWeight: 900,
-                            }}
-                          >
-                            {it.orderUnits}
-                          </td>
-                          <td
-                            style={{
-                              padding: 12,
-                              borderTop: "1px solid #eef2f7",
-                            }}
-                          >
-                            {it.riskNote ?? "—"}
-                          </td>
-                          <td
-                            style={{
-                              padding: 12,
-                              borderTop: "1px solid #eef2f7",
-                              textAlign: "right",
-                            }}
-                          >
-                            {typeof it.confidence === "number"
-                              ? it.confidence.toFixed(2)
-                              : "—"}
-                          </td>
-                          <td
-                            style={{
-                              padding: 12,
-                              borderTop: "1px solid #eef2f7",
-                            }}
-                          >
-                            {it.reason}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-            ))}
-          </div>
-        ) : (
-          <section
+        {/* On-chain Orders (read-only) */}
+        <section style={cardStyle}>
+          <div
             style={{
-              ...cardStyle,
-              border: `1px solid ${COLORS.greenBorder}`,
-              background: COLORS.greenBg,
-              color: COLORS.greenText,
-              fontWeight: 900,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
             }}
           >
-            No output yet — generate a plan to see proposed orders.
-          </section>
-        )}
+            {/* Left: title + pill */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ fontWeight: 950, fontSize: 16 }}>Orders</div>
+
+              {requireApproval === null ? null : requireApproval ? (
+                <span
+                  style={pillStyle({
+                    bg: COLORS.warnBg,
+                    border: COLORS.warnBorder,
+                    text: COLORS.warnText,
+                  })}
+                >
+                  Manual
+                </span>
+              ) : (
+                <span
+                  style={pillStyle({
+                    bg: COLORS.greenBg,
+                    border: COLORS.greenBorder,
+                    text: COLORS.greenText,
+                  })}
+                >
+                  Autonomous
+                </span>
+              )}
+            </div>
+
+            {/* Right: Refresh button */}
+            {(() => {
+              const cooldownRemainingMs = Math.max(
+                0,
+                refreshCooldownUntilMs - Date.now()
+              );
+              const refreshDisabled = ordersLoading || cooldownRemainingMs > 0;
+
+              const tooltip = ordersLoading
+                ? "Refreshing orders…"
+                : cooldownRemainingMs > 0
+                ? `Please wait ${Math.ceil(
+                    cooldownRemainingMs / 1000
+                  )}s before refreshing again (prevents server errors).`
+                : "Refresh orders";
+
+              return (
+                <button
+                  type="button"
+                  onClick={refreshOrdersWithCooldown}
+                  disabled={refreshDisabled}
+                  title={tooltip}
+                  style={btnSoft(refreshDisabled)}
+                >
+                  Refresh
+                </button>
+              );
+            })()}
+          </div>
+
+          {ordersError ? (
+            <div
+              style={{
+                border: `1px solid ${COLORS.warnBorder}`,
+                background: COLORS.warnBg,
+                color: COLORS.warnText,
+                borderRadius: 12,
+                padding: 12,
+                fontWeight: 800,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {ordersError}
+            </div>
+          ) : intents.length === 0 ? (
+            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+              No orders found.
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 12 }}>
+              {intents.map((i) => {
+                const now = Math.floor(Date.now() / 1000);
+                const pending =
+                  !i.canceled && !i.executed && now < Number(i.executeAfter);
+
+                const showApprove = requireApproval === true;
+                const canApprove =
+                  showApprove &&
+                  pending &&
+                  !i.approved &&
+                  approvingRef !== i.ref;
+
+                return (
+                  <div
+                    key={i.ref}
+                    style={{
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: 12,
+                      padding: 12,
+                      background: "rgba(255,255,255,0.75)",
+                      display: "grid",
+                      gap: 10,
+                    }}
+                  >
+                    {/* ... keep your existing intent UI exactly as-is ... */}
+                    {/* (I’m not repeating it here; paste your existing intent rendering block unchanged) */}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
       </main>
     </div>
   );

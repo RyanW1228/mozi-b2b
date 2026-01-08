@@ -21,11 +21,6 @@ type LocationSummary = {
   timezone: string;
 };
 
-function shortenId(id: string) {
-  if (!id) return "—";
-  return id.length <= 10 ? id : `${id.slice(0, 6)}…${id.slice(-4)}`;
-}
-
 export default function LocationsPage() {
   const [locations, setLocations] = useState<LocationSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -167,7 +162,7 @@ export default function LocationsPage() {
                   flexWrap: "wrap",
                 }}
               >
-                <div style={{ fontWeight: 950 }}>Your locations</div>
+                <div style={{ fontWeight: 950 }}>Your Locations</div>
                 <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
                   {loading
                     ? "Loading…"
@@ -187,20 +182,111 @@ export default function LocationsPage() {
                   No locations returned.
                 </div>
               ) : (
-                <div style={{ display: "grid", gap: 12 }}>
-                  {locations.map((loc) => (
+                <>
+                  <div style={{ display: "grid", gap: 12 }}>
+                    {locations.map((loc) => (
+                      <Link
+                        key={loc.id}
+                        href={`/locations/${loc.id}`}
+                        style={{
+                          padding: 16,
+                          borderRadius: 14,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "rgba(255,255,255,0.75)",
+                          textDecoration: "none",
+                          color: "inherit",
+                          display: "block",
+                          boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+                          transition:
+                            "transform 120ms ease, box-shadow 120ms ease",
+                        }}
+                        onMouseEnter={(e) => {
+                          (
+                            e.currentTarget as HTMLAnchorElement
+                          ).style.transform = "translateY(-1px)";
+                          (
+                            e.currentTarget as HTMLAnchorElement
+                          ).style.boxShadow = "0 6px 18px rgba(0,0,0,0.08)";
+                        }}
+                        onMouseLeave={(e) => {
+                          (
+                            e.currentTarget as HTMLAnchorElement
+                          ).style.transform = "translateY(0px)";
+                          (
+                            e.currentTarget as HTMLAnchorElement
+                          ).style.boxShadow = "0 1px 2px rgba(0,0,0,0.04)";
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 12,
+                            alignItems: "center",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div style={{ fontWeight: 950, fontSize: 16 }}>
+                            {loc.name}
+                          </div>
+                        </div>
+
+                        <div
+                          style={{
+                            marginTop: 6,
+                            color: COLORS.subtext,
+                            fontWeight: 700,
+                          }}
+                        >
+                          Timezone: {loc.timezone}
+                        </div>
+
+                        <div
+                          style={{
+                            marginTop: 10,
+                            display: "flex",
+                            justifyContent: "flex-end",
+                          }}
+                        >
+                          <span
+                            style={{
+                              background: "#eff6ff",
+                              border: "1px solid #bfdbfe",
+                              color: "#1d4ed8",
+                              padding: "8px 12px",
+                              borderRadius: 12,
+                              fontWeight: 950,
+                            }}
+                          >
+                            Open →
+                          </span>
+                        </div>
+                      </Link>
+                    ))}
+                  </div>
+
+                  {/* + Add Location (icon only) */}
+                  <div
+                    style={{
+                      marginTop: 16,
+                      display: "flex",
+                      justifyContent: "center",
+                    }}
+                  >
                     <Link
-                      key={loc.id}
-                      href={`/locations/${loc.id}`}
+                      href="/locations/new"
+                      aria-label="Add location"
+                      title="Add location"
                       style={{
-                        padding: 16,
-                        borderRadius: 14,
-                        border: `1px solid ${COLORS.border}`,
-                        background: "rgba(255,255,255,0.75)",
+                        width: 56,
+                        height: 56,
+                        borderRadius: "50%",
+                        background: COLORS.primary, // solid circle
                         textDecoration: "none",
-                        color: "inherit",
-                        display: "block",
-                        boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        boxShadow: "0 4px 12px rgba(37,99,235,0.35)",
                         transition:
                           "transform 120ms ease, box-shadow 120ms ease",
                       }}
@@ -208,77 +294,33 @@ export default function LocationsPage() {
                         (e.currentTarget as HTMLAnchorElement).style.transform =
                           "translateY(-1px)";
                         (e.currentTarget as HTMLAnchorElement).style.boxShadow =
-                          "0 6px 18px rgba(0,0,0,0.08)";
+                          "0 10px 24px rgba(37,99,235,0.4)";
                       }}
                       onMouseLeave={(e) => {
                         (e.currentTarget as HTMLAnchorElement).style.transform =
                           "translateY(0px)";
                         (e.currentTarget as HTMLAnchorElement).style.boxShadow =
-                          "0 1px 2px rgba(0,0,0,0.04)";
+                          "0 4px 12px rgba(37,99,235,0.35)";
                       }}
                     >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 12,
-                          alignItems: "center",
-                          flexWrap: "wrap",
-                        }}
+                      <svg
+                        width="22"
+                        height="22"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        xmlns="http://www.w3.org/2000/svg"
+                        style={{ display: "block" }}
                       >
-                        <div style={{ fontWeight: 950, fontSize: 16 }}>
-                          {loc.name}
-                        </div>
-
-                        <div
-                          style={{
-                            fontFamily: "ui-monospace, Menlo, monospace",
-                            fontWeight: 900,
-                            color: COLORS.subtext,
-                            background: "rgba(255,255,255,0.6)",
-                            border: `1px solid ${COLORS.border}`,
-                            padding: "6px 10px",
-                            borderRadius: 999,
-                          }}
-                          title={loc.id}
-                        >
-                          {shortenId(loc.id)}
-                        </div>
-                      </div>
-
-                      <div
-                        style={{
-                          marginTop: 6,
-                          color: COLORS.subtext,
-                          fontWeight: 700,
-                        }}
-                      >
-                        Timezone: {loc.timezone}
-                      </div>
-
-                      <div
-                        style={{
-                          marginTop: 10,
-                          display: "flex",
-                          justifyContent: "flex-end",
-                        }}
-                      >
-                        <span
-                          style={{
-                            background: "#eff6ff",
-                            border: "1px solid #bfdbfe",
-                            color: "#1d4ed8",
-                            padding: "8px 12px",
-                            borderRadius: 12,
-                            fontWeight: 950,
-                          }}
-                        >
-                          Open →
-                        </span>
-                      </div>
+                        <path
+                          d="M12 5v14M5 12h14"
+                          stroke="white"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                        />
+                      </svg>
                     </Link>
-                  ))}
-                </div>
+                  </div>
+                </>
               )}
             </section>
 
