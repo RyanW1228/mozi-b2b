@@ -1,5 +1,6 @@
 // src/app/api/orders/propose/route.ts
 export const runtime = "nodejs";
+export const maxDuration = 90;
 
 import { NextResponse } from "next/server";
 import {
@@ -13,10 +14,36 @@ import { upsertIntent } from "@/lib/intentStore";
 
 type ExecuteCall = { to: string; data: string };
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    p.then((v) => {
+      clearTimeout(id);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(id);
+      reject(e);
+    });
+  });
+}
+
 function getLocationIdFromUrl(url: string): string | null {
   const u = new URL(url);
   const locationId = u.searchParams.get("locationId");
   return locationId && locationId.trim().length > 0 ? locationId : null;
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __moziWarmupLastAt: Map<string, number> | undefined;
+}
+
+function warmupLastAtStore(): Map<string, number> {
+  if (!global.__moziWarmupLastAt) global.__moziWarmupLastAt = new Map();
+  return global.__moziWarmupLastAt;
 }
 
 export async function POST(req: Request) {
@@ -79,21 +106,36 @@ export async function POST(req: Request) {
     // -------------------------
     const origin = new URL(req.url).origin;
 
-    const warmRes = await fetch(
-      `${origin}/api/orders/list?env=${encodeURIComponent(env)}` +
-        `&owner=${encodeURIComponent(ownerAddress)}` +
-        `&locationId=${encodeURIComponent(locationId)}`,
-      { method: "GET" }
-    );
+    let warmup = { ok: false, status: 0, json: null as any };
 
-    // optional debug only
-    const warmJson = await warmRes.json().catch(() => null);
+    try {
+      const warmRes = await withTimeout(
+        fetch(
+          `${origin}/api/orders/list?env=${encodeURIComponent(env)}` +
+            `&owner=${encodeURIComponent(ownerAddress)}` +
+            `&locationId=${encodeURIComponent(locationId)}`,
+          { method: "GET" }
+        ),
+        3_000,
+        "warm /api/orders/list"
+      );
+
+      warmup.ok = warmRes.ok;
+      warmup.status = warmRes.status;
+      warmup.json = await warmRes.json().catch(() => null);
+    } catch {
+      // ignore warmup failures (should never block proposing)
+    }
 
     // Now fetch deterministic state (pipeline-aware)
-    const stateRes = await fetch(
-      `${origin}/api/state?locationId=${encodeURIComponent(locationId)}` +
-        `&owner=${encodeURIComponent(ownerAddress)}`,
-      { method: "GET" }
+    const stateRes = await withTimeout(
+      fetch(
+        `${origin}/api/state?locationId=${encodeURIComponent(locationId)}` +
+          `&owner=${encodeURIComponent(ownerAddress)}`,
+        { method: "GET" }
+      ),
+      6_000,
+      "/api/state"
     );
 
     const baseInput = await stateRes.json().catch(() => null);
@@ -104,7 +146,7 @@ export async function POST(req: Request) {
           ok: false,
           error: "State route failed",
           detail: baseInput,
-          warmup: { ok: warmRes.ok, status: warmRes.status, json: warmJson },
+          warmup,
         },
         { status: stateRes.status }
       );
@@ -115,7 +157,7 @@ export async function POST(req: Request) {
         {
           ok: false,
           error: "State route returned empty JSON",
-          warmup: warmJson,
+          warmup,
         },
         { status: 500 }
       );
@@ -143,11 +185,16 @@ export async function POST(req: Request) {
     };
 
     // 3) Generate plan
-    const planRes = await fetch(`${origin}/api/plan`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
-    });
+    const planRes = await withTimeout(
+      fetch(`${origin}/api/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      }),
+      30_000,
+      "/api/plan"
+    );
+
     const plan = await planRes.json();
     if (!planRes.ok) {
       return NextResponse.json(
@@ -259,16 +306,20 @@ export async function POST(req: Request) {
     const executeUrl =
       `${origin}/api/execute?locationId=` + encodeURIComponent(locationId);
 
-    const execRes = await fetch(executeUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ownerAddress,
-        pendingWindowHours: body.pendingWindowHours ?? 24,
-        input,
-        plan,
+    const execRes = await withTimeout(
+      fetch(executeUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ownerAddress,
+          pendingWindowHours: body.pendingWindowHours ?? 24,
+          input,
+          plan,
+        }),
       }),
-    });
+      12_000,
+      "/api/execute"
+    );
 
     const execJson = await execRes.json();
 
@@ -370,7 +421,7 @@ export async function POST(req: Request) {
       // MVP: snapshot failure should not block proposing
     }
 
-    // 5) Broadcast calls as agent wallet
+    // 5) Broadcast calls as agent wallet (fast: don't wait confirmations)
     const provider = new JsonRpcProvider(SEPOLIA_RPC_URL);
     const agent = new Wallet(AGENT_PRIVATE_KEY, provider);
 
@@ -384,9 +435,14 @@ export async function POST(req: Request) {
         );
       }
 
-      const tx = await agent.sendTransaction({ to: c.to, data: c.data });
+      const tx = await withTimeout(
+        agent.sendTransaction({ to: c.to, data: c.data }),
+        10_000,
+        "sendTransaction"
+      );
+
+      // DO NOT await tx.wait() — returning hashes is enough for MVP
       txs.push({ to: c.to, hash: tx.hash });
-      await tx.wait();
     }
 
     return NextResponse.json({

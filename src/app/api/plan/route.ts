@@ -1,10 +1,27 @@
 //src/app/api/plan/route.ts
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 import { NextResponse } from "next/server";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type { PlanInput, PlanOutput } from "@/lib/types";
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    p.then((v) => {
+      clearTimeout(id);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(id);
+      reject(e);
+    });
+  });
+}
 
 export async function POST(req: Request) {
   try {
@@ -142,16 +159,21 @@ export async function POST(req: Request) {
       `- If required data is missing, include it in summary.warnings.\n`;
 
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: "models/gemini-2.5-pro",
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      config: {
-        temperature: 0.7,
-        topP: 0.95,
-        topK: 64,
-        maxOutputTokens: 2048,
-      },
-    });
+
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: "models/gemini-2.5-pro",
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        config: {
+          temperature: 0.7,
+          topP: 0.95,
+          topK: 64,
+          maxOutputTokens: 2048,
+        },
+      }),
+      12_000, // <-- IMPORTANT: keep < your platform timeout
+      "Gemini generateContent"
+    );
 
     // 3) Parse JSON safely
     const raw = (response.text ?? "").trim();
@@ -208,8 +230,11 @@ export async function POST(req: Request) {
   } catch (err: any) {
     console.error("Gemini call failed:", err);
     return NextResponse.json(
-      { error: "Gemini call failed", detail: String(err?.message ?? err) },
-      { status: 500 }
+      {
+        error: "Gemini call failed",
+        detail: String(err?.message ?? err),
+      },
+      { status: 502 }
     );
   }
 }

@@ -290,8 +290,9 @@ export default function LocationPage() {
   );
 
   // Supplier display map: payoutAddress(lower) -> { name, address }
+  // Supplier display map: payoutAddress(lower) -> { name, address, leadTimeDays }
   const [supplierByAddress, setSupplierByAddress] = useState<
-    Record<string, { name: string; address: string }>
+    Record<string, { name: string; address: string; leadTimeDays: number }>
   >({});
 
   function supplierLabel(addr: string) {
@@ -300,6 +301,9 @@ export default function LocationPage() {
     return {
       name: hit?.name ?? "Unknown supplier",
       address: addr,
+      leadTimeDays: Number.isFinite(hit?.leadTimeDays as any)
+        ? Number(hit?.leadTimeDays)
+        : 0,
     };
   }
 
@@ -353,6 +357,11 @@ export default function LocationPage() {
   // UI state for approve button
   const [approvingRef, setApprovingRef] = useState<string | null>(null);
 
+  // UI state for deleting (canceling) a grouped order card
+  const [cancelingOrderKey, setCancelingOrderKey] = useState<string | null>(
+    null
+  );
+
   // -------------------------
   // Auto-propose (periodic)
   // -------------------------
@@ -365,6 +374,17 @@ export default function LocationPage() {
     if (typeof window === "undefined") return "testing";
     const v = window.localStorage.getItem("mozi_env");
     return v === "production" ? "production" : "testing";
+  }
+
+  function getInjectedProvider() {
+    if (typeof window === "undefined") return null;
+    const eth = (window as any).ethereum;
+    if (!eth) return null;
+
+    // If multiple injected providers exist, prefer MetaMask
+    const providers: any[] = Array.isArray(eth.providers) ? eth.providers : [];
+    const mm = providers.find((p) => p && p.isMetaMask);
+    return mm ?? eth;
   }
 
   function getSavedOwnerAddress(): string | null {
@@ -386,6 +406,28 @@ export default function LocationPage() {
     if (hours > 0) return `Execution in ${hours}h ${minutes}m`;
     if (minutes > 0) return `Execution in ${minutes}m ${seconds}s`;
     return `Execution in ${seconds}s`;
+  }
+
+  function arrivalEtaUnix(executeAfterUnix: number, leadTimeDays: number) {
+    if (!executeAfterUnix) return 0;
+    const d = Number.isFinite(leadTimeDays) ? Math.max(0, leadTimeDays) : 0;
+    return executeAfterUnix + d * 24 * 60 * 60;
+  }
+
+  function fmtArrivingCountdown(arrivalUnix: number) {
+    if (!arrivalUnix) return "Arrival time unknown";
+
+    const ms = arrivalUnix * 1000 - Date.now();
+    if (ms <= 0) return "Arrived";
+
+    const totalSec = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSec / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+    const seconds = totalSec % 60;
+
+    if (hours > 0) return `Arriving in ${hours}h ${minutes}m`;
+    if (minutes > 0) return `Arriving in ${minutes}m ${seconds}s`;
+    return `Arriving in ${seconds}s`;
   }
 
   function fmtWhen(ts: number) {
@@ -611,7 +653,13 @@ export default function LocationPage() {
       setOrdersError("");
       setApprovingRef(ref);
 
-      const provider = new BrowserProvider((window as any).ethereum);
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setOrdersError("No injected wallet found (window.ethereum missing).");
+        return;
+      }
+
+      const provider = new BrowserProvider(injected);
       const signer = await provider.getSigner();
 
       // optional: sanity check signer matches saved owner
@@ -636,6 +684,105 @@ export default function LocationPage() {
       setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
     } finally {
       setApprovingRef(null);
+    }
+  }
+
+  async function cancelOrderCard(o: {
+    key: string;
+    supplier: string;
+    executeAfter: number;
+    lines: Array<{ orderId?: string; canceled: boolean; executed: boolean }>;
+  }) {
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) {
+      setOrdersError(
+        "No valid wallet found. Connect wallet on homepage first."
+      );
+      return;
+    }
+    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
+      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
+      return;
+    }
+    if (typeof window === "undefined" || !(window as any).ethereum) {
+      setOrdersError("No injected wallet found (window.ethereum missing).");
+      return;
+    }
+
+    // Collect all cancellable orderIds in this card
+    const ids: bigint[] = [];
+    for (const ln of o.lines || []) {
+      const raw = String(ln?.orderId ?? "").trim();
+      if (!raw) continue;
+
+      // Skip lines already canceled/executed (defensive)
+      if (ln.canceled || ln.executed) continue;
+
+      try {
+        // uint256 orderId -> bigint
+        ids.push(BigInt(raw));
+      } catch {
+        // ignore bad ids
+      }
+    }
+
+    if (ids.length === 0) {
+      setOrdersError("No cancellable order IDs found in this order card.");
+      return;
+    }
+
+    try {
+      setOrdersError("");
+      setCancelingOrderKey(o.key);
+
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setOrdersError("No injected wallet found (window.ethereum missing).");
+        return;
+      }
+
+      const provider = new BrowserProvider(injected);
+      const signer = await provider.getSigner();
+
+      // Safety: ensure signer matches saved owner
+      const signerAddr = await signer.getAddress();
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setOrdersError("Connected wallet does not match saved owner address.");
+        return;
+      }
+
+      const hub = new Contract(
+        TREASURY_HUB_ADDRESS,
+        MOZI_TREASURY_HUB_ABI,
+        signer
+      );
+
+      // Cancel every order in this card (1 tx per orderId)
+      for (const id of ids) {
+        try {
+          const tx = await (hub as any).cancelOrder(id);
+
+          // Wait up to 60s for 1 confirmation. If it doesn't confirm, we still proceed.
+          try {
+            await provider.waitForTransaction(tx.hash, 1, 60_000);
+          } catch {
+            // timeout (tx may still confirm later) — continue
+          }
+        } catch (e: any) {
+          // If one cancel fails, stop and show why (so you don't hang silently)
+          setOrdersError(
+            `Cancel failed for orderId=${id.toString()}: ` +
+              String(e?.shortMessage || e?.reason || e?.message || e)
+          );
+          break;
+        }
+      }
+
+      await refreshOrders({ force: true });
+    } catch (e: any) {
+      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
+    } finally {
+      setCancelingOrderKey(null);
     }
   }
 
@@ -831,13 +978,24 @@ export default function LocationPage() {
       .then((r) => r.json())
       .then((json) => {
         const suppliers = Array.isArray(json?.suppliers) ? json.suppliers : [];
-        const map: Record<string, { name: string; address: string }> = {};
+        const map: Record<
+          string,
+          { name: string; address: string; leadTimeDays: number }
+        > = {};
+
         for (const s of suppliers) {
           const name = String(s?.name ?? s?.supplierId ?? "Supplier");
           const addr = String(s?.payoutAddress ?? "");
           if (!addr) continue;
-          map[addr.toLowerCase()] = { name, address: addr };
+
+          const leadTimeDaysRaw = Number(s?.leadTimeDays ?? 0);
+          const leadTimeDays = Number.isFinite(leadTimeDaysRaw)
+            ? Math.max(0, Math.floor(leadTimeDaysRaw))
+            : 0;
+
+          map[addr.toLowerCase()] = { name, address: addr, leadTimeDays };
         }
+
         setSupplierByAddress(map);
       })
       .catch(() => {
@@ -1588,6 +1746,13 @@ export default function LocationPage() {
 
                 return groupedOrders.map((o) => {
                   const sup = supplierLabel(o.supplier);
+
+                  // Pending window is over once now >= executeAfter
+                  const nowUnix = Math.floor(Date.now() / 1000);
+                  const pendingEnded =
+                    Number(o.executeAfter) > 0 &&
+                    nowUnix >= Number(o.executeAfter);
+
                   const statusLabel = o.canceled
                     ? "Canceled"
                     : o.executed
@@ -1674,7 +1839,7 @@ export default function LocationPage() {
                             </div>
                           </div>
 
-                          {/* Row 2: Execution timer UNDER supplier name */}
+                          {/* Row 2: Execution timer */}
                           <div
                             style={{
                               color: COLORS.subtext,
@@ -1684,6 +1849,44 @@ export default function LocationPage() {
                           >
                             {fmtExecutionCountdown(Number(o.executeAfter))}
                           </div>
+
+                          {/* Row 3: Arrival time + ticking "Arriving in..." (ONLY after pending ends) */}
+                          {o.executed && !o.canceled
+                            ? (() => {
+                                // force re-render each second for arrival countdown
+                                void nowTick;
+
+                                const arrivalUnix = arrivalEtaUnix(
+                                  Number(o.executeAfter),
+                                  sup.leadTimeDays
+                                );
+
+                                return (
+                                  <div style={{ display: "grid", gap: 2 }}>
+                                    <div
+                                      style={{
+                                        color: COLORS.subtext,
+                                        fontWeight: 800,
+                                        fontSize: 13,
+                                      }}
+                                    >
+                                      {fmtArrivingCountdown(arrivalUnix)}
+                                    </div>
+
+                                    <div
+                                      style={{
+                                        color: COLORS.subtext,
+                                        fontWeight: 800,
+                                        fontSize: 12,
+                                      }}
+                                    >
+                                      Arrival:{" "}
+                                      {arrivalUnix ? fmtWhen(arrivalUnix) : "—"}
+                                    </div>
+                                  </div>
+                                );
+                              })()
+                            : null}
                         </div>
 
                         <div
@@ -1903,6 +2106,46 @@ export default function LocationPage() {
                                 );
                               })()}
                             </div>
+                            {/* Actions (bottom-right under table) */}
+                            {(() => {
+                              const isPending = !o.canceled && !pendingEnded; // pending window still active
+                              const isDeletingThis =
+                                cancelingOrderKey === o.key;
+
+                              if (!isPending) return null;
+
+                              return (
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "flex-end",
+                                    gap: 10,
+                                    marginTop: 4,
+                                  }}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => cancelOrderCard(o)}
+                                    disabled={isDeletingThis}
+                                    title="Cancel all orders in this card (owner override)"
+                                    style={{
+                                      padding: "10px 14px",
+                                      borderRadius: 12,
+                                      border: `1px solid ${COLORS.dangerBorder}`,
+                                      background: COLORS.dangerBg,
+                                      color: COLORS.dangerText,
+                                      fontWeight: 950,
+                                      cursor: isDeletingThis
+                                        ? "not-allowed"
+                                        : "pointer",
+                                      opacity: isDeletingThis ? 0.7 : 1,
+                                    }}
+                                  >
+                                    {isDeletingThis ? "Deleting…" : "Delete"}
+                                  </button>
+                                </div>
+                              );
+                            })()}
                           </div>
                         ) : null}
                       </div>
