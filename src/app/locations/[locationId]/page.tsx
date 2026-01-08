@@ -9,6 +9,7 @@ import { buildPaymentIntentFromPlan } from "@/lib/pricing";
 import {
   BrowserProvider,
   Contract,
+  formatUnits,
   isAddress,
   keccak256,
   toUtf8Bytes,
@@ -193,6 +194,23 @@ function HelpDot({
   );
 }
 
+function ChevronDown({ open }: { open: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: "inline-block",
+        transform: open ? "rotate(180deg)" : "rotate(0deg)",
+        transition: "transform 120ms ease",
+        fontSize: 16,
+        lineHeight: 1,
+      }}
+    >
+      ▾
+    </span>
+  );
+}
+
 export default function LocationPage() {
   const params = useParams<{ locationId: string }>();
 
@@ -266,10 +284,68 @@ export default function LocationPage() {
   const [ordersError, setOrdersError] = useState<string>("");
   const [intents, setIntents] = useState<IntentRow[]>([]);
 
-  const [refreshCooldownUntilMs, setRefreshCooldownUntilMs] = useState(0);
-  const refreshCooldownMs = 5000; // 3 seconds
+  // which order cards are expanded (keyed by grouped order key)
+  const [openOrderKeys, setOpenOrderKeys] = useState<Record<string, boolean>>(
+    {}
+  );
 
+  // Supplier display map: payoutAddress(lower) -> { name, address }
+  const [supplierByAddress, setSupplierByAddress] = useState<
+    Record<string, { name: string; address: string }>
+  >({});
+
+  function supplierLabel(addr: string) {
+    const key = String(addr || "").toLowerCase();
+    const hit = supplierByAddress[key];
+    return {
+      name: hit?.name ?? "Unknown supplier",
+      address: addr,
+    };
+  }
+
+  function fmtCostUsdFromRawAmount(raw: string) {
+    try {
+      // Assumption in your codebase: 18 decimals and 1 token ~= $1
+      const usd = Number(formatUnits(BigInt(raw), 18));
+      if (!Number.isFinite(usd)) return "—";
+      return usd.toFixed(2);
+    } catch {
+      return "—";
+    }
+  }
+
+  function fmtCountdown(executeAfterUnix: number) {
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const diff = Math.max(0, Number(executeAfterUnix) - nowUnix);
+
+    if (diff <= 0) return "Ready for execution";
+
+    const hours = Math.floor(diff / 3600);
+    const minutes = Math.floor((diff % 3600) / 60);
+    const seconds = diff % 60;
+
+    if (hours > 0) return `Execution in ${hours}h ${minutes}m ${seconds}s`;
+    if (minutes > 0) return `Execution in ${minutes}m ${seconds}s`;
+    return `Execution in ${seconds}s`;
+  }
+
+  // Tick once a second so the countdown updates
+  const [timerTick, setTimerTick] = useState(0);
+
+  const lastOrdersFetchAt = useRef(0);
+
+  // cooldown (5 seconds)
+  const refreshCooldownMs = 5000;
+  const [refreshCooldownUntilMs, setRefreshCooldownUntilMs] = useState(0);
   const [cooldownTick, setCooldownTick] = useState(0);
+
+  // re-render once per second for execution countdown timers
+  const [nowTick, setNowTick] = useState(0);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNowTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Manual vs Autonomous (from chain)
   const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
@@ -294,6 +370,22 @@ export default function LocationPage() {
   function getSavedOwnerAddress(): string | null {
     if (typeof window === "undefined") return null;
     return window.localStorage.getItem("mozi_wallet_address");
+  }
+
+  function fmtExecutionCountdown(executeAfterUnix: number) {
+    if (!executeAfterUnix) return "Execution time unknown";
+
+    const ms = executeAfterUnix * 1000 - Date.now();
+    if (ms <= 0) return "Ready to execute";
+
+    const totalSec = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSec / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+    const seconds = totalSec % 60;
+
+    if (hours > 0) return `Execution in ${hours}h ${minutes}m`;
+    if (minutes > 0) return `Execution in ${minutes}m ${seconds}s`;
+    return `Execution in ${seconds}s`;
   }
 
   function fmtWhen(ts: number) {
@@ -365,10 +457,23 @@ export default function LocationPage() {
     }
   }
 
-  async function refreshOrders() {
-    // Prevent overlapping refreshes (manual + auto + propose)
+  async function refreshOrders(opts?: { force?: boolean }) {
+    const nowMs = Date.now();
+    const force = Boolean(opts?.force);
+
+    // Prevent overlapping refreshes
     if (refreshOrdersInFlight.current) return;
+
+    // Global cooldown (applies to mount + auto + manual)
+    if (!force && nowMs - lastOrdersFetchAt.current < refreshCooldownMs) {
+      // update the UI cooldown timer so button shows remaining time
+      setRefreshCooldownUntilMs(lastOrdersFetchAt.current + refreshCooldownMs);
+      return;
+    }
+
     refreshOrdersInFlight.current = true;
+    lastOrdersFetchAt.current = nowMs;
+    setRefreshCooldownUntilMs(nowMs + refreshCooldownMs);
 
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
@@ -379,6 +484,7 @@ export default function LocationPage() {
       setOrdersError(
         "No valid wallet found. Go to the homepage, connect wallet, then come back."
       );
+      refreshOrdersInFlight.current = false;
       return;
     }
 
@@ -386,6 +492,7 @@ export default function LocationPage() {
       setIntents([]);
       setRequireApproval(null);
       setOrdersError("Missing locationId.");
+      refreshOrdersInFlight.current = false;
       return;
     }
 
@@ -393,26 +500,24 @@ export default function LocationPage() {
     setOrdersError("");
 
     try {
-      // 1) read intent groups from your API
       const url =
         `/api/orders/list?env=${encodeURIComponent(env)}` +
         `&owner=${encodeURIComponent(owner)}` +
-        `&locationId=${encodeURIComponent(locationId)}`;
+        `&locationId=${encodeURIComponent(locationId)}` +
+        `&limit=200`;
 
-      const TIMEOUT_MS = 12_000; // 12s
-      const RETRY_DELAY_MS = 800; // 0.8s
+      const TIMEOUT_MS = 12_000;
+      const RETRY_DELAY_MS = 800;
 
-      let res: Response | null = null;
-      let json: any = null;
+      let res: Response;
+      let json: any;
 
-      // 1st attempt
       ({ res, json } = await fetchJsonWithTimeout(
         url,
         { method: "GET" },
         TIMEOUT_MS
       ));
 
-      // If it fails with the specific flaky error, retry once.
       const missingResponse =
         (json &&
           typeof json?.error === "string" &&
@@ -423,7 +528,6 @@ export default function LocationPage() {
 
       if ((!res.ok || !json?.ok) && missingResponse) {
         await sleep(RETRY_DELAY_MS);
-
         ({ res, json } = await fetchJsonWithTimeout(
           url,
           { method: "GET" },
@@ -441,7 +545,6 @@ export default function LocationPage() {
 
       const raw = (json.intents ?? []) as IntentRow[];
 
-      // Hard guard: keep ONLY intents for this location (restaurantId)
       const scoped = raw.filter(
         (i) =>
           String(i.restaurantId || "").toLowerCase() ===
@@ -450,7 +553,7 @@ export default function LocationPage() {
 
       setIntents(scoped);
 
-      // 2) read manual/autonomous mode from chain
+      // manual/autonomous mode read
       if (
         !TREASURY_HUB_ADDRESS ||
         !isAddress(TREASURY_HUB_ADDRESS) ||
@@ -471,12 +574,11 @@ export default function LocationPage() {
       const req = (await (hub as any).requireApprovalForExecution(
         owner
       )) as boolean;
-
       setRequireApproval(Boolean(req));
     } catch (e: any) {
       setIntents([]);
       setRequireApproval(null);
-      setOrdersError(String(e));
+      setOrdersError(String(e?.message ?? e));
     } finally {
       setOrdersLoading(false);
       refreshOrdersInFlight.current = false;
@@ -484,16 +586,8 @@ export default function LocationPage() {
   }
 
   async function refreshOrdersWithCooldown() {
-    const now = Date.now();
-
-    // If still cooling down or already loading, do nothing.
     if (ordersLoading) return;
-    if (now < refreshCooldownUntilMs) return;
-
-    // Start cooldown immediately (prevents spam-click double fires)
-    setRefreshCooldownUntilMs(now + refreshCooldownMs);
-
-    await refreshOrders();
+    await refreshOrders(); // cooldown is enforced inside refreshOrders now
   }
 
   async function approveIntent(ref: string) {
@@ -720,6 +814,38 @@ export default function LocationPage() {
   }, [locationId]);
 
   useEffect(() => {
+    const id = window.setInterval(() => setTimerTick((x) => x + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!locationId || !owner || !isAddress(owner)) return;
+
+    fetch(
+      `/api/state?locationId=${encodeURIComponent(locationId)}` +
+        `&owner=${encodeURIComponent(owner)}` +
+        `&env=${encodeURIComponent(env)}`
+    )
+      .then((r) => r.json())
+      .then((json) => {
+        const suppliers = Array.isArray(json?.suppliers) ? json.suppliers : [];
+        const map: Record<string, { name: string; address: string }> = {};
+        for (const s of suppliers) {
+          const name = String(s?.name ?? s?.supplierId ?? "Supplier");
+          const addr = String(s?.payoutAddress ?? "");
+          if (!addr) continue;
+          map[addr.toLowerCase()] = { name, address: addr };
+        }
+        setSupplierByAddress(map);
+      })
+      .catch(() => {
+        // ignore
+      });
+  }, [locationId]);
+
+  useEffect(() => {
     if (typeof window === "undefined") return;
 
     const s = window.localStorage.getItem("mozi_plan_strategy");
@@ -745,8 +871,9 @@ export default function LocationPage() {
   }, [horizonDays]);
 
   useEffect(() => {
-    // Read-only load on first render for this location page
-    refreshOrders();
+    if (!locationId) return;
+    // one forced fetch on mount for this location
+    refreshOrders({ force: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
@@ -1370,35 +1497,441 @@ export default function LocationPage() {
             </div>
           ) : (
             <div style={{ display: "grid", gap: 12 }}>
-              {intents.map((i) => {
-                const now = Math.floor(Date.now() / 1000);
-                const pending =
-                  !i.canceled && !i.executed && now < Number(i.executeAfter);
+              {(() => {
+                // force re-render per second for countdowns
+                void nowTick;
 
-                const showApprove = requireApproval === true;
-                const canApprove =
-                  showApprove &&
-                  pending &&
-                  !i.approved &&
-                  approvingRef !== i.ref;
+                type GroupedOrder = {
+                  key: string;
+                  supplier: string;
+                  executeAfter: number;
+                  totalRaw: bigint;
+                  itemCount: number;
+                  canceled: boolean; // if any canceled
+                  executed: boolean; // if all executed
+                  lines: Array<{
+                    // keep these minimal + useful
+                    amountRaw: bigint;
+                    canceled: boolean;
+                    executed: boolean;
+                    orderId?: string; // optional, do not display unless you want to later
+                  }>;
+                };
 
-                return (
-                  <div
-                    key={i.ref}
-                    style={{
-                      border: `1px solid ${COLORS.border}`,
-                      borderRadius: 12,
-                      padding: 12,
-                      background: "rgba(255,255,255,0.75)",
-                      display: "grid",
-                      gap: 10,
-                    }}
-                  >
-                    {/* ... keep your existing intent UI exactly as-is ... */}
-                    {/* (I’m not repeating it here; paste your existing intent rendering block unchanged) */}
-                  </div>
+                const groupsMap = new Map<string, GroupedOrder>();
+
+                for (const intent of intents) {
+                  const items = intent.items ?? [];
+                  for (const it of items) {
+                    const supplier = String(it.supplier || "");
+                    const executeAfter = Number(
+                      it.executeAfter ?? intent.executeAfter ?? 0
+                    );
+
+                    // ✅ GROUP KEY = supplier + executeAfter (this is your requirement)
+                    const key = `${supplier.toLowerCase()}:${executeAfter}`;
+
+                    let amountRaw = BigInt(0);
+                    try {
+                      amountRaw = BigInt(it.amount || "0");
+                    } catch {
+                      amountRaw = BigInt(0);
+                    }
+
+                    const itemCanceled = Boolean(
+                      intent.canceled || it.canceled
+                    );
+                    const itemExecuted = Boolean(
+                      intent.executed || it.executed
+                    );
+
+                    const existing = groupsMap.get(key);
+
+                    if (!existing) {
+                      groupsMap.set(key, {
+                        key,
+                        supplier,
+                        executeAfter,
+                        totalRaw: amountRaw,
+                        itemCount: 1,
+                        canceled: itemCanceled,
+                        executed: itemExecuted,
+                        lines: [
+                          {
+                            amountRaw,
+                            canceled: itemCanceled,
+                            executed: itemExecuted,
+                            orderId: String((it as any)?.orderId ?? ""),
+                          },
+                        ],
+                      });
+                    } else {
+                      existing.totalRaw += amountRaw;
+                      existing.itemCount += 1;
+
+                      existing.canceled = existing.canceled || itemCanceled;
+                      existing.executed = existing.executed && itemExecuted;
+
+                      existing.lines.push({
+                        amountRaw,
+                        canceled: itemCanceled,
+                        executed: itemExecuted,
+                        orderId: String((it as any)?.orderId ?? ""),
+                      });
+                    }
+                  }
+                }
+
+                const groupedOrders = Array.from(groupsMap.values()).sort(
+                  (a, b) => b.executeAfter - a.executeAfter
                 );
-              })}
+
+                return groupedOrders.map((o) => {
+                  const sup = supplierLabel(o.supplier);
+                  const statusLabel = o.canceled
+                    ? "Canceled"
+                    : o.executed
+                    ? "Executed"
+                    : "Pending";
+
+                  const statusPill = o.canceled
+                    ? pillStyle({
+                        bg: COLORS.dangerBg,
+                        border: COLORS.dangerBorder,
+                        text: COLORS.dangerText,
+                      })
+                    : o.executed
+                    ? pillStyle({
+                        bg: COLORS.greenBg,
+                        border: COLORS.greenBorder,
+                        text: COLORS.greenText,
+                      })
+                    : pillStyle({
+                        bg: COLORS.warnBg,
+                        border: COLORS.warnBorder,
+                        text: COLORS.warnText,
+                      });
+
+                  // total cost
+                  let costStr = "—";
+                  const isOpen = Boolean(openOrderKeys[o.key]);
+                  const toggleOpen = () =>
+                    setOpenOrderKeys((prev) => ({
+                      ...prev,
+                      [o.key]: !prev[o.key],
+                    }));
+
+                  try {
+                    const usd = Number(formatUnits(o.totalRaw, 18));
+                    costStr = `$${usd.toFixed(2)}`;
+                  } catch {
+                    costStr = "—";
+                  }
+
+                  return (
+                    <div
+                      key={o.key}
+                      style={{
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 14,
+                        padding: 14,
+                        background: "rgba(255,255,255,0.75)",
+                        display: "grid",
+                        gap: 10,
+                        opacity: o.canceled ? 0.55 : 1,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "1fr auto",
+                          gap: 10,
+                          alignItems: "start",
+                        }}
+                      >
+                        <div style={{ display: "grid", gap: 4 }}>
+                          {/* Row 1: Supplier name + short address on the same line */}
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "baseline",
+                              gap: 10,
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <div style={{ fontWeight: 950 }}>{sup.name}</div>
+
+                            <div
+                              style={{
+                                fontFamily: "ui-monospace, Menlo, monospace",
+                                color: COLORS.subtext,
+                                fontWeight: 800,
+                                fontSize: 12,
+                                lineHeight: 1.2,
+                              }}
+                            >
+                              {shortenId(sup.address)}
+                            </div>
+                          </div>
+
+                          {/* Row 2: Execution timer UNDER supplier name */}
+                          <div
+                            style={{
+                              color: COLORS.subtext,
+                              fontWeight: 800,
+                              fontSize: 13,
+                            }}
+                          >
+                            {fmtExecutionCountdown(Number(o.executeAfter))}
+                          </div>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "flex-end",
+                            gap: 10,
+                          }}
+                        >
+                          {/* NEW: status pill in header */}
+                          <span style={statusPill}>{statusLabel}</span>
+
+                          <div style={{ textAlign: "right" }}>
+                            <div
+                              style={{
+                                color: COLORS.subtext,
+                                fontWeight: 900,
+                                fontSize: 12,
+                              }}
+                            >
+                              Cost
+                            </div>
+                            <div style={{ fontWeight: 950, fontSize: 18 }}>
+                              {costStr}
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            aria-label={
+                              isOpen
+                                ? "Collapse order details"
+                                : "Expand order details"
+                            }
+                            onClick={toggleOpen}
+                            title={isOpen ? "Hide details" : "Show details"}
+                            style={{
+                              width: 34,
+                              height: 34,
+                              borderRadius: 10,
+                              border: `1px solid ${COLORS.border}`,
+                              background: "rgba(255,255,255,0.75)",
+                              color: COLORS.subtext,
+                              fontWeight: 950,
+                              cursor: "pointer",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              padding: 0,
+                              userSelect: "none",
+                            }}
+                          >
+                            <ChevronDown open={isOpen} />
+                          </button>
+                        </div>
+
+                        {isOpen ? (
+                          <div
+                            style={{
+                              gridColumn: "1 / -1", // ✅ spans entire card width
+                              borderTop: `1px solid ${COLORS.border}`,
+                              paddingTop: 10,
+                              display: "grid",
+                              gap: 10,
+                            }}
+                          >
+                            {/* Summary row */}
+                            <div
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns: "1fr 1fr",
+                                gap: 10,
+                                fontSize: 13,
+                                color: COLORS.subtext,
+                                fontWeight: 850,
+                              }}
+                            >
+                              <div>
+                                <div
+                                  style={{
+                                    fontWeight: 950,
+                                    color: COLORS.text,
+                                  }}
+                                >
+                                  Execution time
+                                </div>
+                                <div>{fmtWhen(Number(o.executeAfter))}</div>
+                              </div>
+                            </div>
+
+                            {/* Item breakdown table */}
+                            <div
+                              style={{
+                                width: "100%",
+                                overflowX: "auto",
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 12,
+                                background: "rgba(255,255,255,0.65)",
+                              }}
+                            >
+                              {(() => {
+                                // ---- ADD THIS TOTAL CALC (sum of all line items) ----
+                                const totalLinesRaw = o.lines.reduce(
+                                  (acc, ln) => acc + ln.amountRaw,
+                                  BigInt(0)
+                                );
+
+                                let totalLinesCostStr = "—";
+                                try {
+                                  const usd = Number(
+                                    formatUnits(totalLinesRaw, 18)
+                                  );
+                                  totalLinesCostStr = `$${usd.toFixed(2)}`;
+                                } catch {
+                                  totalLinesCostStr = "—";
+                                }
+
+                                return (
+                                  <table
+                                    style={{
+                                      width: "100%",
+                                      borderCollapse: "collapse",
+                                    }}
+                                  >
+                                    <thead>
+                                      <tr>
+                                        <th
+                                          style={{
+                                            textAlign: "left",
+                                            padding: 12,
+                                            fontWeight: 950,
+                                          }}
+                                        >
+                                          Line Item
+                                        </th>
+                                        <th
+                                          style={{
+                                            textAlign: "right",
+                                            padding: 12,
+                                            fontWeight: 950,
+                                          }}
+                                        >
+                                          Cost
+                                        </th>
+                                      </tr>
+                                    </thead>
+
+                                    <tbody>
+                                      {o.lines.map((ln, idx) => {
+                                        let lnCost = "—";
+                                        try {
+                                          const usd = Number(
+                                            formatUnits(ln.amountRaw, 18)
+                                          );
+                                          lnCost = `$${usd.toFixed(2)}`;
+                                        } catch {
+                                          lnCost = "—";
+                                        }
+
+                                        return (
+                                          <tr key={idx}>
+                                            <td
+                                              style={{
+                                                padding: 12,
+                                                borderTop: "1px solid #eef2f7",
+                                                fontWeight: 850,
+                                                color: COLORS.text,
+                                              }}
+                                            >
+                                              Item {idx + 1}
+                                            </td>
+
+                                            <td
+                                              style={{
+                                                padding: 12,
+                                                borderTop: "1px solid #eef2f7",
+                                                textAlign: "right",
+                                                fontWeight: 950,
+                                              }}
+                                            >
+                                              {lnCost}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+
+                                    {/* ---- ADD THIS TOTAL ROW AT THE BOTTOM ---- */}
+                                    <tfoot>
+                                      <tr>
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: `2px solid ${COLORS.border}`,
+                                            fontWeight: 950,
+                                            color: COLORS.text,
+                                          }}
+                                        >
+                                          Total
+                                        </td>
+
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: `2px solid ${COLORS.border}`,
+                                            textAlign: "right",
+                                            fontWeight: 950,
+                                            color: COLORS.text,
+                                          }}
+                                        >
+                                          {totalLinesCostStr}
+                                        </td>
+                                      </tr>
+                                    </tfoot>
+                                  </table>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {o.executed ? (
+                        <div
+                          style={{
+                            color: COLORS.subtext,
+                            fontWeight: 850,
+                            fontSize: 12,
+                          }}
+                        >
+                          Executed
+                        </div>
+                      ) : o.canceled ? (
+                        <div
+                          style={{
+                            color: COLORS.subtext,
+                            fontWeight: 850,
+                            fontSize: 12,
+                          }}
+                        >
+                          Canceled
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                });
+              })()}
             </div>
           )}
         </section>

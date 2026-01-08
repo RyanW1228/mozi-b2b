@@ -9,9 +9,25 @@ const TREASURY_HUB_ABI = [
 
 export type MoziEnv = "testing" | "production";
 
+const SEPOLIA_NETWORK = { name: "sepolia", chainId: 11155111 } as const;
+
+let cachedReadProvider: JsonRpcProvider | null = null;
+let cachedReadHub: Contract | null = null;
+
+let cachedWriteProvider: JsonRpcProvider | null = null;
+
+function normalizeRpc(v?: string) {
+  return (v ?? "").trim().replace(/^"|"$/g, "");
+}
+
 function getRpcUrl(env: MoziEnv) {
-  if (env === "testing") return process.env.MOZI_SEPOLIA_RPC_URL;
-  return process.env.MOZI_MAINNET_RPC_URL;
+  if (env === "testing") {
+    return (
+      normalizeRpc(process.env.MOZI_SEPOLIA_RPC_URL) ||
+      normalizeRpc(process.env.SEPOLIA_RPC_URL)
+    );
+  }
+  return normalizeRpc(process.env.MOZI_MAINNET_RPC_URL);
 }
 
 export function getHubAddress() {
@@ -28,9 +44,16 @@ export function getAgentWallet(env: MoziEnv) {
   if (!rpc) {
     throw new Error(
       env === "testing"
-        ? "Missing MOZI_SEPOLIA_RPC_URL"
+        ? "Missing MOZI_SEPOLIA_RPC_URL / SEPOLIA_RPC_URL"
         : "Missing MOZI_MAINNET_RPC_URL"
     );
+  }
+
+  if (env === "testing") {
+    if (!cachedWriteProvider) {
+      cachedWriteProvider = new JsonRpcProvider(rpc, SEPOLIA_NETWORK);
+    }
+    return new Wallet(pk, cachedWriteProvider);
   }
 
   const provider = new JsonRpcProvider(rpc);
@@ -42,9 +65,23 @@ export function getHubRead(env: MoziEnv) {
   if (!rpc) {
     throw new Error(
       env === "testing"
-        ? "Missing MOZI_SEPOLIA_RPC_URL"
+        ? "Missing MOZI_SEPOLIA_RPC_URL / SEPOLIA_RPC_URL"
         : "Missing MOZI_MAINNET_RPC_URL"
     );
+  }
+
+  if (env === "testing") {
+    if (!cachedReadProvider) {
+      cachedReadProvider = new JsonRpcProvider(rpc, SEPOLIA_NETWORK);
+    }
+    if (!cachedReadHub) {
+      cachedReadHub = new Contract(
+        getHubAddress(),
+        TREASURY_HUB_ABI,
+        cachedReadProvider
+      );
+    }
+    return cachedReadHub;
   }
 
   const provider = new JsonRpcProvider(rpc);
