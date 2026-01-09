@@ -46,12 +46,6 @@ function shortenId(id: string) {
   return id.length <= 14 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
 }
 
-function toISODate(d: any): string {
-  const s = String(d ?? "");
-  // expecting "YYYY-MM-DD" from your plan; keep it simple
-  return s;
-}
-
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -78,20 +72,11 @@ function sanitizeIntDraft(input: string) {
   return input.replace(/[^\d]/g, "");
 }
 
-function clampInt(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
 function draftToClampedInt(draft: string, min: number, max: number) {
   if (!draft) return min; // if user leaves blank, snap to min
   const n = parseInt(draft, 10);
   if (!Number.isFinite(n) || Number.isNaN(n)) return min;
-  return clampInt(Math.floor(n), min, max);
-}
-
-function safeNum(x: any): number | null {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
+  return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
 function pillStyle(colors: {
@@ -241,24 +226,6 @@ export default function LocationPage() {
   const [paymentIntent, setPaymentIntent] = useState<any>(null);
   const [executeResp, setExecuteResp] = useState<any>(null);
 
-  type PlanSnapshot = {
-    id: string; // unique key for dropdown
-    createdAtMs: number;
-    input: PlanInput;
-    plan: PlanOutput;
-    paymentIntent: any;
-    executeResp: any;
-  };
-
-  const [planHistory, setPlanHistory] = useState<PlanSnapshot[]>([]);
-  const [selectedPlanId, setSelectedPlanId] = useState<string>("");
-
-  const selectedSnapshot = useMemo(() => {
-    if (!planHistory.length) return null;
-    if (!selectedPlanId) return planHistory[0]; // default: newest
-    return planHistory.find((p) => p.id === selectedPlanId) ?? planHistory[0];
-  }, [planHistory, selectedPlanId]);
-
   // -------------------------
   // On-chain orders (grouped by intent ref)
   // -------------------------
@@ -333,18 +300,13 @@ export default function LocationPage() {
     return `Execution in ${seconds}s`;
   }
 
-  // Tick once a second so the countdown updates
-  const [timerTick, setTimerTick] = useState(0);
-
-  const lastOrdersFetchAt = useRef(0);
-
-  // cooldown (5 seconds)
-  const refreshCooldownMs = 5000;
-  const [refreshCooldownUntilMs, setRefreshCooldownUntilMs] = useState(0);
-  const [cooldownTick, setCooldownTick] = useState(0);
-
   // re-render once per second for execution countdown timers
   const [nowTick, setNowTick] = useState(0);
+
+  const lastOrdersAutoUpdateAt = useRef(0);
+
+  // auto-update interval (12 hours) - for automatic on-chain order syncs
+  const ordersAutoUpdateIntervalMs = 12 * 60 * 60 * 1000; // 12 hours
 
   useEffect(() => {
     const id = window.setInterval(() => setNowTick((x) => x + 1), 1000);
@@ -361,6 +323,10 @@ export default function LocationPage() {
   const [cancelingOrderKey, setCancelingOrderKey] = useState<string | null>(
     null
   );
+
+  // ✅ Global cancel mutex (prevents MetaMask glitches from concurrent cancels)
+  const cancelAnyInFlight = useRef(false);
+  const [cancelAnyUi, setCancelAnyUi] = useState(false);
 
   // -------------------------
   // Auto-propose (periodic)
@@ -440,14 +406,9 @@ export default function LocationPage() {
     }
   }
 
-  function intentStatus(i: IntentRow) {
-    if (i.canceled) return "Canceled";
-    if (i.executed) return "Executed";
-    if (i.approved) return "Approved";
-    return "Pending";
-  }
-
   async function autoProposeNow() {
+    if (cancelAnyInFlight.current) return;
+
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
 
@@ -508,23 +469,13 @@ export default function LocationPage() {
     }
   }
 
-  async function refreshOrders(opts?: { force?: boolean }) {
-    const nowMs = Date.now();
-    const force = Boolean(opts?.force);
+  async function refreshOrders() {
+    if (cancelAnyInFlight.current) return;
 
     // Prevent overlapping refreshes
     if (refreshOrdersInFlight.current) return;
 
-    // Global cooldown (applies to mount + auto + manual)
-    if (!force && nowMs - lastOrdersFetchAt.current < refreshCooldownMs) {
-      // update the UI cooldown timer so button shows remaining time
-      setRefreshCooldownUntilMs(lastOrdersFetchAt.current + refreshCooldownMs);
-      return;
-    }
-
     refreshOrdersInFlight.current = true;
-    lastOrdersFetchAt.current = nowMs;
-    setRefreshCooldownUntilMs(nowMs + refreshCooldownMs);
 
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
@@ -647,11 +598,6 @@ export default function LocationPage() {
     }
   }
 
-  async function refreshOrdersWithCooldown() {
-    if (ordersLoading) return;
-    await refreshOrders(); // cooldown is enforced inside refreshOrders now
-  }
-
   async function approveIntent(ref: string) {
     const owner = getSavedOwnerAddress();
     if (!owner || !isAddress(owner)) {
@@ -729,6 +675,11 @@ export default function LocationPage() {
       return;
     }
 
+    // ✅ Prevent concurrent cancels (MetaMask can only reliably handle one prompt at a time)
+    if (cancelAnyInFlight.current) return;
+    cancelAnyInFlight.current = true;
+    setCancelAnyUi(true);
+
     // Collect all cancellable orderIds in this card
     const ids: bigint[] = [];
     for (const ln of o.lines || []) {
@@ -748,6 +699,8 @@ export default function LocationPage() {
 
     if (ids.length === 0) {
       setOrdersError("No cancellable order IDs found in this order card.");
+      cancelAnyInFlight.current = false;
+      setCancelAnyUi(false);
       return;
     }
 
@@ -832,11 +785,13 @@ export default function LocationPage() {
         }
       }
 
-      await refreshOrders({ force: true });
+      await refreshOrders();
     } catch (e: any) {
       setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
     } finally {
       setCancelingOrderKey(null);
+      cancelAnyInFlight.current = false;
+      setCancelAnyUi(false);
     }
   }
 
@@ -1017,11 +972,6 @@ export default function LocationPage() {
   }, [locationId]);
 
   useEffect(() => {
-    const id = window.setInterval(() => setTimerTick((x) => x + 1), 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
     if (!locationId || !owner || !isAddress(owner)) return;
@@ -1086,8 +1036,8 @@ export default function LocationPage() {
 
   useEffect(() => {
     if (!locationId) return;
-    // one forced fetch on mount for this location
-    refreshOrders({ force: true });
+    // one fetch on mount for this location
+    refreshOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
@@ -1121,14 +1071,40 @@ export default function LocationPage() {
   }, [locationId, autoProposeEnabled]);
 
   useEffect(() => {
-    if (Date.now() >= refreshCooldownUntilMs) return;
+    if (!locationId) return;
 
+    let canceled = false;
+
+    // Function to check if we should auto-update orders
+    const checkAndUpdateOrders = async () => {
+      if (canceled) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+
+      const nowMs = Date.now();
+      const timeSinceLastUpdate = nowMs - lastOrdersAutoUpdateAt.current;
+
+      // Only update if 12 hours have passed since last auto-update
+      if (timeSinceLastUpdate >= ordersAutoUpdateIntervalMs) {
+        lastOrdersAutoUpdateAt.current = nowMs;
+        await refreshOrders();
+      }
+    };
+
+    // Check immediately on mount
+    checkAndUpdateOrders();
+
+    // Then check every hour (every 60 minutes), reducing unnecessary checks
     const id = window.setInterval(() => {
-      setCooldownTick((x) => x + 1);
-    }, 250);
+      checkAndUpdateOrders();
+    }, 60 * 60 * 1000); // 1 hour
 
-    return () => window.clearInterval(id);
-  }, [refreshCooldownUntilMs]);
+    return () => {
+      canceled = true;
+      window.clearInterval(id);
+    };
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
 
   if (!locationId) {
     return (
@@ -1672,35 +1648,6 @@ export default function LocationPage() {
                 </span>
               )}
             </div>
-
-            {/* Right: Refresh button */}
-            {(() => {
-              const cooldownRemainingMs = Math.max(
-                0,
-                refreshCooldownUntilMs - Date.now()
-              );
-              const refreshDisabled = ordersLoading || cooldownRemainingMs > 0;
-
-              const tooltip = ordersLoading
-                ? "Refreshing orders…"
-                : cooldownRemainingMs > 0
-                ? `Please wait ${Math.ceil(
-                    cooldownRemainingMs / 1000
-                  )}s before refreshing again (prevents server errors).`
-                : "Refresh orders";
-
-              return (
-                <button
-                  type="button"
-                  onClick={refreshOrdersWithCooldown}
-                  disabled={refreshDisabled}
-                  title={tooltip}
-                  style={btnSoft(refreshDisabled)}
-                >
-                  Refresh
-                </button>
-              );
-            })()}
           </div>
 
           {ordersError ? (
@@ -1990,7 +1937,9 @@ export default function LocationPage() {
                           <button
                             type="button"
                             onClick={() => cancelOrderCard(o)}
-                            disabled={cancelingOrderKey === o.key}
+                            disabled={
+                              cancelAnyUi || cancelingOrderKey === o.key
+                            }
                             title="Cancel all orders in this card (owner override)"
                             style={{
                               padding: "10px 14px",
@@ -2000,13 +1949,16 @@ export default function LocationPage() {
                               color: COLORS.dangerText,
                               fontWeight: 950,
                               cursor:
-                                cancelingOrderKey === o.key
+                                cancelAnyUi || cancelingOrderKey === o.key
                                   ? "not-allowed"
                                   : "pointer",
-                              opacity: cancelingOrderKey === o.key ? 0.7 : 1,
+                              opacity:
+                                cancelAnyUi || cancelingOrderKey === o.key
+                                  ? 0.7
+                                  : 1,
                             }}
                           >
-                            {cancelingOrderKey === o.key
+                            {cancelAnyUi || cancelingOrderKey === o.key
                               ? "Deleting…"
                               : "Delete"}
                           </button>
@@ -2223,7 +2175,7 @@ export default function LocationPage() {
                                   <button
                                     type="button"
                                     onClick={() => cancelOrderCard(o)}
-                                    disabled={isDeletingThis}
+                                    disabled={cancelAnyUi || isDeletingThis}
                                     title="Cancel all orders in this card (owner override)"
                                     style={{
                                       padding: "10px 14px",
@@ -2232,13 +2184,17 @@ export default function LocationPage() {
                                       background: COLORS.dangerBg,
                                       color: COLORS.dangerText,
                                       fontWeight: 950,
-                                      cursor: isDeletingThis
-                                        ? "not-allowed"
-                                        : "pointer",
-                                      opacity: isDeletingThis ? 0.7 : 1,
+                                      cursor:
+                                        cancelAnyUi || isDeletingThis
+                                          ? "not-allowed"
+                                          : "pointer",
+                                      opacity:
+                                        cancelAnyUi || isDeletingThis ? 0.7 : 1,
                                     }}
                                   >
-                                    {isDeletingThis ? "Deleting…" : "Delete"}
+                                    {cancelAnyUi || isDeletingThis
+                                      ? "Deleting…"
+                                      : "Delete"}
                                   </button>
                                 </div>
                               );

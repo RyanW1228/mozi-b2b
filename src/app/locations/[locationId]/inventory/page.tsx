@@ -10,6 +10,14 @@ type InventoryRow = {
   onHandUnits: number;
 };
 
+type SkuMeta = {
+  name: string;
+  priceUsd: number;
+  avgDailyConsumption: number;
+  useByDays: number;
+  supplier: string;
+};
+
 const COLORS = {
   text: "#0f172a",
   subtext: "#64748b",
@@ -33,9 +41,67 @@ const COLORS = {
   warnBorder: "#fde68a",
 };
 
+function metaKey(locationId: string) {
+  return `mozi:inventoryMeta:${locationId}`;
+}
+
+function loadAllMeta(locationId: string): Record<string, SkuMeta> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(metaKey(locationId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAllMeta(locationId: string, meta: Record<string, SkuMeta>) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(metaKey(locationId), JSON.stringify(meta));
+}
+
 function shortenId(id: string) {
   if (!id) return "—";
   return id.length <= 14 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
+function normalizeSku(input: string) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function sanitizeUnitsDraft(input: string) {
+  return input.replace(/[^\d]/g, "");
+}
+
+function draftToNonNegInt(draft: string) {
+  if (!draft) return 0;
+  const n = parseInt(draft, 10);
+  if (!Number.isFinite(n) || Number.isNaN(n)) return 0;
+  return Math.max(0, Math.floor(n));
+}
+
+function sanitizeText(input: string) {
+  return input.trim();
+}
+
+function sanitizeNumberDraft(input: string) {
+  const cleaned = input.replace(/[^\d.]/g, "");
+  const parts = cleaned.split(".");
+  if (parts.length <= 1) return cleaned;
+  return `${parts[0]}.${parts.slice(1).join("")}`;
+}
+
+function draftToNonNegFloat(draft: string) {
+  if (!draft) return 0;
+  const n = Number(draft);
+  if (!Number.isFinite(n) || Number.isNaN(n)) return 0;
+  return Math.max(0, n);
 }
 
 export default function InventoryPage() {
@@ -51,17 +117,30 @@ export default function InventoryPage() {
   const [rows, setRows] = useState<InventoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [savingSku, setSavingSku] = useState<string | null>(null);
-  // Draft text values for numeric inputs (so typing is smooth)
+
+  // Draft text values for inputs (smooth typing)
   const [draftUnits, setDraftUnits] = useState<Record<string, string>>({});
+  const [metaBySku, setMetaBySku] = useState<Record<string, SkuMeta>>({});
+  const [draftName, setDraftName] = useState<Record<string, string>>({});
+  const [draftPrice, setDraftPrice] = useState<Record<string, string>>({});
+  const [draftAvg, setDraftAvg] = useState<Record<string, string>>({});
+  const [draftUseBy, setDraftUseBy] = useState<Record<string, string>>({});
+  const [draftSupplier, setDraftSupplier] = useState<Record<string, string>>(
+    {}
+  );
 
   const [msg, setMsg] = useState<string>("");
   const [msgKind, setMsgKind] = useState<"success" | "error" | "warn" | "">("");
 
-  const [showHelp, setShowHelp] = useState(false);
-
   const [showAddItem, setShowAddItem] = useState(false);
+
   const [newSku, setNewSku] = useState("");
   const [newUnitsDraft, setNewUnitsDraft] = useState<string>("0");
+  const [newName, setNewName] = useState("");
+  const [newPriceDraft, setNewPriceDraft] = useState("0");
+  const [newAvgDraft, setNewAvgDraft] = useState("0");
+  const [newUseByDraft, setNewUseByDraft] = useState("0");
+  const [newSupplier, setNewSupplier] = useState("");
 
   const cardStyle: React.CSSProperties = {
     marginTop: 16,
@@ -107,8 +186,7 @@ export default function InventoryPage() {
     color: COLORS.text,
     fontWeight: 800,
     outline: "none",
-    width: 120,
-    textAlign: "right",
+    width: 140,
     boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
   };
 
@@ -171,10 +249,44 @@ export default function InventoryPage() {
 
       const next = data as InventoryRow[];
       setRows(next);
+
+      // drafts for onHand
       setDraftUnits(
         Object.fromEntries(next.map((r) => [r.sku, String(r.onHandUnits ?? 0)]))
       );
-      if (!(data as InventoryRow[])?.length) {
+
+      // load + seed meta drafts
+      const allMeta = loadAllMeta(locationId);
+      setMetaBySku(allMeta);
+
+      setDraftName(
+        Object.fromEntries(next.map((r) => [r.sku, allMeta[r.sku]?.name ?? ""]))
+      );
+      setDraftPrice(
+        Object.fromEntries(
+          next.map((r) => [r.sku, String(allMeta[r.sku]?.priceUsd ?? 0)])
+        )
+      );
+      setDraftAvg(
+        Object.fromEntries(
+          next.map((r) => [
+            r.sku,
+            String(allMeta[r.sku]?.avgDailyConsumption ?? 0),
+          ])
+        )
+      );
+      setDraftUseBy(
+        Object.fromEntries(
+          next.map((r) => [r.sku, String(allMeta[r.sku]?.useByDays ?? 0)])
+        )
+      );
+      setDraftSupplier(
+        Object.fromEntries(
+          next.map((r) => [r.sku, allMeta[r.sku]?.supplier ?? ""])
+        )
+      );
+
+      if (!next?.length) {
         setMessage("warn", "No inventory rows returned for this location yet.");
       }
     } catch (e: any) {
@@ -184,61 +296,8 @@ export default function InventoryPage() {
     }
   }
 
-  function normalizeSku(input: string) {
-    return (
-      input
-        .trim()
-        .toLowerCase()
-        // replace spaces and any non-alphanumeric chars with underscores
-        .replace(/[^a-z0-9]+/g, "_")
-        // remove leading/trailing underscores
-        .replace(/^_+|_+$/g, "")
-    );
-  }
-
-  function sanitizeUnitsDraft(input: string) {
-    // keep only digits; allow empty while typing
-    return input.replace(/[^\d]/g, "");
-  }
-
-  function draftToNonNegInt(draft: string) {
-    if (!draft) return 0;
-    // parse base-10, clamp to >= 0, force integer
-    const n = parseInt(draft, 10);
-    if (!Number.isFinite(n) || Number.isNaN(n)) return 0;
-    return Math.max(0, Math.floor(n));
-  }
-
-  function addLocalRow() {
-    const raw = newSku;
-    const sku = normalizeSku(raw);
-
-    if (!sku) {
-      setMessage("warn", "SKU must contain at least one letter or number.");
-      return;
-    }
-
-    // prevent duplicates
-    const exists = rows.some((r) => r.sku === sku);
-    if (exists) {
-      setMessage("warn", `SKU "${sku}" already exists.`);
-      return;
-    }
-
-    const units = draftToNonNegInt(newUnitsDraft);
-
-    setRows((prev) => [{ sku, onHandUnits: units }, ...prev]);
-    setDraftUnits((prev) => ({ ...prev, [sku]: String(units) }));
-
-    setNewSku("");
-    setNewUnitsDraft("0");
-    setShowAddItem(false);
-    setMessage("success", `Added ${sku}. Click Save to persist.`);
-  }
-
   async function saveRow(sku: string, onHandUnits: number) {
     if (!locationId) return;
-
     setSavingSku(sku);
 
     try {
@@ -256,8 +315,6 @@ export default function InventoryPage() {
         setMessage("error", JSON.stringify(data, null, 2));
         return;
       }
-
-      setMessage("success", `Saved ${sku} • onHandUnits=${onHandUnits}`);
     } catch (e: any) {
       setMessage("error", String(e));
     } finally {
@@ -268,15 +325,49 @@ export default function InventoryPage() {
   async function deleteRow(sku: string) {
     if (!locationId) return;
 
-    // Optimistic UI: remove locally first (no lag)
+    // optimistic UI
     const prevRows = rows;
-    const prevDraft = draftUnits;
+    const prevDraftUnits = draftUnits;
+    const prevMeta = metaBySku;
 
     setRows((prev) => prev.filter((r) => r.sku !== sku));
     setDraftUnits((prev) => {
       const next = { ...prev };
       delete next[sku];
       return next;
+    });
+
+    setMetaBySku((prev) => {
+      const next = { ...prev };
+      delete next[sku];
+      saveAllMeta(locationId, next);
+      return next;
+    });
+
+    setDraftName((prev) => {
+      const n = { ...prev };
+      delete n[sku];
+      return n;
+    });
+    setDraftPrice((prev) => {
+      const n = { ...prev };
+      delete n[sku];
+      return n;
+    });
+    setDraftAvg((prev) => {
+      const n = { ...prev };
+      delete n[sku];
+      return n;
+    });
+    setDraftUseBy((prev) => {
+      const n = { ...prev };
+      delete n[sku];
+      return n;
+    });
+    setDraftSupplier((prev) => {
+      const n = { ...prev };
+      delete n[sku];
+      return n;
     });
 
     try {
@@ -289,16 +380,18 @@ export default function InventoryPage() {
         }
       );
 
-      // some APIs return 204 No Content; don't assume json always exists
       let data: any = null;
       try {
         data = await res.json();
       } catch {}
 
       if (!res.ok) {
-        // rollback if server rejects
+        // rollback
         setRows(prevRows);
-        setDraftUnits(prevDraft);
+        setDraftUnits(prevDraftUnits);
+        setMetaBySku(prevMeta);
+        saveAllMeta(locationId, prevMeta);
+
         setMessage(
           "error",
           data
@@ -312,9 +405,80 @@ export default function InventoryPage() {
     } catch (e: any) {
       // rollback on network error
       setRows(prevRows);
-      setDraftUnits(prevDraft);
+      setDraftUnits(prevDraftUnits);
+      setMetaBySku(prevMeta);
+      saveAllMeta(locationId, prevMeta);
+
       setMessage("error", String(e));
     }
+  }
+
+  function addLocalRow() {
+    const sku = normalizeSku(newSku);
+
+    if (!sku) {
+      setMessage("warn", "SKU must contain at least one letter or number.");
+      return;
+    }
+    if (rows.some((r) => r.sku === sku)) {
+      setMessage("warn", `SKU "${sku}" already exists.`);
+      return;
+    }
+
+    const name = sanitizeText(newName);
+    const supplier = sanitizeText(newSupplier);
+
+    if (!name) {
+      setMessage("warn", "Please enter a Name for this SKU.");
+      return;
+    }
+    if (!supplier) {
+      setMessage("warn", "Please enter a Supplier for this SKU.");
+      return;
+    }
+
+    const units = draftToNonNegInt(newUnitsDraft);
+    const priceUsd = draftToNonNegFloat(newPriceDraft);
+    const avgDailyConsumption = draftToNonNegFloat(newAvgDraft);
+    const useByDays = draftToNonNegInt(newUseByDraft);
+
+    // Add row
+    setRows((prev) => [{ sku, onHandUnits: units }, ...prev]);
+    setDraftUnits((prev) => ({ ...prev, [sku]: String(units) }));
+
+    // Add meta (persist immediately to localStorage so it's "clearly stored")
+    const newMeta: SkuMeta = {
+      name,
+      supplier,
+      priceUsd,
+      avgDailyConsumption,
+      useByDays,
+    };
+
+    setMetaBySku((prev) => {
+      const next = { ...prev, [sku]: newMeta };
+      saveAllMeta(locationId, next);
+      return next;
+    });
+
+    // seed drafts
+    setDraftName((p) => ({ ...p, [sku]: name }));
+    setDraftSupplier((p) => ({ ...p, [sku]: supplier }));
+    setDraftPrice((p) => ({ ...p, [sku]: String(priceUsd) }));
+    setDraftAvg((p) => ({ ...p, [sku]: String(avgDailyConsumption) }));
+    setDraftUseBy((p) => ({ ...p, [sku]: String(useByDays) }));
+
+    // reset add form
+    setNewSku("");
+    setNewUnitsDraft("0");
+    setNewName("");
+    setNewPriceDraft("0");
+    setNewAvgDraft("0");
+    setNewUseByDraft("0");
+    setNewSupplier("");
+
+    setShowAddItem(false);
+    setMessage("success", `Added ${sku}. Click Save to persist counts.`);
   }
 
   useEffect(() => {
@@ -324,505 +488,458 @@ export default function InventoryPage() {
 
   if (!locationId) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          width: "100%",
-          backgroundColor: "#dbeafe",
-          backgroundImage: [
-            "radial-gradient(1400px 750px at 50% -220px, rgba(37,99,235,0.35) 0%, rgba(37,99,235,0.18) 42%, rgba(219,234,254,0) 75%)",
-            "radial-gradient(1100px 650px at 15% 25%, rgba(59,130,246,0.22) 0%, rgba(219,234,254,0) 62%)",
-            "linear-gradient(180deg, #dbeafe 0%, #e0e7ff 45%, #eaf2ff 100%)",
-          ].join(", "),
-          backgroundRepeat: "no-repeat",
-          backgroundSize: "200% 200%",
-          animation: "moziBgDrift 60s ease-in-out infinite",
-          display: "flex",
-          justifyContent: "center",
-          padding: "32px 16px",
-          color: COLORS.text,
-          fontFamily: "system-ui",
-        }}
-      >
-        <style>{`
-          @keyframes moziBgDrift {
-            0%   { background-position: 50% 0%, 0% 30%, 0% 0%; }
-            50%  { background-position: 60% 12%, 15% 40%, 0% 0%; }
-            100% { background-position: 50% 0%, 0% 30%, 0% 0%; }
-          }
-        `}</style>
-
-        <main style={{ maxWidth: 900, width: "100%", padding: 24 }}>
-          <header
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr auto 1fr",
-              alignItems: "center",
-              marginBottom: 24,
-            }}
-          >
-            <div />
-            <h1
-              style={{
-                fontSize: 30,
-                fontWeight: 950,
-                letterSpacing: -0.4,
-                margin: 0,
-                textAlign: "center",
-              }}
-            >
-              Inventory
-            </h1>
-
-            <div />
-          </header>
-
-          <section
-            style={{
-              ...cardStyle,
-              border: `1px solid ${COLORS.dangerBorder}`,
-              background: COLORS.dangerBg,
-              color: COLORS.dangerText,
-              fontWeight: 800,
-            }}
-          >
-            Missing locationId in route params.
-          </section>
-        </main>
+      <div style={{ padding: 24, color: COLORS.text, fontFamily: "system-ui" }}>
+        Missing locationId in route params.
       </div>
     );
   }
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        width: "100%",
-        backgroundColor: "#dbeafe",
-        backgroundImage: [
-          "radial-gradient(1400px 750px at 50% -220px, rgba(37,99,235,0.35) 0%, rgba(37,99,235,0.18) 42%, rgba(219,234,254,0) 75%)",
-          "radial-gradient(1100px 650px at 15% 25%, rgba(59,130,246,0.22) 0%, rgba(219,234,254,0) 62%)",
-          "linear-gradient(180deg, #dbeafe 0%, #e0e7ff 45%, #eaf2ff 100%)",
-        ].join(", "),
-        backgroundRepeat: "no-repeat",
-        backgroundSize: "200% 200%",
-        animation: "moziBgDrift 60s ease-in-out infinite",
-        display: "flex",
-        justifyContent: "center",
-        padding: "32px 16px",
-        color: COLORS.text,
-        fontFamily: "system-ui",
-      }}
-    >
-      <style>{`
-        @keyframes moziBgDrift {
-          0%   { background-position: 50% 0%, 0% 30%, 0% 0%; }
-          50%  { background-position: 60% 12%, 15% 40%, 0% 0%; }
-          100% { background-position: 50% 0%, 0% 30%, 0% 0%; }
-        }
-      `}</style>
+    <div style={{ padding: 24, color: COLORS.text, fontFamily: "system-ui" }}>
+      <header
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+        }}
+      >
+        <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
+          ← Purchase Plan
+        </Link>
 
-      <main style={{ maxWidth: 900, width: "100%", padding: 24 }}>
-        {/* Header */}
-        <header
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr auto 1fr",
-            alignItems: "center",
-            marginBottom: 24,
+        <div style={{ fontSize: 26, fontWeight: 950 }}>Inventory</div>
+
+        <button
+          onClick={async () => {
+            setMsg("");
+            setMsgKind("");
+            try {
+              // 1) persist on-hand counts to API
+              for (const r of rows) {
+                await saveRow(r.sku, r.onHandUnits);
+              }
+
+              // 2) persist meta to localStorage
+              const nextMeta: Record<string, SkuMeta> = { ...metaBySku };
+
+              for (const r of rows) {
+                const sku = r.sku;
+
+                const name = sanitizeText(
+                  draftName[sku] ?? nextMeta[sku]?.name ?? ""
+                );
+                const supplier = sanitizeText(
+                  draftSupplier[sku] ?? nextMeta[sku]?.supplier ?? ""
+                );
+
+                const priceUsd = draftToNonNegFloat(
+                  draftPrice[sku] ?? String(nextMeta[sku]?.priceUsd ?? 0)
+                );
+                const avgDailyConsumption = draftToNonNegFloat(
+                  draftAvg[sku] ??
+                    String(nextMeta[sku]?.avgDailyConsumption ?? 0)
+                );
+                const useByDays = draftToNonNegInt(
+                  draftUseBy[sku] ?? String(nextMeta[sku]?.useByDays ?? 0)
+                );
+
+                nextMeta[sku] = {
+                  name,
+                  supplier,
+                  priceUsd,
+                  avgDailyConsumption,
+                  useByDays,
+                };
+              }
+
+              saveAllMeta(locationId, nextMeta);
+              setMetaBySku(nextMeta);
+
+              setMessage("success", "Saved inventory counts + SKU details.");
+            } catch (e: any) {
+              setMessage("error", String(e));
+            }
           }}
+          disabled={loading || rows.length === 0 || !!savingSku}
+          style={btnPrimary(loading || rows.length === 0 || !!savingSku)}
         >
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
-              ← Purchase Plan
-            </Link>
-          </div>
+          Save
+        </button>
+      </header>
 
-          <div style={{ textAlign: "center" }}>
-            <div
-              style={{
-                fontSize: 30,
-                fontWeight: 950,
-                letterSpacing: -0.4,
-                margin: 0,
-              }}
-            >
-              Inventory
-            </div>
-          </div>
-        </header>
+      {msg ? (
+        <section style={{ ...cardStyle, ...msgStyle() }}>{msg}</section>
+      ) : null}
 
-        {/* Status */}
-        {msg ? (
-          <section style={{ ...cardStyle, ...msgStyle() }}>{msg}</section>
-        ) : null}
+      <section style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <div style={{ fontWeight: 950 }}>Inventory SKUs</div>
+          <button
+            type="button"
+            onClick={() => setShowAddItem((v) => !v)}
+            style={btnSoft(false)}
+          >
+            + Add SKU
+          </button>
+        </div>
 
-        {/* Table */}
-        <section style={cardStyle}>
+        {showAddItem && (
           <div
             style={{
               display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: 12,
+              gap: 10,
               flexWrap: "wrap",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={{ fontWeight: 950 }}>On-hand counts</div>
-
-              {/* Help icon */}
-              <button
-                onClick={() => setShowHelp((v) => !v)}
-                style={{
-                  width: 22,
-                  height: 22,
-                  borderRadius: "50%",
-                  border: `1px solid ${COLORS.border}`,
-                  background: "rgba(255,255,255,0.9)",
-                  color: COLORS.subtext,
-                  fontWeight: 900,
-                  cursor: "pointer",
-                  lineHeight: "20px",
-                  textAlign: "center",
-                  padding: 0,
-                }}
-                aria-label="What is SKU and units?"
-              >
-                ?
-              </button>
-            </div>
-
-            <button
-              onClick={async () => {
-                setMsg("");
-                setMsgKind("");
-                try {
-                  for (const r of rows) {
-                    await saveRow(r.sku, r.onHandUnits);
-                  }
-                  setMessage("success", "Saved all inventory updates.");
-                } catch (e: any) {
-                  setMessage("error", String(e));
-                }
-              }}
-              disabled={loading || rows.length === 0}
-              style={btnPrimary(loading || rows.length === 0)}
-            >
-              Save
-            </button>
-          </div>
-
-          {showHelp && (
-            <div
-              style={{
-                marginTop: 8,
-                padding: 12,
-                borderRadius: 12,
-                background: "rgba(255,255,255,0.85)",
-                border: `1px solid ${COLORS.border}`,
-                color: COLORS.text,
-                fontWeight: 800,
-                fontSize: 14,
-                lineHeight: 1.45,
-              }}
-            >
-              <div>
-                <strong>SKU</strong> (Stock Keeping Unit) is the unique
-                identifier for each product you track in inventory (for example:{" "}
-                <code>chicken_breast</code>,<code>romaine_lettuce</code>, or{" "}
-                <code>coke_12oz</code>).
-              </div>
-              <div style={{ marginTop: 6 }}>
-                <strong>Units</strong> represent how many physical items you
-                currently have on hand for that SKU. A unit is whatever your
-                restaurant uses to count that product — for example: individual
-                items, packages, cases, or pounds — as defined in your inventory
-                system.
-              </div>
-            </div>
-          )}
-
-          <div
-            style={{
-              overflowX: "auto",
+              alignItems: "center",
               border: `1px solid ${COLORS.border}`,
               borderRadius: 12,
+              padding: 12,
               background: "rgba(255,255,255,0.75)",
             }}
           >
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr>
-                  <th
-                    style={{ textAlign: "left", padding: 12, fontWeight: 950 }}
-                  >
-                    SKU
-                  </th>
-                  <th
-                    style={{ textAlign: "right", padding: 12, fontWeight: 950 }}
-                  >
-                    On Hand
-                  </th>
-                  <th
-                    style={{
-                      textAlign: "right",
-                      padding: "12px 6px", // tighter
-                      fontWeight: 950,
-                      width: 1, // shrink to content
-                    }}
-                  />
-                </tr>
-              </thead>
+            <input
+              value={newSku}
+              onChange={(e) => setNewSku(e.target.value)}
+              placeholder="SKU (e.g., chicken_breast)"
+              style={{ ...inputStyle, width: 220 }}
+            />
 
-              <tbody>
-                {rows.map((r) => (
-                  <tr key={r.sku}>
-                    <td style={{ padding: 12, borderTop: "1px solid #eef2f7" }}>
-                      <span
-                        style={{
-                          fontFamily: "ui-monospace, Menlo, monospace",
-                          fontWeight: 900,
-                        }}
-                      >
-                        {r.sku}
-                      </span>
-                    </td>
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Name (e.g., Chicken Breast)"
+              style={{ ...inputStyle, width: 240 }}
+            />
 
-                    <td
-                      style={{
-                        padding: 12,
-                        borderTop: "1px solid #eef2f7",
-                        textAlign: "right",
-                      }}
-                    >
-                      <input
-                        inputMode="numeric"
-                        pattern="[0-9]*"
-                        value={draftUnits[r.sku] ?? String(r.onHandUnits ?? 0)}
-                        onChange={(e) => {
-                          const cleaned = sanitizeUnitsDraft(e.target.value);
-                          setDraftUnits((prev) => ({
-                            ...prev,
-                            [r.sku]: cleaned,
-                          }));
-                        }}
-                        onBlur={() => {
-                          const normalized = draftToNonNegInt(
-                            draftUnits[r.sku] ?? ""
-                          );
-                          setRows((prev) =>
-                            prev.map((x) =>
-                              x.sku === r.sku
-                                ? { ...x, onHandUnits: normalized }
-                                : x
-                            )
-                          );
-                          setDraftUnits((prev) => ({
-                            ...prev,
-                            [r.sku]: String(normalized),
-                          }));
-                        }}
-                        onFocus={(e) => e.currentTarget.select()}
-                        style={{
-                          ...inputStyle,
-                          width: 150, // easier to type
-                          fontSize: 16, // nicer on mobile
-                        }}
-                      />
-                    </td>
-                    <td
-                      style={{
-                        padding: 12,
-                        borderTop: "1px solid #eef2f7",
-                        textAlign: "right",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (confirm(`Delete "${r.sku}"?`)) deleteRow(r.sku);
-                        }}
-                        aria-label={`Delete ${r.sku}`}
-                        title="Delete item"
-                        style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: 10,
-                          border: `1px solid ${COLORS.dangerBorder}`,
-                          background: COLORS.dangerBg,
-                          color: COLORS.dangerText,
-                          fontWeight: 950,
-                          cursor: "pointer",
-                          lineHeight: "26px",
-                          padding: 0,
-                        }}
-                        onMouseEnter={(e) => {
-                          (
-                            e.currentTarget as HTMLButtonElement
-                          ).style.transform = "translateY(-1px)";
-                        }}
-                        onMouseLeave={(e) => {
-                          (
-                            e.currentTarget as HTMLButtonElement
-                          ).style.transform = "translateY(0px)";
-                        }}
-                      >
-                        ×
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+            <input
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={newUnitsDraft}
+              onChange={(e) =>
+                setNewUnitsDraft(sanitizeUnitsDraft(e.target.value))
+              }
+              onBlur={() =>
+                setNewUnitsDraft(String(draftToNonNegInt(newUnitsDraft)))
+              }
+              placeholder="On hand"
+              style={{ ...inputStyle, width: 120 }}
+            />
 
-                {!rows.length ? (
-                  <tr>
-                    <td
-                      colSpan={3}
-                      style={{
-                        padding: 14,
-                        color: COLORS.subtext,
-                        fontWeight: 900,
-                        borderTop: "1px solid #eef2f7",
-                      }}
-                    >
-                      No SKUs returned yet.
-                    </td>
-                  </tr>
-                ) : null}
-              </tbody>
-            </table>
-          </div>
-          {/* Add-item form (toggles when you click the +) */}
-          {showAddItem && (
-            <div
-              style={{
-                marginTop: 10,
-                padding: 12,
-                borderRadius: 12,
-                border: `1px solid ${COLORS.border}`,
-                background: "rgba(255,255,255,0.85)",
-                display: "flex",
-                gap: 10,
-                alignItems: "center",
-                flexWrap: "wrap",
-              }}
-            >
-              <div style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Add item
-              </div>
+            <input
+              inputMode="decimal"
+              value={newPriceDraft}
+              onChange={(e) =>
+                setNewPriceDraft(sanitizeNumberDraft(e.target.value))
+              }
+              onBlur={() =>
+                setNewPriceDraft(String(draftToNonNegFloat(newPriceDraft)))
+              }
+              placeholder="Price (USD)"
+              style={{ ...inputStyle, width: 140 }}
+            />
 
-              <input
-                value={newSku}
-                onChange={(e) => setNewSku(e.target.value)}
-                placeholder="SKU (e.g., chicken_breast)"
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: `1px solid ${COLORS.border}`,
-                  background: "rgba(255,255,255,0.9)",
-                  color: COLORS.text,
-                  fontWeight: 800,
-                  outline: "none",
-                  minWidth: 240,
-                }}
-              />
+            <input
+              inputMode="decimal"
+              value={newAvgDraft}
+              onChange={(e) =>
+                setNewAvgDraft(sanitizeNumberDraft(e.target.value))
+              }
+              onBlur={() =>
+                setNewAvgDraft(String(draftToNonNegFloat(newAvgDraft)))
+              }
+              placeholder="Avg/day"
+              style={{ ...inputStyle, width: 130 }}
+            />
 
-              <input
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={newUnitsDraft}
-                onChange={(e) =>
-                  setNewUnitsDraft(sanitizeUnitsDraft(e.target.value))
-                }
-                onBlur={() => {
-                  const normalized = draftToNonNegInt(newUnitsDraft);
-                  setNewUnitsDraft(String(normalized));
-                }}
-                onFocus={(e) => e.currentTarget.select()}
-                style={{
-                  ...inputStyle,
-                  width: 150,
-                  fontSize: 16,
-                }}
-              />
+            <input
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={newUseByDraft}
+              onChange={(e) =>
+                setNewUseByDraft(sanitizeUnitsDraft(e.target.value))
+              }
+              onBlur={() =>
+                setNewUseByDraft(String(draftToNonNegInt(newUseByDraft)))
+              }
+              placeholder="Use-by (days)"
+              style={{ ...inputStyle, width: 150 }}
+            />
 
-              <button
-                type="button"
-                onClick={addLocalRow}
-                style={btnPrimary(false)}
-              >
-                Add
-              </button>
+            <input
+              value={newSupplier}
+              onChange={(e) => setNewSupplier(e.target.value)}
+              placeholder="Supplier"
+              style={{ ...inputStyle, width: 200 }}
+            />
 
-              <button
-                type="button"
-                onClick={() => setShowAddItem(false)}
-                style={btnSoft(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
-
-          {/* + Add Item (icon only, bottom-centered like Locations page) */}
-          <div
-            style={{
-              marginTop: 16,
-              display: "flex",
-              justifyContent: "center",
-            }}
-          >
             <button
               type="button"
-              onClick={() => setShowAddItem((v) => !v)}
-              aria-label="Add inventory item"
-              title="Add inventory item"
-              style={{
-                width: 56,
-                height: 56,
-                borderRadius: "50%",
-                background: COLORS.primary, // solid circle
-                border: "none",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                boxShadow: "0 4px 12px rgba(37,99,235,0.35)",
-                transition: "transform 120ms ease, box-shadow 120ms ease",
-                cursor: "pointer",
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.transform =
-                  "translateY(-1px)";
-                (e.currentTarget as HTMLButtonElement).style.boxShadow =
-                  "0 10px 24px rgba(37,99,235,0.4)";
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.transform =
-                  "translateY(0px)";
-                (e.currentTarget as HTMLButtonElement).style.boxShadow =
-                  "0 4px 12px rgba(37,99,235,0.35)";
-              }}
+              onClick={addLocalRow}
+              style={btnPrimary(false)}
             >
-              <svg
-                width="22"
-                height="22"
-                viewBox="0 0 24 24"
-                fill="none"
-                xmlns="http://www.w3.org/2000/svg"
-                style={{ display: "block" }}
-              >
-                <path
-                  d="M12 5v14M5 12h14"
-                  stroke="white"
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                />
-              </svg>
+              Add
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowAddItem(false)}
+              style={btnSoft(false)}
+            >
+              Cancel
             </button>
           </div>
-        </section>
-      </main>
+        )}
+
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", padding: 10, fontWeight: 950 }}>
+                  SKU
+                </th>
+                <th style={{ textAlign: "left", padding: 10, fontWeight: 950 }}>
+                  Name
+                </th>
+                <th
+                  style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
+                >
+                  On hand
+                </th>
+                <th
+                  style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
+                >
+                  Price
+                </th>
+                <th
+                  style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
+                >
+                  Avg/day
+                </th>
+                <th
+                  style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
+                >
+                  Use-by (days)
+                </th>
+                <th style={{ textAlign: "left", padding: 10, fontWeight: 950 }}>
+                  Supplier
+                </th>
+                <th
+                  style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
+                >
+                  Actions
+                </th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.sku}>
+                  <td style={{ padding: 10, borderTop: "1px solid #eef2f7" }}>
+                    <span
+                      style={{
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontWeight: 900,
+                      }}
+                    >
+                      {r.sku}
+                    </span>
+                  </td>
+
+                  <td style={{ padding: 10, borderTop: "1px solid #eef2f7" }}>
+                    <input
+                      value={draftName[r.sku] ?? metaBySku[r.sku]?.name ?? ""}
+                      onChange={(e) =>
+                        setDraftName((p) => ({ ...p, [r.sku]: e.target.value }))
+                      }
+                      placeholder="Name"
+                      style={{ ...inputStyle, width: 220 }}
+                    />
+                  </td>
+
+                  <td
+                    style={{
+                      padding: 10,
+                      borderTop: "1px solid #eef2f7",
+                      textAlign: "right",
+                    }}
+                  >
+                    <input
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={draftUnits[r.sku] ?? String(r.onHandUnits ?? 0)}
+                      onChange={(e) => {
+                        const cleaned = sanitizeUnitsDraft(e.target.value);
+                        setDraftUnits((prev) => ({
+                          ...prev,
+                          [r.sku]: cleaned,
+                        }));
+                      }}
+                      onBlur={() => {
+                        const normalized = draftToNonNegInt(
+                          draftUnits[r.sku] ?? ""
+                        );
+                        setRows((prev) =>
+                          prev.map((x) =>
+                            x.sku === r.sku
+                              ? { ...x, onHandUnits: normalized }
+                              : x
+                          )
+                        );
+                        setDraftUnits((prev) => ({
+                          ...prev,
+                          [r.sku]: String(normalized),
+                        }));
+                      }}
+                      style={{ ...inputStyle, width: 110, textAlign: "right" }}
+                    />
+                  </td>
+
+                  <td
+                    style={{
+                      padding: 10,
+                      borderTop: "1px solid #eef2f7",
+                      textAlign: "right",
+                    }}
+                  >
+                    <input
+                      inputMode="decimal"
+                      value={
+                        draftPrice[r.sku] ??
+                        String(metaBySku[r.sku]?.priceUsd ?? 0)
+                      }
+                      onChange={(e) => {
+                        const cleaned = sanitizeNumberDraft(e.target.value);
+                        setDraftPrice((p) => ({ ...p, [r.sku]: cleaned }));
+                      }}
+                      onBlur={() => {
+                        const n = draftToNonNegFloat(draftPrice[r.sku] ?? "");
+                        setDraftPrice((p) => ({ ...p, [r.sku]: String(n) }));
+                      }}
+                      style={{ ...inputStyle, width: 120, textAlign: "right" }}
+                    />
+                  </td>
+
+                  <td
+                    style={{
+                      padding: 10,
+                      borderTop: "1px solid #eef2f7",
+                      textAlign: "right",
+                    }}
+                  >
+                    <input
+                      inputMode="decimal"
+                      value={
+                        draftAvg[r.sku] ??
+                        String(metaBySku[r.sku]?.avgDailyConsumption ?? 0)
+                      }
+                      onChange={(e) => {
+                        const cleaned = sanitizeNumberDraft(e.target.value);
+                        setDraftAvg((p) => ({ ...p, [r.sku]: cleaned }));
+                      }}
+                      onBlur={() => {
+                        const n = draftToNonNegFloat(draftAvg[r.sku] ?? "");
+                        setDraftAvg((p) => ({ ...p, [r.sku]: String(n) }));
+                      }}
+                      style={{ ...inputStyle, width: 120, textAlign: "right" }}
+                    />
+                  </td>
+
+                  <td
+                    style={{
+                      padding: 10,
+                      borderTop: "1px solid #eef2f7",
+                      textAlign: "right",
+                    }}
+                  >
+                    <input
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={
+                        draftUseBy[r.sku] ??
+                        String(metaBySku[r.sku]?.useByDays ?? 0)
+                      }
+                      onChange={(e) => {
+                        const cleaned = sanitizeUnitsDraft(e.target.value);
+                        setDraftUseBy((p) => ({ ...p, [r.sku]: cleaned }));
+                      }}
+                      onBlur={() => {
+                        const n = draftToNonNegInt(draftUseBy[r.sku] ?? "");
+                        setDraftUseBy((p) => ({ ...p, [r.sku]: String(n) }));
+                      }}
+                      style={{ ...inputStyle, width: 130, textAlign: "right" }}
+                    />
+                  </td>
+
+                  <td style={{ padding: 10, borderTop: "1px solid #eef2f7" }}>
+                    <input
+                      value={
+                        draftSupplier[r.sku] ?? metaBySku[r.sku]?.supplier ?? ""
+                      }
+                      onChange={(e) =>
+                        setDraftSupplier((p) => ({
+                          ...p,
+                          [r.sku]: e.target.value,
+                        }))
+                      }
+                      placeholder="Supplier"
+                      style={{ ...inputStyle, width: 180 }}
+                    />
+                  </td>
+
+                  <td
+                    style={{
+                      padding: 10,
+                      borderTop: "1px solid #eef2f7",
+                      textAlign: "right",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (confirm(`Delete "${r.sku}"?`)) deleteRow(r.sku);
+                      }}
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: 10,
+                        border: `1px solid ${COLORS.dangerBorder}`,
+                        background: COLORS.dangerBg,
+                        color: COLORS.dangerText,
+                        fontWeight: 900,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+
+              {!rows.length ? (
+                <tr>
+                  <td
+                    colSpan={8}
+                    style={{
+                      padding: 14,
+                      color: COLORS.subtext,
+                      fontWeight: 900,
+                      borderTop: "1px solid #eef2f7",
+                    }}
+                  >
+                    No SKUs returned yet.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ color: COLORS.subtext, fontWeight: 800, fontSize: 13 }}>
+          Note: SKU details (name, price, avg/day, use-by, supplier) are stored
+          locally in your browser (localStorage) per location.
+        </div>
+      </section>
     </div>
   );
 }
