@@ -6,6 +6,7 @@ export const maxDuration = 60;
 import { NextResponse } from "next/server";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type { PlanInput, PlanOutput } from "@/lib/types";
+import crypto from "crypto";
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -21,6 +22,54 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       reject(e);
     });
   });
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __moziPlanInflight: Map<string, Promise<any>> | undefined;
+}
+
+function planInflightStore(): Map<string, Promise<any>> {
+  if (!global.__moziPlanInflight) global.__moziPlanInflight = new Map();
+  return global.__moziPlanInflight;
+}
+
+function stableHash(obj: any): string {
+  const s = JSON.stringify(obj);
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __moziPlanCache: Map<string, { at: number; plan: any }> | undefined;
+}
+
+function planCacheStore(): Map<string, { at: number; plan: any }> {
+  if (!global.__moziPlanCache) global.__moziPlanCache = new Map();
+  return global.__moziPlanCache;
+}
+
+async function extractGeminiText(resp: any): Promise<string> {
+  // 1) Some SDK versions: resp.text is string
+  if (typeof resp?.text === "string") return resp.text;
+
+  // 2) Some SDK versions: resp.text() returns Promise<string>
+  if (typeof resp?.text === "function") {
+    try {
+      const t = await resp.text();
+      if (typeof t === "string") return t;
+    } catch {
+      // fall through
+    }
+  }
+
+  // 3) Fall back to candidates[0].content.parts[].text
+  const parts = resp?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    return parts.map((p: any) => String(p?.text ?? "")).join("");
+  }
+
+  return "";
 }
 
 export async function POST(req: Request) {
@@ -137,7 +186,7 @@ export async function POST(req: Request) {
       `  "summary": { "keyDrivers": string[], "warnings"?: string[] }\n` +
       `}\n\n` +
       `Use these inputs (JSON):\n` +
-      `${JSON.stringify(inputForPrompt, null, 2)}\n\n` +
+      `${JSON.stringify(inputForPrompt, null, 0)}\n\n` +
       `IMPORTANT INVENTORY RULE:\n` +
       `- Each input.skus[*] now includes:\n` +
       `  - onHandUnits (physical in-house)\n` +
@@ -160,33 +209,95 @@ export async function POST(req: Request) {
 
     const ai = new GoogleGenAI({ apiKey });
 
-    const response = await withTimeout(
-      ai.models.generateContent({
+    const inflight = planInflightStore();
+    const key = stableHash({
+      model: "models/gemini-2.5-pro",
+      input: inputForPrompt,
+      tz: input.restaurant.timezone,
+      horizon: input.restaurant.planningHorizonDays,
+    });
+
+    // ✅ Fast TTL cache: if we computed this plan very recently, reuse it
+    const cache = planCacheStore();
+    const cached = cache.get(key);
+    const CACHE_TTL_MS = 25_000; // pick 15–60s; 25s is a good start
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      return NextResponse.json(cached.plan);
+    }
+
+    let p = inflight.get(key);
+
+    if (!p) {
+      p = ai.models.generateContent({
         model: "models/gemini-2.5-pro",
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         config: {
-          temperature: 0.7,
-          topP: 0.95,
-          topK: 64,
-          maxOutputTokens: 2048,
+          temperature: 0.3,
+          topP: 0.9,
+          topK: 40,
+          maxOutputTokens: 3072,
+          responseMimeType: "application/json",
         },
-      }),
-      12_000, // <-- IMPORTANT: keep < your platform timeout
-      "Gemini generateContent"
-    );
+      });
+
+      inflight.set(key, p);
+      p.finally(() => inflight.delete(key));
+    }
+
+    const response = await withTimeout(p, 45_000, "Gemini generateContent");
 
     // 3) Parse JSON safely
-    const raw = (response.text ?? "").trim();
+    // 3) Parse JSON safely (robust text extraction)
+    let raw = (await extractGeminiText(response)).trim();
 
-    // If Gemini adds any extra text, try to grab the JSON object
+    // If empty, retry once (transient network / empty candidate cases)
+    if (!raw) {
+      // small backoff
+      await new Promise((r) => setTimeout(r, 400));
+
+      // IMPORTANT: do NOT create a second inflight entry; just call the model again directly
+      const retryResp = await withTimeout(
+        ai.models.generateContent({
+          model: "models/gemini-2.5-pro",
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: {
+            temperature: 0.3,
+            topP: 0.9,
+            topK: 40,
+            maxOutputTokens: 1200,
+          },
+        }),
+        45_000,
+        "Gemini generateContent (retry)"
+      );
+
+      raw = (await extractGeminiText(retryResp)).trim();
+    }
+
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
     if (start === -1 || end === -1 || end <= start) {
       return NextResponse.json(
-        { error: "Model response had no JSON object", raw },
+        {
+          error: "Model response had no JSON object",
+          raw,
+          debug: {
+            hasCandidates: Boolean((response as any)?.candidates?.length),
+            finishReason: (response as any)?.candidates?.[0]?.finishReason,
+            partsPreview: Array.isArray(
+              (response as any)?.candidates?.[0]?.content?.parts
+            )
+              ? (response as any).candidates[0].content.parts
+                  .map((p: any) => String(p?.text ?? ""))
+                  .join("")
+                  .slice(0, 600)
+              : null,
+          },
+        },
         { status: 502 }
       );
     }
+
     const jsonText = raw.slice(start, end + 1);
 
     let plan: PlanOutput;
@@ -226,6 +337,7 @@ export async function POST(req: Request) {
     plan.horizonDays = input.restaurant.planningHorizonDays;
 
     // 5) Return structured plan
+    cache.set(key, { at: Date.now(), plan });
     return NextResponse.json(plan);
   } catch (err: any) {
     console.error("Gemini call failed:", err);

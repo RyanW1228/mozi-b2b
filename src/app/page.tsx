@@ -1019,20 +1019,18 @@ export default function Home() {
           {/* Right navigation */}
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <Link
-              href="/locations"
+              href="/locations/loc-1"
               style={{
                 padding: "10px 16px",
                 borderRadius: 12,
-
-                background: "#eff6ff", // soft blue tint
-                border: "1px solid #bfdbfe", // light blue border
-                color: "#1d4ed8", // readable blue text
-
+                background: "#eff6ff",
+                border: "1px solid #bfdbfe",
+                color: "#1d4ed8",
                 textDecoration: "none",
                 fontWeight: 900,
               }}
             >
-              Locations
+              Dashboard
             </Link>
           </div>
         </header>

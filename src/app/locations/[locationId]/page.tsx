@@ -369,6 +369,7 @@ export default function LocationPage() {
   const [autoProposeMsg, setAutoProposeMsg] = useState<string>("");
   const autoProposeInFlight = useRef(false);
   const refreshOrdersInFlight = useRef(false);
+  const manualGenerateInFlight = useRef(false);
 
   function getSavedEnv(): "testing" | "production" {
     if (typeof window === "undefined") return "testing";
@@ -451,6 +452,14 @@ export default function LocationPage() {
     const env = getSavedEnv();
 
     if (!locationId) return;
+    // ✅ Don’t auto-propose while a manual plan generation is running
+    if (loading) return;
+
+    // ✅ Optional: don’t run while tab is hidden
+    if (typeof document !== "undefined" && document.hidden) return;
+
+    if (manualGenerateInFlight.current) return;
+    if (loading) return;
 
     if (!owner || !isAddress(owner)) {
       setAutoProposeMsg("Connect wallet on homepage first.");
@@ -593,7 +602,18 @@ export default function LocationPage() {
           String(locationRestaurantId || "").toLowerCase()
       );
 
-      setIntents(scoped);
+      // ✅ Remove canceled lines so canceled orders never render
+      const cleaned = scoped
+        .map((intent) => {
+          const items = Array.isArray(intent.items) ? intent.items : [];
+          const filteredItems = items.filter(
+            (it) => !intent.canceled && !it.canceled
+          );
+          return { ...intent, items: filteredItems };
+        })
+        .filter((intent) => (intent.items ?? []).length > 0);
+
+      setIntents(cleaned);
 
       // manual/autonomous mode read
       if (
@@ -734,6 +754,40 @@ export default function LocationPage() {
     try {
       setOrdersError("");
       setCancelingOrderKey(o.key);
+      // ✅ Optimistic UI: remove this order card immediately (don’t wait for chain/indexer)
+      setIntents((prev) => {
+        const supKey = String(o.supplier || "").toLowerCase();
+        const execKey = Number(o.executeAfter || 0);
+
+        const next = prev
+          .map((intent) => {
+            const items = Array.isArray(intent.items) ? intent.items : [];
+
+            const filtered = items.filter((it: any) => {
+              const itSup = String(it?.supplier || "").toLowerCase();
+              const itExec = Number(
+                it?.executeAfter ?? intent.executeAfter ?? 0
+              );
+
+              // If this line item belongs to the card being canceled, drop it
+              const matchesCard = itSup === supKey && itExec === execKey;
+              return !matchesCard;
+            });
+
+            return { ...intent, items: filtered };
+          })
+          // drop empty intents
+          .filter((intent) => (intent.items ?? []).length > 0);
+
+        return next;
+      });
+
+      // Also close its expanded state if it was open
+      setOpenOrderKeys((prev) => {
+        const copy = { ...prev };
+        delete copy[o.key];
+        return copy;
+      });
 
       const injected = getInjectedProvider();
       if (!injected) {
@@ -826,6 +880,7 @@ export default function LocationPage() {
     if (!locationId) return;
 
     setLoading(true);
+    manualGenerateInFlight.current = true;
     setError("");
     setPlan(null);
     setPaymentIntent(null);
@@ -941,6 +996,7 @@ export default function LocationPage() {
     } catch (e: any) {
       setError(String(e));
     } finally {
+      manualGenerateInFlight.current = false;
       setLoading(false);
     }
   }
@@ -1039,18 +1095,30 @@ export default function LocationPage() {
     if (!locationId) return;
     if (!autoProposeEnabled) return;
 
-    // run once immediately, then every 60s while page is open
-    autoProposeNow();
+    let canceled = false;
+
+    // delay first run so it doesn't collide with page load + manual click
+    const first = window.setTimeout(() => {
+      if (canceled) return;
+      if (document.visibilityState !== "visible") return;
+      autoProposeNow();
+    }, 5_000);
 
     const id = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       autoProposeNow();
     }, 60_000);
 
-    return () => window.clearInterval(id);
+    return () => {
+      canceled = true;
+      window.clearTimeout(first);
+      window.clearInterval(id);
+    };
 
-    // IMPORTANT: include controls so the proposer uses the latest settings
+    // Intentionally do NOT depend on strategy/horizonDays/notes
+    // so changing knobs doesn't immediately trigger an auto-propose.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationId, autoProposeEnabled, strategy, horizonDays, notes]);
+  }, [locationId, autoProposeEnabled]);
 
   useEffect(() => {
     if (Date.now() >= refreshCooldownUntilMs) return;
@@ -1102,8 +1170,8 @@ export default function LocationPage() {
             }}
           >
             <div>
-              <Link href="/locations" style={btnSoft(false)}>
-                ← Locations
+              <Link href="/" style={btnSoft(false)}>
+                ← Home
               </Link>
             </div>
 
@@ -1178,8 +1246,8 @@ export default function LocationPage() {
           }}
         >
           <div style={{ display: "flex", gap: 10 }}>
-            <Link href="/locations" style={btnSoft(false)}>
-              ← Locations
+            <Link href="/" style={btnSoft(false)}>
+              ← Home
             </Link>
           </div>
 
@@ -1696,12 +1764,12 @@ export default function LocationPage() {
                       amountRaw = BigInt(0);
                     }
 
-                    const itemCanceled = Boolean(
-                      intent.canceled || it.canceled
-                    );
-                    const itemExecuted = Boolean(
-                      intent.executed || it.executed
-                    );
+                    // ✅ IMPORTANT: use *line-level* flags only (intent flags can be coarse and hide cancelable lines)
+                    const itemCanceled = Boolean(it.canceled);
+                    const itemExecuted = Boolean(it.executed);
+
+                    // ✅ Don’t show canceled lines at all
+                    if (itemCanceled) continue;
 
                     const existing = groupsMap.get(key);
 
@@ -1749,6 +1817,9 @@ export default function LocationPage() {
 
                   // Pending window is over once now >= executeAfter
                   const nowUnix = Math.floor(Date.now() / 1000);
+                  const hasCancelableLines = o.lines.some(
+                    (ln) => !ln.canceled && !ln.executed
+                  );
                   const pendingEnded =
                     Number(o.executeAfter) > 0 &&
                     nowUnix >= Number(o.executeAfter);
@@ -1895,9 +1966,9 @@ export default function LocationPage() {
                             alignItems: "center",
                             justifyContent: "flex-end",
                             gap: 10,
+                            flexWrap: "wrap",
                           }}
                         >
-                          {/* NEW: status pill in header */}
                           <span style={statusPill}>{statusLabel}</span>
 
                           <div style={{ textAlign: "right" }}>
@@ -1914,6 +1985,31 @@ export default function LocationPage() {
                               {costStr}
                             </div>
                           </div>
+
+                          {/* ✅ ALWAYS SHOW DELETE */}
+                          <button
+                            type="button"
+                            onClick={() => cancelOrderCard(o)}
+                            disabled={cancelingOrderKey === o.key}
+                            title="Cancel all orders in this card (owner override)"
+                            style={{
+                              padding: "10px 14px",
+                              borderRadius: 12,
+                              border: `1px solid ${COLORS.dangerBorder}`,
+                              background: COLORS.dangerBg,
+                              color: COLORS.dangerText,
+                              fontWeight: 950,
+                              cursor:
+                                cancelingOrderKey === o.key
+                                  ? "not-allowed"
+                                  : "pointer",
+                              opacity: cancelingOrderKey === o.key ? 0.7 : 1,
+                            }}
+                          >
+                            {cancelingOrderKey === o.key
+                              ? "Deleting…"
+                              : "Delete"}
+                          </button>
 
                           <button
                             type="button"
@@ -2108,7 +2204,8 @@ export default function LocationPage() {
                             </div>
                             {/* Actions (bottom-right under table) */}
                             {(() => {
-                              const isPending = !o.canceled && !pendingEnded; // pending window still active
+                              const isPending =
+                                hasCancelableLines && !pendingEnded;
                               const isDeletingThis =
                                 cancelingOrderKey === o.key;
 
