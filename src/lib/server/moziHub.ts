@@ -1,10 +1,22 @@
 import { JsonRpcProvider, Wallet, Contract } from "ethers";
 
 const TREASURY_HUB_ABI = [
+  // --- agents / permissions ---
+  "function setAgent(address agent, bool allowed) external",
+  "function isAgentFor(address owner, address agent) view returns (bool)",
+
+  // --- manual vs autonomous gating ---
+  "function setRequireApprovalForExecution(bool required) external",
+  "function requireApprovalForExecution(address owner) view returns (bool)",
+  "function setIntentApproval(bytes32 ref, bool approved) external",
+  "function isIntentApproved(address owner, bytes32 ref) view returns (bool)",
+
+  // --- core order lifecycle ---
   "function nextOrderId() view returns (uint256)",
   "function pendingOrders(uint256) view returns (address owner,address supplier,uint256 amount,uint64 executeAfter,bool canceled,bool executed,bytes32 ref,bytes32 restaurantId)",
   "function proposeOrderFor(address owner,address supplier,uint256 amount,uint64 executeAfter,bytes32 ref,bytes32 restaurantId) returns (uint256)",
   "function executeOrder(uint256 orderId) external",
+  "function cancelOrder(uint256 orderId) external",
 ] as const;
 
 export type MoziEnv = "testing" | "production";

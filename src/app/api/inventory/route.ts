@@ -1,8 +1,10 @@
 // src/app/api/inventory/route.ts
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { getState, patchInventory } from "@/lib/stateStore";
+import { getState, patchInventory, removeInventorySku } from "@/lib/stateStore";
 
 function getLocationIdFromUrl(url: string): string | null {
   const u = new URL(url);
@@ -21,7 +23,9 @@ export async function GET(req: Request) {
   if (!locationId) return jsonError("Missing locationId in query string", 400);
 
   const state = getState(locationId);
-  return NextResponse.json(state.inventory);
+  return NextResponse.json(state.inventory, {
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 export async function POST(req: Request) {
@@ -43,8 +47,7 @@ export async function POST(req: Request) {
     return jsonError("Missing or invalid onHandUnits", 400);
   }
 
-  // Enforce your numeric rules at the API boundary too:
-  // integer, non-negative
+  // Enforce integer, non-negative
   const onHandUnits = Math.max(0, Math.floor(onHandUnitsRaw));
 
   patchInventory(locationId, sku, onHandUnits);
@@ -64,27 +67,13 @@ export async function DELETE(req: Request) {
 
   const state = getState(locationId);
   const before = state.inventory ?? [];
-  const after = before.filter((r) => r.sku !== sku);
+  const exists = before.some((r) => r.sku === sku);
 
-  // If it wasn't there, treat as success (idempotent delete)
-  if (after.length === before.length) {
+  // Idempotent delete
+  if (!exists) {
     return NextResponse.json({ ok: true, deleted: false });
   }
 
-  /**
-   * We only have patchInventory() available, so we "rewrite" inventory by:
-   * - Clearing by setting deleted SKU to 0 (optional)
-   * - Re-applying all remaining rows
-   *
-   * If your patchInventory() already treats 0 as delete, this is perfect.
-   * If not, the re-apply step still makes the in-memory list correct as long as
-   * your stateStore uses patchInventory to maintain inventory and doesn't keep
-   * extra rows elsewhere.
-   */
-  patchInventory(locationId, sku, 0);
-  for (const r of after) {
-    patchInventory(locationId, r.sku, r.onHandUnits);
-  }
-
+  removeInventorySku(locationId, sku);
   return NextResponse.json({ ok: true, deleted: true });
 }

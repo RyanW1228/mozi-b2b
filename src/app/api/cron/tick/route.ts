@@ -114,35 +114,11 @@ async function run(req: Request) {
     }> = [];
 
     for (const locationId of locationIds) {
-      // Delegate to the ONE source of truth for ordering
-      const proposeUrl =
-        `${origin}/api/orders/propose?locationId=` +
-        encodeURIComponent(locationId);
-
-      const res = await fetch(proposeUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          env,
-          ownerAddress,
-          pendingWindowHours:
-            body.pendingWindowHours ?? DEFAULT_PENDING_WINDOW_HOURS,
-          strategy: body.strategy ?? DEFAULT_STRATEGY,
-          horizonDays:
-            typeof body.horizonDays === "number"
-              ? body.horizonDays
-              : DEFAULT_HORIZON_DAYS,
-          notes: body.notes ?? DEFAULT_NOTES,
-        }),
-      });
-
-      const json = await res.json().catch(() => null);
-
       results.push({
         locationId,
-        ok: Boolean(json?.ok) && res.ok,
-        status: res.status,
-        json,
+        ok: true,
+        status: 200,
+        json: { ok: true, skipped: true, reason: "auto-cron disabled" },
       });
     }
 

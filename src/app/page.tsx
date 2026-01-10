@@ -1071,22 +1071,6 @@ export default function Home() {
               Production (Mainnet)
             </button>
           </div>
-
-          {env === "production" && (
-            <div
-              style={{
-                color: "#92400e",
-                background: "#fffbeb",
-                border: "1px solid #fde68a",
-                padding: 10,
-                borderRadius: 12,
-                fontWeight: 700,
-              }}
-            >
-              Production points to mainnet. Treat any future write actions as
-              real-value transactions.
-            </div>
-          )}
         </section>
 
         {/* AI Autonomy */}

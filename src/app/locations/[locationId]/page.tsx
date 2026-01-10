@@ -5,7 +5,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PlanInput, PlanOutput } from "@/lib/types";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { buildPaymentIntentFromPlan } from "@/lib/pricing";
 import {
   BrowserProvider,
   Contract,
@@ -115,11 +114,34 @@ function strategyLabel(
   }
 }
 
+function chatMemoryKey(env: string, owner: string, locationId: string) {
+  return `mozi_chat_memory:${env}:${owner.toLowerCase()}:${locationId}`;
+}
+
+function loadChatMemory(env: string, owner: string, locationId: string) {
+  if (typeof window === "undefined") return "";
+  return (
+    window.localStorage.getItem(chatMemoryKey(env, owner, locationId)) ?? ""
+  );
+}
+
+function saveChatMemory(
+  env: string,
+  owner: string,
+  locationId: string,
+  value: string
+) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(chatMemoryKey(env, owner, locationId), value);
+}
+
 function HelpDot({
   title = "What do these mean?",
+  align = "right",
   children,
 }: {
   title?: string;
+  align?: "left" | "right";
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -155,13 +177,13 @@ function HelpDot({
       {open ? (
         <div
           role="dialog"
-          aria-label="Purchase plan help"
+          aria-label="Help"
           style={{
             position: "absolute",
             top: 28,
-            right: 0,
+            ...(align === "left" ? { left: 0 } : { right: 0 }),
             width: 360,
-            maxWidth: "80vw",
+            maxWidth: "min(360px, calc(100vw - 32px))",
             padding: 12,
             borderRadius: 12,
             border: `1px solid ${COLORS.border}`,
@@ -169,7 +191,8 @@ function HelpDot({
             boxShadow: "0 12px 28px rgba(0,0,0,0.12)",
             color: COLORS.text,
             fontWeight: 750,
-            zIndex: 50,
+            zIndex: 2000,
+            overflowWrap: "anywhere",
           }}
         >
           {children}
@@ -199,6 +222,44 @@ function ChevronDown({ open }: { open: boolean }) {
 export default function LocationPage() {
   const params = useParams<{ locationId: string }>();
 
+  // --- Chat UI styles ---
+  const chatPanelBg = [
+    "radial-gradient(900px 500px at 20% 10%, rgba(37,99,235,0.12) 0%, rgba(37,99,235,0) 60%)",
+    "radial-gradient(800px 500px at 80% 30%, rgba(99,102,241,0.10) 0%, rgba(99,102,241,0) 55%)",
+    "linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 55%, rgba(255,255,255,0.98) 100%)",
+  ].join(",");
+
+  const chatCloseBtn: React.CSSProperties = {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    border: `1px solid ${COLORS.dangerBorder}`,
+    background: COLORS.dangerBg,
+    color: COLORS.dangerText,
+    fontWeight: 1000,
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    boxShadow: "0 8px 18px rgba(153,27,27,0.15)",
+  };
+
+  function bubbleStyle(role: "user" | "assistant"): React.CSSProperties {
+    const isUser = role === "user";
+    return {
+      maxWidth: "85%",
+      padding: "10px 12px",
+      borderRadius: 16,
+      border: `1px solid ${COLORS.border}`,
+      background: isUser ? "rgba(37,99,235,0.10)" : "rgba(255,255,255,0.92)",
+      color: COLORS.text,
+      fontWeight: 800,
+      lineHeight: 1.35,
+      boxShadow: "0 10px 20px rgba(0,0,0,0.06)",
+      whiteSpace: "pre-wrap",
+    };
+  }
+
   const locationId = useMemo(() => {
     const v = params?.locationId;
     if (typeof v === "string") return v;
@@ -221,10 +282,14 @@ export default function LocationPage() {
   const [horizonDays, setHorizonDays] = useState<number>(7);
   // Draft text value so typing is smooth (like inventory inputs)
   const [horizonDaysDraft, setHorizonDaysDraft] = useState<string>("7");
-  const [notes, setNotes] = useState<string>("Normal week");
 
   const [paymentIntent, setPaymentIntent] = useState<any>(null);
   const [executeResp, setExecuteResp] = useState<any>(null);
+
+  const [editingPlan, setEditingPlan] = useState(false);
+
+  const [strategyDraft, setStrategyDraft] =
+    useState<PlanInput["ownerPrefs"]["strategy"]>("balanced");
 
   // -------------------------
   // On-chain orders (grouped by intent ref)
@@ -246,6 +311,237 @@ export default function LocationPage() {
       executed: boolean;
     }>;
   };
+
+  type ChatMsg = { role: "user" | "assistant"; content: string };
+
+  type AdditionalContextItem = {
+    id: string; // stable key for remove
+    text: string; // the context text
+    durationDays: number; // how long it applies
+    createdAtMs: number; // when it was saved
+  };
+
+  function additionalContextKey(
+    env: string,
+    owner: string,
+    locationId: string
+  ) {
+    return `mozi_additional_context:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function loadAdditionalContext(
+    env: string,
+    owner: string,
+    locationId: string
+  ) {
+    if (typeof window === "undefined") return [] as AdditionalContextItem[];
+    try {
+      const raw = window.localStorage.getItem(
+        additionalContextKey(env, owner, locationId)
+      );
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? (parsed as AdditionalContextItem[]) : [];
+    } catch {
+      return [] as AdditionalContextItem[];
+    }
+  }
+
+  function saveAdditionalContext(
+    env: string,
+    owner: string,
+    locationId: string,
+    items: AdditionalContextItem[]
+  ) {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      additionalContextKey(env, owner, locationId),
+      JSON.stringify(items)
+    );
+  }
+
+  function isContextActive(item: AdditionalContextItem) {
+    const d = Number(item.durationDays ?? 0);
+    if (!Number.isFinite(d) || d <= 0) return false;
+    const expiresAt = item.createdAtMs + d * 24 * 60 * 60 * 1000;
+    return Date.now() < expiresAt;
+  }
+
+  function formatContextForNotes(items: AdditionalContextItem[]) {
+    const active = items.filter(isContextActive);
+    if (active.length === 0) return "";
+    return active
+      .map((it) => `- ${it.text} (applies ${it.durationDays}d)`)
+      .join("\n");
+  }
+
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string>("");
+
+  const [chatOpen, setChatOpen] = useState(false);
+
+  // persistent notes for future orders (NOT purchase-plan notes)
+  const [chatMemory, setChatMemory] = useState<string>("");
+
+  // Additional Context items (saved one-by-one)
+  const [additionalContext, setAdditionalContext] = useState<
+    AdditionalContextItem[]
+  >([]);
+
+  // Draft inputs
+  const [contextDraft, setContextDraft] = useState("");
+  const [contextDaysDraft, setContextDaysDraft] = useState("7");
+
+  useEffect(() => {
+    if (!locationId) return;
+
+    let stopped = false;
+
+    const tick = async () => {
+      if (stopped) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+
+      const owner = getSavedOwnerAddress();
+      const env = getSavedEnv();
+
+      // Optional: only execute for this owner+location
+      const url =
+        `/api/orders/execute?env=${encodeURIComponent(env)}` +
+        `&locationId=${encodeURIComponent(locationId)}` +
+        (owner ? `&owner=${encodeURIComponent(owner)}` : "") +
+        `&limit=120`;
+
+      try {
+        await fetch(url, { method: "POST" });
+        // then refresh UI so executed orders disappear
+        await refreshOrders();
+      } catch {
+        // ignore for MVP
+      }
+    };
+
+    // run every 30s
+    const id = window.setInterval(() => tick(), 30_000);
+    // run once immediately
+    tick();
+
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
+
+  useEffect(() => {
+    if (!editingPlan) setStrategyDraft(strategy);
+  }, [strategy, editingPlan]);
+
+  useEffect(() => {
+    if (!editingPlan) setHorizonDaysDraft(String(horizonDays));
+  }, [horizonDays, editingPlan]);
+
+  useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!owner || !locationId) return;
+
+    const items = loadAdditionalContext(env, owner, locationId);
+    setAdditionalContext(items);
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
+
+  async function sendChat() {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    if (!owner || !isAddress(owner)) {
+      setChatError("No valid wallet found. Connect wallet on homepage first.");
+      return;
+    }
+    if (!locationId) return;
+
+    const msg = chatDraft.trim();
+    if (!msg) return;
+
+    setChatError("");
+    setChatLoading(true);
+
+    // optimistic append user message
+    const nextThread: ChatMsg[] = [
+      ...chatMessages,
+      { role: "user", content: msg },
+    ];
+    setChatMessages(nextThread);
+    setChatDraft("");
+
+    try {
+      // optional but strong: give the chat a snapshot of your restaurant state
+      // (THIS DOES NOT create a plan. It's just context.)
+      let restaurantContext: any = null;
+      try {
+        const stateRes = await fetch(
+          `/api/state?locationId=${encodeURIComponent(locationId)}` +
+            `&owner=${encodeURIComponent(owner)}` +
+            `&env=${encodeURIComponent(env)}`
+        );
+        if (stateRes.ok) restaurantContext = await stateRes.json();
+      } catch {
+        restaurantContext = null;
+      }
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ownerAddress: owner,
+          env,
+          locationId,
+          restaurantContext,
+          memory: formatContextForNotes(additionalContext),
+          messages: nextThread.slice(-16),
+          userMessage: msg,
+        }),
+      });
+
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.ok) {
+        setChatError(
+          `CHAT HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+        return;
+      }
+
+      const reply = String(json.reply ?? "");
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: reply },
+      ]);
+
+      // If model suggests durable info, append it to saved notes.
+      if (typeof json.memoryAppend === "string" && json.memoryAppend.trim()) {
+        const nextItem: AdditionalContextItem = {
+          id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          text: json.memoryAppend.trim(),
+          durationDays: 7,
+          createdAtMs: Date.now(),
+        };
+
+        setAdditionalContext((prev) => {
+          const next = [nextItem, ...prev];
+          saveAdditionalContext(env, owner, locationId, next);
+          return next;
+        });
+      }
+    } catch (e: any) {
+      setChatError(String(e?.message ?? e));
+    } finally {
+      setChatLoading(false);
+    }
+  }
 
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState<string>("");
@@ -285,21 +581,6 @@ export default function LocationPage() {
     }
   }
 
-  function fmtCountdown(executeAfterUnix: number) {
-    const nowUnix = Math.floor(Date.now() / 1000);
-    const diff = Math.max(0, Number(executeAfterUnix) - nowUnix);
-
-    if (diff <= 0) return "Ready for execution";
-
-    const hours = Math.floor(diff / 3600);
-    const minutes = Math.floor((diff % 3600) / 60);
-    const seconds = diff % 60;
-
-    if (hours > 0) return `Execution in ${hours}h ${minutes}m ${seconds}s`;
-    if (minutes > 0) return `Execution in ${minutes}m ${seconds}s`;
-    return `Execution in ${seconds}s`;
-  }
-
   // re-render once per second for execution countdown timers
   const [nowTick, setNowTick] = useState(0);
 
@@ -331,8 +612,6 @@ export default function LocationPage() {
   // -------------------------
   // Auto-propose (periodic)
   // -------------------------
-  const [autoProposeEnabled, setAutoProposeEnabled] = useState(true);
-  const [autoProposeMsg, setAutoProposeMsg] = useState<string>("");
   const autoProposeInFlight = useRef(false);
   const refreshOrdersInFlight = useRef(false);
   const manualGenerateInFlight = useRef(false);
@@ -375,97 +654,12 @@ export default function LocationPage() {
     return `Execution in ${seconds}s`;
   }
 
-  function arrivalEtaUnix(executeAfterUnix: number, leadTimeDays: number) {
-    if (!executeAfterUnix) return 0;
-    const d = Number.isFinite(leadTimeDays) ? Math.max(0, leadTimeDays) : 0;
-    return executeAfterUnix + d * 24 * 60 * 60;
-  }
-
-  function fmtArrivingCountdown(arrivalUnix: number) {
-    if (!arrivalUnix) return "Arrival time unknown";
-
-    const ms = arrivalUnix * 1000 - Date.now();
-    if (ms <= 0) return "Arrived";
-
-    const totalSec = Math.floor(ms / 1000);
-    const hours = Math.floor(totalSec / 3600);
-    const minutes = Math.floor((totalSec % 3600) / 60);
-    const seconds = totalSec % 60;
-
-    if (hours > 0) return `Arriving in ${hours}h ${minutes}m`;
-    if (minutes > 0) return `Arriving in ${minutes}m ${seconds}s`;
-    return `Arriving in ${seconds}s`;
-  }
-
   function fmtWhen(ts: number) {
     if (!ts) return "—";
     try {
       return new Date(ts * 1000).toLocaleString();
     } catch {
       return String(ts);
-    }
-  }
-
-  async function autoProposeNow() {
-    if (cancelAnyInFlight.current) return;
-
-    const owner = getSavedOwnerAddress();
-    const env = getSavedEnv();
-
-    if (!locationId) return;
-    // ✅ Don’t auto-propose while a manual plan generation is running
-    if (loading) return;
-
-    // ✅ Optional: don’t run while tab is hidden
-    if (typeof document !== "undefined" && document.hidden) return;
-
-    if (manualGenerateInFlight.current) return;
-    if (loading) return;
-
-    if (!owner || !isAddress(owner)) {
-      setAutoProposeMsg("Connect wallet on homepage first.");
-      return;
-    }
-
-    if (autoProposeInFlight.current) return;
-    autoProposeInFlight.current = true;
-
-    try {
-      setAutoProposeMsg("Auto-propose: proposing…");
-
-      const res = await fetch(
-        `/api/orders/propose?locationId=${encodeURIComponent(locationId)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            env,
-            ownerAddress: owner,
-            pendingWindowHours: 24,
-
-            // keep proposer aligned with the UI controls
-            strategy,
-            horizonDays,
-            notes,
-          }),
-        }
-      );
-
-      const json = await res.json();
-
-      if (!res.ok || !json?.ok) {
-        setAutoProposeMsg(
-          `Auto-propose failed (HTTP ${res.status}): ${JSON.stringify(json)}`
-        );
-        return;
-      }
-
-      setAutoProposeMsg("Auto-propose: proposed ✔");
-      await refreshOrders();
-    } catch (e: any) {
-      setAutoProposeMsg(`Auto-propose error: ${String(e?.message ?? e)}`);
-    } finally {
-      autoProposeInFlight.current = false;
     }
   }
 
@@ -653,6 +847,102 @@ export default function LocationPage() {
     }
   }
 
+  async function cancelIntentCard(intent: IntentRow) {
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) {
+      setOrdersError(
+        "No valid wallet found. Connect wallet on homepage first."
+      );
+      return;
+    }
+    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
+      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
+      return;
+    }
+    if (typeof window === "undefined" || !(window as any).ethereum) {
+      setOrdersError("No injected wallet found (window.ethereum missing).");
+      return;
+    }
+
+    if (cancelAnyInFlight.current) return;
+    cancelAnyInFlight.current = true;
+    setCancelAnyUi(true);
+
+    const key = String(intent.ref || "");
+    const items = Array.isArray(intent.items) ? intent.items : [];
+
+    // Collect cancellable ids
+    const ids: bigint[] = [];
+    for (const it of items) {
+      if (it.canceled || it.executed) continue;
+      const raw = String(it.orderId ?? "").trim();
+      if (!raw) continue;
+      try {
+        ids.push(BigInt(raw));
+      } catch {}
+    }
+
+    if (ids.length === 0) {
+      setOrdersError("No cancellable order IDs found in this intent.");
+      cancelAnyInFlight.current = false;
+      setCancelAnyUi(false);
+      return;
+    }
+
+    try {
+      setOrdersError("");
+      setCancelingOrderKey(key);
+
+      // Optimistic UI: remove the whole intent immediately
+      setIntents((prev) =>
+        prev.filter((x) => String(x.ref) !== String(intent.ref))
+      );
+      setOpenOrderKeys((prev) => {
+        const copy = { ...prev };
+        delete copy[key];
+        return copy;
+      });
+
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setOrdersError("No injected wallet found (window.ethereum missing).");
+        return;
+      }
+
+      const provider = new BrowserProvider(injected);
+      const signer = await provider.getSigner();
+
+      const signerAddr = await signer.getAddress();
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setOrdersError("Connected wallet does not match saved owner address.");
+        return;
+      }
+
+      const hub = new Contract(
+        TREASURY_HUB_ADDRESS,
+        MOZI_TREASURY_HUB_ABI,
+        signer
+      );
+
+      for (const id of ids) {
+        const tx = await (hub as any).cancelOrder(id);
+        try {
+          await provider.waitForTransaction(tx.hash, 1, 60_000);
+        } catch {
+          // ignore timeout
+        }
+      }
+
+      await refreshOrders();
+    } catch (e: any) {
+      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
+    } finally {
+      setCancelingOrderKey(null);
+      cancelAnyInFlight.current = false;
+      setCancelAnyUi(false);
+    }
+  }
+
   async function cancelOrderCard(o: {
     key: string;
     supplier: string;
@@ -831,13 +1121,47 @@ export default function LocationPage() {
     display: "inline-block",
   });
 
-  async function generate() {
+  const btnLink = (disabled?: boolean): React.CSSProperties => ({
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    color: COLORS.primary,
+    fontWeight: 900,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.6 : 1,
+  });
+
+  const readRow: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr auto",
+    alignItems: "center",
+    gap: 12,
+    padding: "6px 0",
+    minWidth: 0,
+  };
+
+  const valuePill = (bg = "rgba(15,23,42,0.06)"): React.CSSProperties => ({
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: bg,
+    color: COLORS.text,
+    fontWeight: 900,
+    fontSize: 13,
+    lineHeight: 1,
+    whiteSpace: "nowrap",
+    justifySelf: "end",
+  });
+
+  async function generateOrders() {
     if (!locationId) return;
 
     setLoading(true);
     manualGenerateInFlight.current = true;
+
     setError("");
-    setPlan(null);
+    setPlan(null); // optional: if you want to stop showing the plan UI
     setPaymentIntent(null);
     setExecuteResp(null);
 
@@ -852,104 +1176,36 @@ export default function LocationPage() {
         return;
       }
 
-      const stateRes = await fetch(
-        `/api/state?locationId=${encodeURIComponent(locationId)}` +
-          `&owner=${encodeURIComponent(owner)}` +
-          `&env=${encodeURIComponent(env)}`
+      // This creates new on-chain orders through your proposer route
+      const res = await fetch(
+        `/api/orders/propose?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            env,
+            ownerAddress: owner,
+            pendingWindowHours: 24,
+            strategy,
+            horizonDays,
+            notes: formatContextForNotes(additionalContext),
+          }),
+        }
       );
 
-      if (!stateRes.ok) {
-        const err = await stateRes.json();
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.ok) {
         setError(
-          `STATE HTTP ${stateRes.status}\n` + JSON.stringify(err, null, 2)
+          `GENERATE ORDERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
         );
         return;
       }
 
-      const baseInput = (await stateRes.json()) as PlanInput;
-
-      // Apply UI controls deterministically before calling /api/plan
-      const input: PlanInput = {
-        ...baseInput,
-        restaurant: {
-          ...baseInput.restaurant,
-          id: locationId,
-          planningHorizonDays: horizonDays,
-        },
-        ownerPrefs: {
-          ...baseInput.ownerPrefs,
-          strategy,
-        },
-        context: {
-          ...(baseInput.context ?? {}),
-          notes,
-        },
-      };
-
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        setError(`PLAN HTTP ${res.status}\n` + JSON.stringify(data, null, 2));
-      } else {
-        setPlan(data as PlanOutput);
-
-        const pi = buildPaymentIntentFromPlan({
-          input,
-          plan: data as PlanOutput,
-        });
-        console.log("PAYMENT_INTENT", pi);
-        setPaymentIntent(pi);
-        setExecuteResp(null);
-
-        // --- TEMP EXECUTE STEP (calls your /api/execute route) ---
-
-        // 1) Read connected wallet address from localStorage (same key as homepage)
-        const ownerAddress =
-          typeof window !== "undefined"
-            ? window.localStorage.getItem("mozi_wallet_address")
-            : null;
-
-        // 2) Validate it
-        if (!ownerAddress || !isAddress(ownerAddress)) {
-          setError(
-            "No valid wallet found. Go to the homepage, connect wallet, then come back here."
-          );
-          return;
-        }
-
-        // 3) Call execute API with the shape it expects: { ownerAddress, paymentIntent }
-        const execRes = await fetch(
-          `/api/execute?locationId=${encodeURIComponent(locationId)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ownerAddress: owner,
-              input,
-              plan: data,
-              paymentIntent: pi,
-            }),
-          }
-        );
-
-        const execJson = await execRes.json();
-        console.log("EXECUTE_RESPONSE", execJson);
-        setExecuteResp(execJson);
-
-        if (!execRes.ok) {
-          setError(
-            `EXECUTE HTTP ${execRes.status}\n` +
-              JSON.stringify(execJson, null, 2)
-          );
-        }
-      }
+      // refresh list immediately so the new orders appear
+      await refreshOrders();
     } catch (e: any) {
-      setError(String(e));
+      setError(String(e?.message ?? e));
     } finally {
       manualGenerateInFlight.current = false;
       setLoading(false);
@@ -1026,8 +1282,6 @@ export default function LocationPage() {
         setHorizonDays(Math.max(5, Math.min(30, parsed)));
       }
     }
-
-    if (typeof n === "string") setNotes(n);
   }, []);
 
   useEffect(() => {
@@ -1040,35 +1294,6 @@ export default function LocationPage() {
     refreshOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
-
-  useEffect(() => {
-    if (!locationId) return;
-    if (!autoProposeEnabled) return;
-
-    let canceled = false;
-
-    // delay first run so it doesn't collide with page load + manual click
-    const first = window.setTimeout(() => {
-      if (canceled) return;
-      if (document.visibilityState !== "visible") return;
-      autoProposeNow();
-    }, 5_000);
-
-    const id = window.setInterval(() => {
-      if (document.visibilityState !== "visible") return;
-      autoProposeNow();
-    }, 60_000);
-
-    return () => {
-      canceled = true;
-      window.clearTimeout(first);
-      window.clearInterval(id);
-    };
-
-    // Intentionally do NOT depend on strategy/horizonDays/notes
-    // so changing knobs doesn't immediately trigger an auto-propose.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationId, autoProposeEnabled]);
 
   useEffect(() => {
     if (!locationId) return;
@@ -1147,7 +1372,7 @@ export default function LocationPage() {
           >
             <div>
               <Link href="/" style={btnSoft(false)}>
-                ← Home
+                Home
               </Link>
             </div>
 
@@ -1160,7 +1385,7 @@ export default function LocationPage() {
                 textAlign: "center",
               }}
             >
-              Location
+              Joe's Diner
             </h1>
 
             <div />
@@ -1211,1026 +1436,1237 @@ export default function LocationPage() {
         }
       `}</style>
 
-      <main style={{ maxWidth: 900, width: "100%", padding: 24 }}>
-        {/* Header */}
-        <header
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr auto 1fr",
-            alignItems: "center",
-            marginBottom: 24,
-          }}
-        >
-          <div style={{ display: "flex", gap: 10 }}>
-            <Link href="/" style={btnSoft(false)}>
-              ← Home
-            </Link>
-          </div>
+      <main
+        style={{
+          width: "100%",
+          height: "100%",
+          padding: 24,
 
-          <div style={{ textAlign: "center" }}>
-            <div
-              style={{
-                fontSize: 30,
-                fontWeight: 950,
-                letterSpacing: -0.4,
-                margin: 0,
-              }}
-            >
-              Location
-            </div>
-          </div>
+          display: "grid",
+          gridTemplateColumns: chatOpen ? "1fr 1fr" : "1fr",
+          gap: 16,
+          alignItems: "start",
 
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-            <Link
-              href={`/locations/${locationId}/inventory`}
-              style={btnSoft(false)}
-            >
-              Inventory
-            </Link>
-          </div>
-        </header>
-
-        {/* Generate Purchase Plan */}
-        <section style={cardStyle}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 12,
-              marginBottom: 8,
-            }}
-          >
-            {/* Left: title + ? bubble right next to it */}
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ fontWeight: 950, fontSize: 16 }}>Purchase Plan</div>
-
-              <HelpDot title="Explain plan settings">
-                <div style={{ fontWeight: 950, marginBottom: 8 }}>
-                  Plan settings
-                </div>
-
-                <div style={{ display: "grid", gap: 10, fontSize: 13 }}>
-                  <div>
-                    <div style={{ fontWeight: 950 }}>Strategy</div>
-                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                      How Mozi trades off waste vs. stockouts when choosing
-                      quantities.
-                      <div style={{ marginTop: 6 }}>
-                        <span style={{ fontWeight: 900 }}>
-                          {strategyLabel("min_waste")}
-                        </span>
-                        : order less, accept higher stockout risk •{" "}
-                        <span style={{ fontWeight: 900 }}>
-                          {strategyLabel("balanced")}
-                        </span>
-                        : default tradeoff •{" "}
-                        <span style={{ fontWeight: 900 }}>
-                          {strategyLabel("min_stockouts")}
-                        </span>
-                        : order more, accept higher waste risk
-                      </div>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div style={{ fontWeight: 950 }}>Planning Horizon</div>
-                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                      How far into the future Mozi looks when deciding what to
-                      order today. A longer horizon means Mozi considers
-                      upcoming demand and deliveries further out; a shorter
-                      horizon makes it focus more on the near term.
-                    </div>
-                  </div>
-
-                  <div>
-                    <div style={{ fontWeight: 950 }}>Additional Context</div>
-                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                      Short notes that adjust assumptions (events, seasonality,
-                      promos, unusual weeks). Example: “Football weekend” can
-                      bias expected demand.
-                    </div>
-                  </div>
-                </div>
-              </HelpDot>
-            </div>
-
-            {/* Right: Save button */}
-            <button
-              type="button"
-              onClick={() => {
-                if (typeof window === "undefined") return;
-
-                window.localStorage.setItem("mozi_plan_strategy", strategy);
-                window.localStorage.setItem(
-                  "mozi_plan_horizon_days",
-                  String(horizonDays)
-                );
-                window.localStorage.setItem("mozi_plan_notes", notes);
-
-                // optional: quick feedback without adding new UI state
-                // (if you want a real status message, tell me and I'll wire it)
-              }}
-              style={btnSoft(false)}
-              title="Save plan settings"
-            >
-              Save
-            </button>
-          </div>
-
-          <div
+          // ⬇️ This is the key part
+          maxWidth: chatOpen ? "100vw" : 900,
+          marginLeft: chatOpen ? 0 : "auto",
+          marginRight: chatOpen ? 0 : "auto",
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          {/* Header */}
+          <header
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
-              gap: 12,
+              gridTemplateColumns: "1fr auto 1fr",
+              alignItems: "center",
+              marginBottom: 24,
             }}
           >
-            <div style={{ display: "grid", gap: 6 }}>
-              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Strategy
-              </label>
-              <select
-                value={strategy}
-                onChange={(e) =>
-                  setStrategy(
-                    e.target.value as PlanInput["ownerPrefs"]["strategy"]
-                  )
-                }
+            <div style={{ display: "flex", gap: 10 }}>
+              <Link href="/" style={btnSoft(false)}>
+                Home
+              </Link>
+            </div>
+
+            <div style={{ textAlign: "center" }}>
+              <div
                 style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: `1px solid ${COLORS.border}`,
-                  background: "rgba(255,255,255,0.85)",
-                  color: COLORS.text,
-                  fontWeight: 800,
-                  outline: "none",
+                  fontSize: 30,
+                  fontWeight: 950,
+                  letterSpacing: -0.4,
+                  margin: 0,
                 }}
               >
-                <option value="min_waste">{strategyLabel("min_waste")}</option>
-                <option value="balanced">{strategyLabel("balanced")}</option>
-                <option value="min_stockouts">
-                  {strategyLabel("min_stockouts")}
-                </option>
-              </select>
+                Joe's Diner
+              </div>
             </div>
 
-            <div style={{ display: "grid", gap: 6 }}>
-              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Planning Horizon
-              </label>
-              <input
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={horizonDaysDraft}
-                onChange={(e) => {
-                  setHorizonDaysDraft(sanitizeIntDraft(e.target.value));
-                }}
-                onBlur={() => {
-                  const normalized = draftToClampedInt(horizonDaysDraft, 5, 30);
-                  setHorizonDays(normalized);
-                  setHorizonDaysDraft(String(normalized));
-                }}
-                onFocus={(e) => e.currentTarget.select()}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: `1px solid ${COLORS.border}`,
-                  background: "rgba(255,255,255,0.85)",
-                  color: COLORS.text,
-                  fontWeight: 800,
-                  outline: "none",
-                  fontSize: 16, // nicer to type (matches inventory idea)
-                }}
-              />
-            </div>
-
-            <div style={{ display: "grid", gap: 6, gridColumn: "1 / -1" }}>
-              <label style={{ fontWeight: 900, color: COLORS.subtext }}>
-                Additional Context
-              </label>
-              <input
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder='e.g. "Football weekend"'
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: `1px solid ${COLORS.border}`,
-                  background: "rgba(255,255,255,0.85)",
-                  color: COLORS.text,
-                  fontWeight: 800,
-                  outline: "none",
-                }}
-              />
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "flex-end",
-              marginTop: 8, // 🔧 tighter vertical spacing
-            }}
-          >
-            <button
-              onClick={generate}
-              disabled={loading}
-              style={btnPrimary(loading)}
+            <div
+              style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}
             >
-              {loading ? "Generating…" : "Generate Plan"}
-            </button>
-          </div>
+              <Link
+                href={`/locations/${locationId}/inventory`}
+                style={btnSoft(false)}
+              >
+                Inventory
+              </Link>
 
-          {/* Generated Plan (shows here) */}
-          {error ? (
+              <Link
+                href={`/locations/${locationId}/suppliers`}
+                style={btnSoft(false)}
+              >
+                Suppliers
+              </Link>
+            </div>
+          </header>
+
+          {/* Generate Purchase Plan */}
+          <section style={{ ...cardStyle, gap: 10, padding: 14 }}>
             <div
               style={{
-                marginTop: 12,
-                border: `1px solid ${COLORS.dangerBorder}`,
-                background: COLORS.dangerBg,
-                color: COLORS.dangerText,
-                borderRadius: 12,
-                padding: 12,
-                fontWeight: 800,
-                whiteSpace: "pre-wrap",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                marginBottom: 8,
               }}
             >
-              {error}
+              {/* Left */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontWeight: 950, fontSize: 16 }}>
+                  Purchase Plan
+                </div>
+                <HelpDot title="Explain plan settings">...</HelpDot>
+              </div>
+
+              {/* Right */}
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                {!editingPlan ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStrategyDraft(strategy);
+                      setHorizonDaysDraft(String(horizonDays));
+                      setEditingPlan(true);
+                    }}
+                    style={btnSoft(false)}
+                    title="Edit plan settings"
+                  >
+                    Edit
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const normalized = draftToClampedInt(
+                          horizonDaysDraft,
+                          5,
+                          30
+                        );
+
+                        setStrategy(strategyDraft);
+                        setHorizonDays(normalized);
+                        setHorizonDaysDraft(String(normalized));
+
+                        if (typeof window !== "undefined") {
+                          window.localStorage.setItem(
+                            "mozi_plan_strategy",
+                            strategyDraft
+                          );
+                          window.localStorage.setItem(
+                            "mozi_plan_horizon_days",
+                            String(normalized)
+                          );
+                        }
+
+                        setEditingPlan(false);
+                      }}
+                      style={btnSoft(false)}
+                      title="Save plan settings"
+                    >
+                      Done
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStrategyDraft(strategy);
+                        setHorizonDaysDraft(String(horizonDays));
+                        setEditingPlan(false);
+                      }}
+                      style={btnSoft(false)}
+                      title="Cancel edits"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
-          ) : null}
 
-          {plan ? (
-            <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
-              <div style={{ fontWeight: 950, fontSize: 16 }}>
-                Generated Plan
-              </div>
-              <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                Generated: {plan.generatedAt} • Horizon: {plan.horizonDays} days
-              </div>
-
-              {/* Orders */}
-              <div style={{ display: "grid", gap: 10 }}>
-                {plan.orders.map((order, idx) => (
-                  <details
-                    key={idx}
-                    open={idx === 0}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: 12,
+              }}
+            >
+              <div style={{ display: "grid", gap: 10, gridColumn: "1 / -1" }}>
+                {/* Strategy + Planning Horizon */}
+                <div style={{ display: "grid", gap: 10, gridColumn: "1 / -1" }}>
+                  {/* Strategy */}
+                  <div
                     style={{
-                      border: `1px solid ${COLORS.border}`,
-                      borderRadius: 12,
-                      background: "rgba(255,255,255,0.75)",
-                      padding: 12,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      flexWrap: "wrap",
                     }}
                   >
-                    <summary style={{ cursor: "pointer", fontWeight: 950 }}>
-                      Supplier:{" "}
-                      <span
-                        style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
-                      >
-                        {order.supplierId}
-                      </span>{" "}
-                      • {order.orderDate} • {order.items.length} items
-                    </summary>
-
-                    <div
-                      style={{
-                        marginTop: 10,
-                        overflowX: "auto",
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 12,
-                        background: "rgba(255,255,255,0.75)",
-                      }}
-                    >
-                      <table
-                        style={{ width: "100%", borderCollapse: "collapse" }}
-                      >
-                        <thead>
-                          <tr>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              SKU
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "right",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Units
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Risk
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "right",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Conf.
-                            </th>
-                            <th
-                              style={{
-                                textAlign: "left",
-                                padding: 12,
-                                fontWeight: 950,
-                              }}
-                            >
-                              Reason
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {order.items.map((it, j) => (
-                            <tr key={j}>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                }}
-                              >
-                                {it.sku}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                  textAlign: "right",
-                                  fontWeight: 900,
-                                }}
-                              >
-                                {it.orderUnits}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                }}
-                              >
-                                {it.riskNote ?? "—"}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                  textAlign: "right",
-                                }}
-                              >
-                                {typeof it.confidence === "number"
-                                  ? it.confidence.toFixed(2)
-                                  : "—"}
-                              </td>
-                              <td
-                                style={{
-                                  padding: 12,
-                                  borderTop: "1px solid #eef2f7",
-                                }}
-                              >
-                                {it.reason}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                    <div style={{ fontWeight: 900, color: COLORS.subtext }}>
+                      Strategy
                     </div>
-                  </details>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </section>
 
-        {/* On-chain Orders (read-only) */}
-        <section style={cardStyle}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: 12,
-            }}
-          >
-            {/* Left: title + pill */}
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ fontWeight: 950, fontSize: 16 }}>Orders</div>
-
-              {requireApproval === null ? null : requireApproval ? (
-                <span
-                  style={pillStyle({
-                    bg: COLORS.warnBg,
-                    border: COLORS.warnBorder,
-                    text: COLORS.warnText,
-                  })}
-                >
-                  Manual
-                </span>
-              ) : (
-                <span
-                  style={pillStyle({
-                    bg: COLORS.greenBg,
-                    border: COLORS.greenBorder,
-                    text: COLORS.greenText,
-                  })}
-                >
-                  Autonomous
-                </span>
-              )}
-            </div>
-          </div>
-
-          {ordersError ? (
-            <div
-              style={{
-                border: `1px solid ${COLORS.warnBorder}`,
-                background: COLORS.warnBg,
-                color: COLORS.warnText,
-                borderRadius: 12,
-                padding: 12,
-                fontWeight: 800,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {ordersError}
-            </div>
-          ) : intents.length === 0 ? (
-            <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-              No orders found.
-            </div>
-          ) : (
-            <div style={{ display: "grid", gap: 12 }}>
-              {(() => {
-                // force re-render per second for countdowns
-                void nowTick;
-
-                type GroupedOrder = {
-                  key: string;
-                  supplier: string;
-                  executeAfter: number;
-                  totalRaw: bigint;
-                  itemCount: number;
-                  canceled: boolean; // if any canceled
-                  executed: boolean; // if all executed
-                  lines: Array<{
-                    // keep these minimal + useful
-                    amountRaw: bigint;
-                    canceled: boolean;
-                    executed: boolean;
-                    orderId?: string; // optional, do not display unless you want to later
-                  }>;
-                };
-
-                const groupsMap = new Map<string, GroupedOrder>();
-
-                for (const intent of intents) {
-                  const items = intent.items ?? [];
-                  for (const it of items) {
-                    const supplier = String(it.supplier || "");
-                    const executeAfter = Number(
-                      it.executeAfter ?? intent.executeAfter ?? 0
-                    );
-
-                    // ✅ GROUP KEY = supplier + executeAfter (this is your requirement)
-                    const key = `${supplier.toLowerCase()}:${executeAfter}`;
-
-                    let amountRaw = BigInt(0);
-                    try {
-                      amountRaw = BigInt(it.amount || "0");
-                    } catch {
-                      amountRaw = BigInt(0);
-                    }
-
-                    // ✅ IMPORTANT: use *line-level* flags only (intent flags can be coarse and hide cancelable lines)
-                    const itemCanceled = Boolean(it.canceled);
-                    const itemExecuted = Boolean(it.executed);
-
-                    // ✅ Don’t show canceled lines at all
-                    if (itemCanceled) continue;
-
-                    const existing = groupsMap.get(key);
-
-                    if (!existing) {
-                      groupsMap.set(key, {
-                        key,
-                        supplier,
-                        executeAfter,
-                        totalRaw: amountRaw,
-                        itemCount: 1,
-                        canceled: itemCanceled,
-                        executed: itemExecuted,
-                        lines: [
-                          {
-                            amountRaw,
-                            canceled: itemCanceled,
-                            executed: itemExecuted,
-                            orderId: String((it as any)?.orderId ?? ""),
-                          },
-                        ],
-                      });
-                    } else {
-                      existing.totalRaw += amountRaw;
-                      existing.itemCount += 1;
-
-                      existing.canceled = existing.canceled || itemCanceled;
-                      existing.executed = existing.executed && itemExecuted;
-
-                      existing.lines.push({
-                        amountRaw,
-                        canceled: itemCanceled,
-                        executed: itemExecuted,
-                        orderId: String((it as any)?.orderId ?? ""),
-                      });
-                    }
-                  }
-                }
-
-                const groupedOrders = Array.from(groupsMap.values()).sort(
-                  (a, b) => b.executeAfter - a.executeAfter
-                );
-
-                return groupedOrders.map((o) => {
-                  const sup = supplierLabel(o.supplier);
-
-                  // Pending window is over once now >= executeAfter
-                  const nowUnix = Math.floor(Date.now() / 1000);
-                  const hasCancelableLines = o.lines.some(
-                    (ln) => !ln.canceled && !ln.executed
-                  );
-                  const pendingEnded =
-                    Number(o.executeAfter) > 0 &&
-                    nowUnix >= Number(o.executeAfter);
-
-                  const statusLabel = o.canceled
-                    ? "Canceled"
-                    : o.executed
-                    ? "Executed"
-                    : "Pending";
-
-                  const statusPill = o.canceled
-                    ? pillStyle({
-                        bg: COLORS.dangerBg,
-                        border: COLORS.dangerBorder,
-                        text: COLORS.dangerText,
-                      })
-                    : o.executed
-                    ? pillStyle({
-                        bg: COLORS.greenBg,
-                        border: COLORS.greenBorder,
-                        text: COLORS.greenText,
-                      })
-                    : pillStyle({
-                        bg: COLORS.warnBg,
-                        border: COLORS.warnBorder,
-                        text: COLORS.warnText,
-                      });
-
-                  // total cost
-                  let costStr = "—";
-                  const isOpen = Boolean(openOrderKeys[o.key]);
-                  const toggleOpen = () =>
-                    setOpenOrderKeys((prev) => ({
-                      ...prev,
-                      [o.key]: !prev[o.key],
-                    }));
-
-                  try {
-                    const usd = Number(formatUnits(o.totalRaw, 18));
-                    costStr = `$${usd.toFixed(2)}`;
-                  } catch {
-                    costStr = "—";
-                  }
-
-                  return (
-                    <div
-                      key={o.key}
-                      style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        background: "rgba(255,255,255,0.75)",
-                        display: "grid",
-                        gap: 10,
-                        opacity: o.canceled ? 0.55 : 1,
-                      }}
-                    >
-                      <div
+                    {!editingPlan ? (
+                      <div style={valuePill()}>{strategyLabel(strategy)}</div>
+                    ) : (
+                      <select
+                        value={strategyDraft}
+                        onChange={(e) =>
+                          setStrategyDraft(
+                            e.target
+                              .value as PlanInput["ownerPrefs"]["strategy"]
+                          )
+                        }
                         style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr auto",
-                          gap: 10,
-                          alignItems: "start",
+                          padding: "10px 12px",
+                          borderRadius: 12,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "rgba(255,255,255,0.85)",
+                          color: COLORS.text,
+                          fontWeight: 850,
+                          outline: "none",
                         }}
                       >
-                        <div style={{ display: "grid", gap: 4 }}>
-                          {/* Row 1: Supplier name + short address on the same line */}
+                        <option value="balanced">
+                          {strategyLabel("balanced")}
+                        </option>
+                        <option value="min_waste">
+                          {strategyLabel("min_waste")}
+                        </option>
+                        <option value="min_stockouts">
+                          {strategyLabel("min_stockouts")}
+                        </option>
+                      </select>
+                    )}
+                  </div>
+
+                  {/* Planning Horizon */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ fontWeight: 900, color: COLORS.subtext }}>
+                      Planning Horizon
+                    </div>
+
+                    {!editingPlan ? (
+                      <div style={valuePill()}>{horizonDays} days</div>
+                    ) : (
+                      <input
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        value={horizonDaysDraft}
+                        onChange={(e) =>
+                          setHorizonDaysDraft(sanitizeIntDraft(e.target.value))
+                        }
+                        onBlur={() => {
+                          const normalized = draftToClampedInt(
+                            horizonDaysDraft,
+                            5,
+                            30
+                          );
+                          setHorizonDaysDraft(String(normalized));
+                        }}
+                        onFocus={(e) => e.currentTarget.select()}
+                        style={{
+                          width: 120,
+                          padding: "10px 12px",
+                          borderRadius: 12,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "rgba(255,255,255,0.85)",
+                          color: COLORS.text,
+                          fontWeight: 850,
+                          outline: "none",
+                          textAlign: "right",
+                        }}
+                      />
+                    )}
+                  </div>
+                </div>
+
+                {/* Title row */}
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <label style={{ fontWeight: 900, color: COLORS.subtext }}>
+                    Additional Context
+                  </label>
+
+                  <HelpDot title="What is Additional Context?">
+                    <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                      Additional Context
+                    </div>
+                    <div style={{ display: "grid", gap: 8, fontSize: 13 }}>
+                      <div>
+                        Add one-off notes that should affect ordering
+                        assumptions.
+                      </div>
+                      <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                        Each note has a duration in days. Expired notes won’t be
+                        sent when generating orders.
+                      </div>
+                    </div>
+                  </HelpDot>
+                </div>
+
+                {/* Input row: context + days + add */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 160px auto",
+                    gap: 10,
+                    alignItems: "center",
+                  }}
+                >
+                  <input
+                    value={contextDraft}
+                    onChange={(e) => setContextDraft(e.target.value)}
+                    placeholder='e.g. "Big game Sunday → expect +20% wings"'
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      border: `1px solid ${COLORS.border}`,
+                      background: "rgba(255,255,255,0.85)",
+                      color: COLORS.text,
+                      fontWeight: 800,
+                      outline: "none",
+                    }}
+                  />
+
+                  <input
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={contextDaysDraft}
+                    onChange={(e) =>
+                      setContextDaysDraft(sanitizeIntDraft(e.target.value))
+                    }
+                    onBlur={() => {
+                      const normalized = draftToClampedInt(
+                        contextDaysDraft,
+                        1,
+                        365
+                      );
+                      setContextDaysDraft(String(normalized));
+                    }}
+                    onFocus={(e) => e.currentTarget.select()}
+                    placeholder="Days"
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      border: `1px solid ${COLORS.border}`,
+                      background: "rgba(255,255,255,0.85)",
+                      color: COLORS.text,
+                      fontWeight: 800,
+                      outline: "none",
+                    }}
+                  />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const owner = getSavedOwnerAddress();
+                      const env = getSavedEnv();
+                      if (!owner || !locationId) return;
+
+                      const text = contextDraft.trim();
+                      const days = draftToClampedInt(contextDaysDraft, 1, 365);
+
+                      if (!text) return;
+
+                      const nextItem: AdditionalContextItem = {
+                        id: `${Date.now()}_${Math.random()
+                          .toString(16)
+                          .slice(2)}`,
+                        text,
+                        durationDays: days,
+                        createdAtMs: Date.now(),
+                      };
+
+                      setAdditionalContext((prev) => {
+                        const next = [nextItem, ...prev];
+                        saveAdditionalContext(env, owner, locationId, next);
+                        return next;
+                      });
+
+                      setContextDraft("");
+                      // keep days as-is (nice UX), or reset if you want:
+                      // setContextDaysDraft("7");
+                    }}
+                    disabled={!contextDraft.trim()}
+                    style={btnSoft(!contextDraft.trim())}
+                    title="Save this context item"
+                  >
+                    Add
+                  </button>
+                </div>
+
+                {/* Saved items list */}
+                {additionalContext.length === 0 ? (
+                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                    No additional context saved.
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {additionalContext.map((it) => {
+                      const active = isContextActive(it);
+                      const expiresAtMs =
+                        it.createdAtMs + it.durationDays * 24 * 60 * 60 * 1000;
+
+                      return (
+                        <div
+                          key={it.id}
+                          style={{
+                            border: `1px solid ${COLORS.border}`,
+                            background: "rgba(255,255,255,0.75)",
+                            borderRadius: 12,
+                            padding: 12,
+                            display: "grid",
+                            gap: 6,
+                            opacity: active ? 1 : 0.55,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns: "1fr auto",
+                              gap: 10,
+                              alignItems: "start",
+                            }}
+                          >
+                            <div
+                              style={{ fontWeight: 900, color: COLORS.text }}
+                            >
+                              {it.text}
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const owner = getSavedOwnerAddress();
+                                const env = getSavedEnv();
+                                if (!owner || !locationId) return;
+
+                                setAdditionalContext((prev) => {
+                                  const next = prev.filter(
+                                    (x) => x.id !== it.id
+                                  );
+                                  saveAdditionalContext(
+                                    env,
+                                    owner,
+                                    locationId,
+                                    next
+                                  );
+                                  return next;
+                                });
+                              }}
+                              style={{
+                                padding: "8px 10px",
+                                borderRadius: 10,
+                                border: `1px solid ${COLORS.dangerBorder}`,
+                                background: COLORS.dangerBg,
+                                color: COLORS.dangerText,
+                                fontWeight: 950,
+                                cursor: "pointer",
+                              }}
+                              title="Remove this context item"
+                            >
+                              Remove
+                            </button>
+                          </div>
+
                           <div
                             style={{
                               display: "flex",
-                              alignItems: "baseline",
+                              gap: 12,
+                              flexWrap: "wrap",
+                              color: COLORS.subtext,
+                              fontWeight: 800,
+                              fontSize: 12,
+                            }}
+                          >
+                            <div>Applies for: {it.durationDays} days</div>
+                            <div>
+                              Expires: {new Date(expiresAtMs).toLocaleString()}
+                            </div>
+                            <div style={{ fontWeight: 950 }}>
+                              {active ? "Active" : "Expired"}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+
+          {/* On-chain Orders (read-only) */}
+          <section style={cardStyle}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+              }}
+            >
+              {/* Left: title + pill */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontWeight: 950, fontSize: 16 }}>Orders</div>
+
+                {requireApproval === null ? null : requireApproval ? (
+                  <span
+                    style={pillStyle({
+                      bg: COLORS.warnBg,
+                      border: COLORS.warnBorder,
+                      text: COLORS.warnText,
+                    })}
+                  >
+                    Manual
+                  </span>
+                ) : (
+                  <span
+                    style={pillStyle({
+                      bg: COLORS.greenBg,
+                      border: COLORS.greenBorder,
+                      text: COLORS.greenText,
+                    })}
+                  >
+                    Autonomous
+                  </span>
+                )}
+              </div>
+
+              {/* Right: buttons */}
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <button
+                  type="button"
+                  onClick={generateOrders}
+                  disabled={loading || ordersLoading || cancelAnyUi}
+                  style={btnPrimary(loading || ordersLoading || cancelAnyUi)}
+                  title="Create new on-chain orders"
+                >
+                  {loading ? "Generating…" : "Generate Orders"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={refreshOrders}
+                  disabled={ordersLoading || cancelAnyUi}
+                  style={btnSoft(ordersLoading || cancelAnyUi)}
+                  title="Refresh orders"
+                >
+                  {ordersLoading ? "Refreshing…" : "Refresh"}
+                </button>
+              </div>
+            </div>
+
+            {ordersError ? (
+              <div
+                style={{
+                  border: `1px solid ${COLORS.warnBorder}`,
+                  background: COLORS.warnBg,
+                  color: COLORS.warnText,
+                  borderRadius: 12,
+                  padding: 12,
+                  fontWeight: 800,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {ordersError}
+              </div>
+            ) : intents.length === 0 ? (
+              <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                No orders found.
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 12 }}>
+                {(() => {
+                  // force re-render per second for countdowns
+                  void nowTick;
+
+                  const sortedIntents = [...intents].sort(
+                    (a, b) =>
+                      Number(b.executeAfter ?? 0) - Number(a.executeAfter ?? 0)
+                  );
+
+                  return sortedIntents.map((intent) => {
+                    const key = String(intent.ref || "");
+                    const isOpen = Boolean(openOrderKeys[key]);
+                    const toggleOpen = () =>
+                      setOpenOrderKeys((prev) => ({
+                        ...prev,
+                        [key]: !prev[key],
+                      }));
+
+                    const items = Array.isArray(intent.items)
+                      ? intent.items
+                      : [];
+
+                    // Totals + supplier summary
+                    const totalRaw = items.reduce((acc, it) => {
+                      try {
+                        return acc + BigInt(String(it.amount ?? "0"));
+                      } catch {
+                        return acc;
+                      }
+                    }, BigInt(0));
+
+                    let costStr = "—";
+                    try {
+                      const usd = Number(formatUnits(totalRaw, 18));
+                      costStr = `$${usd.toFixed(2)}`;
+                    } catch {}
+
+                    const supplierAddrs = Array.from(
+                      new Set(
+                        items.map((it) =>
+                          String(it.supplier || "").toLowerCase()
+                        )
+                      )
+                    ).filter(Boolean);
+
+                    const supplierNames = supplierAddrs
+                      .map((addr) => supplierLabel(addr).name)
+                      .slice(0, 3);
+
+                    const supplierSummary =
+                      supplierAddrs.length <= 3
+                        ? supplierNames.join(", ")
+                        : `${supplierNames.join(", ")} +${
+                            supplierAddrs.length - 3
+                          } more`;
+
+                    const statusLabel = intent.canceled
+                      ? "Canceled"
+                      : intent.executed
+                      ? "Executed"
+                      : "Pending";
+
+                    const statusPill = intent.canceled
+                      ? pillStyle({
+                          bg: COLORS.dangerBg,
+                          border: COLORS.dangerBorder,
+                          text: COLORS.dangerText,
+                        })
+                      : intent.executed
+                      ? pillStyle({
+                          bg: COLORS.greenBg,
+                          border: COLORS.greenBorder,
+                          text: COLORS.greenText,
+                        })
+                      : pillStyle({
+                          bg: COLORS.warnBg,
+                          border: COLORS.warnBorder,
+                          text: COLORS.warnText,
+                        });
+
+                    const nowUnix = Math.floor(Date.now() / 1000);
+                    const pendingEnded =
+                      Number(intent.executeAfter ?? 0) > 0 &&
+                      nowUnix >= Number(intent.executeAfter);
+
+                    const canApprove =
+                      Boolean(requireApproval) &&
+                      !intent.canceled &&
+                      !intent.executed &&
+                      !intent.approved &&
+                      !pendingEnded;
+
+                    return (
+                      <div
+                        key={key}
+                        style={{
+                          border: `1px solid ${COLORS.border}`,
+                          borderRadius: 14,
+                          padding: 14,
+                          background: "rgba(255,255,255,0.75)",
+                          display: "grid",
+                          gap: 10,
+                          opacity: intent.canceled ? 0.55 : 1,
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr auto",
+                            gap: 10,
+                            alignItems: "start",
+                          }}
+                        >
+                          <div style={{ display: "grid", gap: 4 }}>
+                            {/* Row 1: Order */}
+                            <div style={{ fontWeight: 950 }}>Order</div>
+
+                            {/* Row 2: Suppliers summary */}
+                            <div
+                              style={{
+                                color: COLORS.subtext,
+                                fontWeight: 800,
+                                fontSize: 13,
+                              }}
+                            >
+                              Suppliers: {supplierSummary || "—"}
+                            </div>
+
+                            {/* Row 3: Execution timer (intent-level) */}
+                            <div
+                              style={{
+                                color: COLORS.subtext,
+                                fontWeight: 800,
+                                fontSize: 13,
+                              }}
+                            >
+                              {fmtExecutionCountdown(
+                                Number(intent.executeAfter)
+                              )}
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "flex-end",
                               gap: 10,
                               flexWrap: "wrap",
                             }}
                           >
-                            <div style={{ fontWeight: 950 }}>{sup.name}</div>
+                            {intent.canceled || intent.executed ? (
+                              <span style={statusPill}>{statusLabel}</span>
+                            ) : null}
 
-                            <div
-                              style={{
-                                fontFamily: "ui-monospace, Menlo, monospace",
-                                color: COLORS.subtext,
-                                fontWeight: 800,
-                                fontSize: 12,
-                                lineHeight: 1.2,
-                              }}
-                            >
-                              {shortenId(sup.address)}
-                            </div>
-                          </div>
-
-                          {/* Row 2: Execution timer */}
-                          <div
-                            style={{
-                              color: COLORS.subtext,
-                              fontWeight: 800,
-                              fontSize: 13,
-                            }}
-                          >
-                            {fmtExecutionCountdown(Number(o.executeAfter))}
-                          </div>
-
-                          {/* Row 3: Arrival time + ticking "Arriving in..." (ONLY after pending ends) */}
-                          {o.executed && !o.canceled
-                            ? (() => {
-                                // force re-render each second for arrival countdown
-                                void nowTick;
-
-                                const arrivalUnix = arrivalEtaUnix(
-                                  Number(o.executeAfter),
-                                  sup.leadTimeDays
-                                );
-
-                                return (
-                                  <div style={{ display: "grid", gap: 2 }}>
-                                    <div
-                                      style={{
-                                        color: COLORS.subtext,
-                                        fontWeight: 800,
-                                        fontSize: 13,
-                                      }}
-                                    >
-                                      {fmtArrivingCountdown(arrivalUnix)}
-                                    </div>
-
-                                    <div
-                                      style={{
-                                        color: COLORS.subtext,
-                                        fontWeight: 800,
-                                        fontSize: 12,
-                                      }}
-                                    >
-                                      Arrival:{" "}
-                                      {arrivalUnix ? fmtWhen(arrivalUnix) : "—"}
-                                    </div>
-                                  </div>
-                                );
-                              })()
-                            : null}
-                        </div>
-
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "flex-end",
-                            gap: 10,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <span style={statusPill}>{statusLabel}</span>
-
-                          <div style={{ textAlign: "right" }}>
-                            <div
-                              style={{
-                                color: COLORS.subtext,
-                                fontWeight: 900,
-                                fontSize: 12,
-                              }}
-                            >
-                              Cost
-                            </div>
-                            <div style={{ fontWeight: 950, fontSize: 18 }}>
-                              {costStr}
-                            </div>
-                          </div>
-
-                          {/* ✅ ALWAYS SHOW DELETE */}
-                          <button
-                            type="button"
-                            onClick={() => cancelOrderCard(o)}
-                            disabled={
-                              cancelAnyUi || cancelingOrderKey === o.key
-                            }
-                            title="Cancel all orders in this card (owner override)"
-                            style={{
-                              padding: "10px 14px",
-                              borderRadius: 12,
-                              border: `1px solid ${COLORS.dangerBorder}`,
-                              background: COLORS.dangerBg,
-                              color: COLORS.dangerText,
-                              fontWeight: 950,
-                              cursor:
-                                cancelAnyUi || cancelingOrderKey === o.key
-                                  ? "not-allowed"
-                                  : "pointer",
-                              opacity:
-                                cancelAnyUi || cancelingOrderKey === o.key
-                                  ? 0.7
-                                  : 1,
-                            }}
-                          >
-                            {cancelAnyUi || cancelingOrderKey === o.key
-                              ? "Deleting…"
-                              : "Delete"}
-                          </button>
-
-                          <button
-                            type="button"
-                            aria-label={
-                              isOpen
-                                ? "Collapse order details"
-                                : "Expand order details"
-                            }
-                            onClick={toggleOpen}
-                            title={isOpen ? "Hide details" : "Show details"}
-                            style={{
-                              width: 34,
-                              height: 34,
-                              borderRadius: 10,
-                              border: `1px solid ${COLORS.border}`,
-                              background: "rgba(255,255,255,0.75)",
-                              color: COLORS.subtext,
-                              fontWeight: 950,
-                              cursor: "pointer",
-                              display: "inline-flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              padding: 0,
-                              userSelect: "none",
-                            }}
-                          >
-                            <ChevronDown open={isOpen} />
-                          </button>
-                        </div>
-
-                        {isOpen ? (
-                          <div
-                            style={{
-                              gridColumn: "1 / -1", // ✅ spans entire card width
-                              borderTop: `1px solid ${COLORS.border}`,
-                              paddingTop: 10,
-                              display: "grid",
-                              gap: 10,
-                            }}
-                          >
-                            {/* Summary row */}
-                            <div
-                              style={{
-                                display: "grid",
-                                gridTemplateColumns: "1fr 1fr",
-                                gap: 10,
-                                fontSize: 13,
-                                color: COLORS.subtext,
-                                fontWeight: 850,
-                              }}
-                            >
-                              <div>
-                                <div
-                                  style={{
-                                    fontWeight: 950,
-                                    color: COLORS.text,
-                                  }}
-                                >
-                                  Execution time
-                                </div>
-                                <div>{fmtWhen(Number(o.executeAfter))}</div>
+                            <div style={{ textAlign: "right" }}>
+                              <div
+                                style={{
+                                  color: COLORS.subtext,
+                                  fontWeight: 900,
+                                  fontSize: 12,
+                                }}
+                              >
+                                Cost
+                              </div>
+                              <div style={{ fontWeight: 950, fontSize: 18 }}>
+                                {costStr}
                               </div>
                             </div>
 
-                            {/* Item breakdown table */}
-                            <div
+                            {canApprove ? (
+                              <button
+                                type="button"
+                                onClick={() => approveIntent(intent.ref)}
+                                disabled={
+                                  approvingRef === intent.ref || cancelAnyUi
+                                }
+                                style={btnSoft(
+                                  approvingRef === intent.ref || cancelAnyUi
+                                )}
+                                title="Approve this intent (required for Manual mode)"
+                              >
+                                {approvingRef === intent.ref
+                                  ? "Approving…"
+                                  : "Approve"}
+                              </button>
+                            ) : null}
+
+                            <button
+                              type="button"
+                              onClick={() => cancelIntentCard(intent)}
+                              disabled={
+                                cancelAnyUi || cancelingOrderKey === key
+                              }
+                              title="Cancel all orders in this intent (owner override)"
                               style={{
-                                width: "100%",
-                                overflowX: "auto",
-                                border: `1px solid ${COLORS.border}`,
+                                padding: "10px 14px",
                                 borderRadius: 12,
-                                background: "rgba(255,255,255,0.65)",
+                                border: `1px solid ${COLORS.dangerBorder}`,
+                                background: COLORS.dangerBg,
+                                color: COLORS.dangerText,
+                                fontWeight: 950,
+                                cursor:
+                                  cancelAnyUi || cancelingOrderKey === key
+                                    ? "not-allowed"
+                                    : "pointer",
+                                opacity:
+                                  cancelAnyUi || cancelingOrderKey === key
+                                    ? 0.7
+                                    : 1,
                               }}
                             >
-                              {(() => {
-                                // ---- ADD THIS TOTAL CALC (sum of all line items) ----
-                                const totalLinesRaw = o.lines.reduce(
-                                  (acc, ln) => acc + ln.amountRaw,
-                                  BigInt(0)
-                                );
+                              {cancelAnyUi || cancelingOrderKey === key
+                                ? "Deleting…"
+                                : "Delete"}
+                            </button>
 
-                                let totalLinesCostStr = "—";
-                                try {
-                                  const usd = Number(
-                                    formatUnits(totalLinesRaw, 18)
-                                  );
-                                  totalLinesCostStr = `$${usd.toFixed(2)}`;
-                                } catch {
-                                  totalLinesCostStr = "—";
-                                }
+                            <button
+                              type="button"
+                              aria-label={
+                                isOpen
+                                  ? "Collapse intent details"
+                                  : "Expand intent details"
+                              }
+                              onClick={toggleOpen}
+                              title={isOpen ? "Hide details" : "Show details"}
+                              style={{
+                                width: 34,
+                                height: 34,
+                                borderRadius: 10,
+                                border: `1px solid ${COLORS.border}`,
+                                background: "rgba(255,255,255,0.75)",
+                                color: COLORS.subtext,
+                                fontWeight: 950,
+                                cursor: "pointer",
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: 0,
+                                userSelect: "none",
+                              }}
+                            >
+                              <ChevronDown open={isOpen} />
+                            </button>
+                          </div>
 
-                                return (
-                                  <table
+                          {isOpen ? (
+                            <div
+                              style={{
+                                gridColumn: "1 / -1",
+                                borderTop: `1px solid ${COLORS.border}`,
+                                paddingTop: 10,
+                                display: "grid",
+                                gap: 10,
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "1fr 1fr",
+                                  gap: 10,
+                                  fontSize: 13,
+                                  color: COLORS.subtext,
+                                  fontWeight: 850,
+                                }}
+                              >
+                                <div>
+                                  <div
                                     style={{
-                                      width: "100%",
-                                      borderCollapse: "collapse",
+                                      fontWeight: 950,
+                                      color: COLORS.text,
                                     }}
                                   >
-                                    <thead>
-                                      <tr>
-                                        <th
-                                          style={{
-                                            textAlign: "left",
-                                            padding: 12,
-                                            fontWeight: 950,
-                                          }}
-                                        >
-                                          Line Item
-                                        </th>
-                                        <th
-                                          style={{
-                                            textAlign: "right",
-                                            padding: 12,
-                                            fontWeight: 950,
-                                          }}
-                                        >
-                                          Cost
-                                        </th>
-                                      </tr>
-                                    </thead>
+                                    Execution time
+                                  </div>
+                                  <div>
+                                    {fmtWhen(Number(intent.executeAfter))}
+                                  </div>
+                                </div>
 
-                                    <tbody>
-                                      {o.lines.map((ln, idx) => {
-                                        let lnCost = "—";
-                                        try {
-                                          const usd = Number(
-                                            formatUnits(ln.amountRaw, 18)
-                                          );
-                                          lnCost = `$${usd.toFixed(2)}`;
-                                        } catch {
-                                          lnCost = "—";
-                                        }
+                                <div>
+                                  <div
+                                    style={{
+                                      fontWeight: 950,
+                                      color: COLORS.text,
+                                    }}
+                                  >
+                                    Items
+                                  </div>
+                                  <div>{items.length}</div>
+                                </div>
+                              </div>
 
-                                        return (
-                                          <tr key={idx}>
-                                            <td
-                                              style={{
-                                                padding: 12,
-                                                borderTop: "1px solid #eef2f7",
-                                                fontWeight: 850,
-                                                color: COLORS.text,
-                                              }}
-                                            >
-                                              Item {idx + 1}
-                                            </td>
-
-                                            <td
-                                              style={{
-                                                padding: 12,
-                                                borderTop: "1px solid #eef2f7",
-                                                textAlign: "right",
-                                                fontWeight: 950,
-                                              }}
-                                            >
-                                              {lnCost}
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-
-                                    {/* ---- ADD THIS TOTAL ROW AT THE BOTTOM ---- */}
-                                    <tfoot>
-                                      <tr>
-                                        <td
-                                          style={{
-                                            padding: 12,
-                                            borderTop: `2px solid ${COLORS.border}`,
-                                            fontWeight: 950,
-                                            color: COLORS.text,
-                                          }}
-                                        >
-                                          Total
-                                        </td>
-
-                                        <td
-                                          style={{
-                                            padding: 12,
-                                            borderTop: `2px solid ${COLORS.border}`,
-                                            textAlign: "right",
-                                            fontWeight: 950,
-                                            color: COLORS.text,
-                                          }}
-                                        >
-                                          {totalLinesCostStr}
-                                        </td>
-                                      </tr>
-                                    </tfoot>
-                                  </table>
-                                );
-                              })()}
-                            </div>
-                            {/* Actions (bottom-right under table) */}
-                            {(() => {
-                              const isPending =
-                                hasCancelableLines && !pendingEnded;
-                              const isDeletingThis =
-                                cancelingOrderKey === o.key;
-
-                              if (!isPending) return null;
-
-                              return (
-                                <div
+                              <div
+                                style={{
+                                  width: "100%",
+                                  overflowX: "auto",
+                                  border: `1px solid ${COLORS.border}`,
+                                  borderRadius: 12,
+                                  background: "rgba(255,255,255,0.65)",
+                                }}
+                              >
+                                <table
                                   style={{
-                                    display: "flex",
-                                    justifyContent: "flex-end",
-                                    gap: 10,
-                                    marginTop: 4,
+                                    width: "100%",
+                                    borderCollapse: "collapse",
                                   }}
                                 >
-                                  <button
-                                    type="button"
-                                    onClick={() => cancelOrderCard(o)}
-                                    disabled={cancelAnyUi || isDeletingThis}
-                                    title="Cancel all orders in this card (owner override)"
-                                    style={{
-                                      padding: "10px 14px",
-                                      borderRadius: 12,
-                                      border: `1px solid ${COLORS.dangerBorder}`,
-                                      background: COLORS.dangerBg,
-                                      color: COLORS.dangerText,
-                                      fontWeight: 950,
-                                      cursor:
-                                        cancelAnyUi || isDeletingThis
-                                          ? "not-allowed"
-                                          : "pointer",
-                                      opacity:
-                                        cancelAnyUi || isDeletingThis ? 0.7 : 1,
-                                    }}
-                                  >
-                                    {cancelAnyUi || isDeletingThis
-                                      ? "Deleting…"
-                                      : "Delete"}
-                                  </button>
-                                </div>
-                              );
-                            })()}
-                          </div>
-                        ) : null}
-                      </div>
+                                  <thead>
+                                    <tr>
+                                      <th
+                                        style={{
+                                          textAlign: "left",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Supplier
+                                      </th>
+                                      <th
+                                        style={{
+                                          textAlign: "left",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Execution
+                                      </th>
+                                      <th
+                                        style={{
+                                          textAlign: "right",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Cost
+                                      </th>
+                                    </tr>
+                                  </thead>
 
-                      {o.executed ? (
-                        <div
-                          style={{
-                            color: COLORS.subtext,
-                            fontWeight: 850,
-                            fontSize: 12,
-                          }}
-                        >
-                          Executed
+                                  <tbody>
+                                    {items.map((it, idx) => {
+                                      const sup = supplierLabel(
+                                        String(it.supplier || "")
+                                      );
+                                      const execAt = Number(
+                                        it.executeAfter ??
+                                          intent.executeAfter ??
+                                          0
+                                      );
+                                      const cost = fmtCostUsdFromRawAmount(
+                                        String(it.amount ?? "0")
+                                      );
+
+                                      return (
+                                        <tr key={idx}>
+                                          <td
+                                            style={{
+                                              padding: 12,
+                                              borderTop: "1px solid #eef2f7",
+                                              fontWeight: 850,
+                                              color: COLORS.text,
+                                            }}
+                                          >
+                                            <div style={{ fontWeight: 950 }}>
+                                              {sup.name}
+                                            </div>
+                                            <div
+                                              style={{
+                                                fontFamily:
+                                                  "ui-monospace, Menlo, monospace",
+                                                color: COLORS.subtext,
+                                                fontWeight: 800,
+                                                fontSize: 12,
+                                              }}
+                                            >
+                                              {shortenId(sup.address)}
+                                            </div>
+                                          </td>
+
+                                          <td
+                                            style={{
+                                              padding: 12,
+                                              borderTop: "1px solid #eef2f7",
+                                              fontWeight: 850,
+                                              color: COLORS.subtext,
+                                            }}
+                                          >
+                                            {fmtExecutionCountdown(execAt)}
+                                          </td>
+
+                                          <td
+                                            style={{
+                                              padding: 12,
+                                              borderTop: "1px solid #eef2f7",
+                                              textAlign: "right",
+                                              fontWeight: 950,
+                                            }}
+                                          >
+                                            ${cost}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+
+                                  <tfoot>
+                                    <tr>
+                                      <td
+                                        style={{
+                                          padding: 12,
+                                          borderTop: `2px solid ${COLORS.border}`,
+                                          fontWeight: 950,
+                                          color: COLORS.text,
+                                        }}
+                                        colSpan={2}
+                                      >
+                                        Total
+                                      </td>
+                                      <td
+                                        style={{
+                                          padding: 12,
+                                          borderTop: `2px solid ${COLORS.border}`,
+                                          textAlign: "right",
+                                          fontWeight: 950,
+                                          color: COLORS.text,
+                                        }}
+                                      >
+                                        {costStr}
+                                      </td>
+                                    </tr>
+                                  </tfoot>
+                                </table>
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
-                      ) : o.canceled ? (
-                        <div
-                          style={{
-                            color: COLORS.subtext,
-                            fontWeight: 850,
-                            fontSize: 12,
-                          }}
-                        >
-                          Canceled
-                        </div>
-                      ) : null}
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+            )}
+          </section>
+        </div>
+        {/* Floating Chat Button + Right Drawer */}
+        <>
+          {/* Floating button */}
+          <button
+            type="button"
+            onClick={() => setChatOpen(true)}
+            style={{
+              position: "fixed",
+              right: 18,
+              bottom: 18,
+              zIndex: 1000,
+              padding: "12px 14px",
+              borderRadius: 999,
+              border: `1px solid ${COLORS.border}`,
+              background: COLORS.primary,
+              color: COLORS.buttonTextLight,
+              fontWeight: 950,
+              cursor: "pointer",
+              boxShadow: "0 10px 24px rgba(0,0,0,0.18)",
+            }}
+            aria-label="Open Mozi Chat"
+            title="Mozi Chat"
+          >
+            Mozi Chat
+          </button>
+
+          {/* Drawer */}
+          <div
+            role="dialog"
+            aria-label="Mozi Chat Drawer"
+            style={{
+              position: "fixed",
+              top: 0,
+              right: 0,
+              height: "100vh",
+              width: "50vw",
+              maxWidth: 720,
+              minWidth: 360,
+              backgroundColor: "#020617", // fallback
+              backgroundImage: [
+                "radial-gradient(900px 500px at 20% 10%, rgba(37,99,235,0.25) 0%, rgba(37,99,235,0) 60%)",
+                "radial-gradient(800px 500px at 80% 30%, rgba(99,102,241,0.22) 0%, rgba(99,102,241,0) 55%)",
+                "linear-gradient(180deg, #0f172a 0%, #020617 55%, #020617 100%)",
+              ].join(","),
+              color: COLORS.text, // <-- IMPORTANT: stops white text leaking into light panels
+
+              borderLeft: `1px solid ${COLORS.border}`,
+              boxShadow: "-14px 0 40px rgba(0,0,0,0.14)",
+              zIndex: 1000,
+              transform: chatOpen ? "translateX(0)" : "translateX(110%)",
+              transition: "transform 180ms ease",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            {/* Header */}
+            <div
+              style={{
+                padding: 14,
+                borderBottom: `1px solid ${COLORS.border}`,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 10,
+                background: "#ffffff",
+                backdropFilter: "none",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontWeight: 950, fontSize: 16 }}>Mozi Chat</div>
+
+                <HelpDot title="Mozi Chat help" align="left">
+                  <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                    Mozi Chat
+                  </div>
+                  <div style={{ display: "grid", gap: 8, fontSize: 13 }}>
+                    <div style={{ fontWeight: 800 }}>
+                      Ask about inventory, suppliers, seasonality, upcoming
+                      events, or ordering strategy.
                     </div>
-                  );
-                });
-              })()}
+                    <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
+                      Saved Notes (Additional Context) are edited in the
+                      Purchase Plan section.
+                    </div>
+                  </div>
+                </HelpDot>
+              </div>
+
+              {/* Red X in top-right */}
+              <button
+                type="button"
+                onClick={() => setChatOpen(false)}
+                style={chatCloseBtn}
+                aria-label="Close chat"
+                title="Close"
+              >
+                ✕
+              </button>
             </div>
-          )}
-        </section>
+
+            {/* Body */}
+            <div
+              style={{
+                padding: 14,
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+                flex: 1,
+                minHeight: 0,
+              }}
+            >
+              {/* Conversation */}
+              <div
+                style={{
+                  flex: 1,
+                  minHeight: 0,
+                  overflow: "auto",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 10,
+                  padding: 12,
+                  borderRadius: 14,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "#ffffff",
+                  backdropFilter: "none",
+                }}
+              >
+                {chatMessages.length === 0 ? (
+                  <div
+                    style={{
+                      color: COLORS.subtext,
+                      fontWeight: 850,
+                      lineHeight: 1.4,
+                      background: "rgba(255,255,255,0.85)",
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: 14,
+                      padding: 12,
+                    }}
+                  >
+                    Ask about inventory, suppliers, seasonality, upcoming
+                    events, or ordering strategy.
+                  </div>
+                ) : (
+                  chatMessages.map((m, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        display: "flex",
+                        justifyContent:
+                          m.role === "user" ? "flex-end" : "flex-start",
+                      }}
+                    >
+                      <div style={bubbleStyle(m.role)}>
+                        <div
+                          style={{
+                            color: COLORS.subtext,
+                            fontWeight: 950,
+                            fontSize: 11,
+                            marginBottom: 6,
+                          }}
+                        >
+                          {m.role === "user" ? "You" : "Mozi"}
+                        </div>
+                        {m.content}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Input */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "center",
+                  padding: 12,
+                  borderRadius: 14,
+                  border: `1px solid ${COLORS.border}`,
+                  background: "#ffffff",
+                  backdropFilter: "none",
+                }}
+              >
+                <input
+                  value={chatDraft}
+                  onChange={(e) => setChatDraft(e.target.value)}
+                  placeholder='e.g. "We have a catering event Friday—what should I watch out for?"'
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") sendChat();
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: "10px 12px",
+                    borderRadius: 12,
+                    border: `1px solid ${COLORS.border}`,
+                    background: "rgba(255,255,255,0.92)",
+                    color: COLORS.text,
+                    fontWeight: 800,
+                    outline: "none",
+                  }}
+                />
+
+                <button
+                  type="button"
+                  onClick={sendChat}
+                  disabled={chatLoading || !chatDraft.trim()}
+                  style={{
+                    ...btnPrimary(chatLoading || !chatDraft.trim()),
+                    borderRadius: 12,
+                    boxShadow: "0 10px 22px rgba(37,99,235,0.22)",
+                  }}
+                >
+                  {chatLoading ? "Sending…" : "Send"}
+                </button>
+              </div>
+
+              {chatError ? (
+                <div
+                  style={{
+                    border: `1px solid ${COLORS.warnBorder}`,
+                    background: COLORS.warnBg,
+                    color: COLORS.warnText,
+                    borderRadius: 12,
+                    padding: 12,
+                    fontWeight: 850,
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {chatError}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </>
       </main>
     </div>
   );
