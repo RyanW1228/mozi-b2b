@@ -1023,9 +1023,9 @@ export default function Home() {
               style={{
                 padding: "10px 16px",
                 borderRadius: 12,
-                background: "#eff6ff",
-                border: "1px solid #bfdbfe",
-                color: "#1d4ed8",
+                background: "#ffffff",
+                border: `1px solid ${COLORS.border}`,
+                color: COLORS.text, // ✅ black text
                 textDecoration: "none",
                 fontWeight: 900,
               }}

@@ -137,18 +137,54 @@ function saveChatMemory(
 
 function HelpDot({
   title = "What do these mean?",
-  align = "right",
+  align = "auto",
   children,
 }: {
   title?: string;
-  align?: "left" | "right";
+  align?: "left" | "right" | "auto";
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+
+  // computed alignment when open
+  const [computedAlign, setComputedAlign] = useState<"left" | "right">("left");
+
+  useEffect(() => {
+    if (!open) return;
+
+    const POP_W = 360; // your popover width
+    const MARGIN = 16;
+
+    const compute = () => {
+      const rect = btnRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const vw = window.innerWidth;
+
+      // If we anchor popover with left:0 (expands right), will it overflow viewport?
+      const wouldOverflowRight = rect.left + POP_W + MARGIN > vw;
+
+      // If it would overflow right, expand left instead (right:0).
+      setComputedAlign(wouldOverflowRight ? "right" : "left");
+    };
+
+    compute();
+    window.addEventListener("resize", compute);
+    window.addEventListener("scroll", compute, true);
+
+    return () => {
+      window.removeEventListener("resize", compute);
+      window.removeEventListener("scroll", compute, true);
+    };
+  }, [open]);
+
+  const finalAlign: "left" | "right" = align === "auto" ? computedAlign : align;
 
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
       <button
+        ref={btnRef}
         type="button"
         aria-label={title}
         title={title}
@@ -181,7 +217,7 @@ function HelpDot({
           style={{
             position: "absolute",
             top: 28,
-            ...(align === "left" ? { left: 0 } : { right: 0 }),
+            ...(finalAlign === "left" ? { left: 0 } : { right: 0 }),
             width: 360,
             maxWidth: "min(360px, calc(100vw - 32px))",
             padding: 12,
@@ -191,7 +227,7 @@ function HelpDot({
             boxShadow: "0 12px 28px rgba(0,0,0,0.12)",
             color: COLORS.text,
             fontWeight: 750,
-            zIndex: 2000,
+            zIndex: 5000, // higher than the chat drawer
             overflowWrap: "anywhere",
           }}
         >
@@ -277,6 +313,16 @@ export default function LocationPage() {
   const [plan, setPlan] = useState<PlanOutput | null>(null);
   const [error, setError] = useState<string>("");
 
+  // --- Demo time travel (UI-only) ---
+  const [demoNowOffsetMs, setDemoNowOffsetMs] = useState(0);
+
+  function demoNowMs() {
+    return Date.now() + demoNowOffsetMs;
+  }
+  function demoNowUnix() {
+    return Math.floor(demoNowMs() / 1000);
+  }
+
   const [strategy, setStrategy] =
     useState<PlanInput["ownerPrefs"]["strategy"]>("balanced");
   const [horizonDays, setHorizonDays] = useState<number>(7);
@@ -309,6 +355,14 @@ export default function LocationPage() {
       executeAfter: number;
       canceled: boolean;
       executed: boolean;
+
+      // ✅ off-chain metadata merged in by /api/orders/list
+      lines?: Array<{
+        sku: string;
+        name?: string;
+        qty: number;
+        uom?: string; // "units", "lbs", "cases", etc.
+      }>;
     }>;
   };
 
@@ -641,7 +695,7 @@ export default function LocationPage() {
   function fmtExecutionCountdown(executeAfterUnix: number) {
     if (!executeAfterUnix) return "Execution time unknown";
 
-    const ms = executeAfterUnix * 1000 - Date.now();
+    const ms = executeAfterUnix * 1000 - demoNowMs();
     if (ms <= 0) return "Ready to execute";
 
     const totalSec = Math.floor(ms / 1000);
@@ -657,6 +711,7 @@ export default function LocationPage() {
   function fmtWhen(ts: number) {
     if (!ts) return "—";
     try {
+      // ts is unix seconds; independent of demo clock, but we still want displayed times
       return new Date(ts * 1000).toLocaleString();
     } catch {
       return String(ts);
@@ -747,13 +802,13 @@ export default function LocationPage() {
           String(locationRestaurantId || "").toLowerCase()
       );
 
-      // ✅ Remove canceled lines so canceled orders never render
+      // ✅ Remove canceled intents entirely (don't show deleted cards)
+      // ✅ Remove canceled items inside active intents
       const cleaned = scoped
+        .filter((intent) => !intent.canceled) // <-- key change: drop deleted cards
         .map((intent) => {
           const items = Array.isArray(intent.items) ? intent.items : [];
-          const filteredItems = items.filter(
-            (it) => !intent.canceled && !it.canceled
-          );
+          const filteredItems = items.filter((it) => !it.canceled);
           return { ...intent, items: filteredItems };
         })
         .filter((intent) => (intent.items ?? []).length > 0);
@@ -1500,6 +1555,82 @@ export default function LocationPage() {
               </Link>
             </div>
           </header>
+          {/* Demo controls */}
+          <section style={{ ...cardStyle, gap: 10, padding: 14 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                flexWrap: "nowrap",
+                minWidth: 0,
+              }}
+            >
+              {/* Left: title + ? */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  minWidth: 0,
+                  flex: "1 1 auto",
+                }}
+              >
+                <div
+                  style={{
+                    fontWeight: 950,
+                    fontSize: 16,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Simulate Time
+                </div>
+
+                <HelpDot title="Explain Simulate Time" align="left">
+                  <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                    Simulate Time
+                  </div>
+                  <div style={{ display: "grid", gap: 8, fontSize: 13 }}>
+                    <div style={{ fontWeight: 800 }}>
+                      UI-only: fast-forwards countdowns and arrival labels
+                      without changing on-chain state.
+                    </div>
+                  </div>
+                </HelpDot>
+              </div>
+
+              {/* Right: date pill + button */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  flex: "0 0 auto",
+                }}
+              >
+                <div style={valuePill()}>
+                  {new Date(demoNowMs()).toLocaleDateString(undefined, {
+                    weekday: "long",
+                    month: "long",
+                    day: "numeric",
+                    year: "numeric",
+                  })}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDemoNowOffsetMs((x) => x + 24 * 60 * 60 * 1000)
+                  }
+                  style={btnSoft(false)}
+                  title="Fast-forward the UI by 1 day"
+                >
+                  +1 day
+                </button>
+              </div>
+            </div>
+          </section>
 
           {/* Generate Purchase Plan */}
           <section style={{ ...cardStyle, gap: 10, padding: 14 }}>
@@ -1517,7 +1648,37 @@ export default function LocationPage() {
                 <div style={{ fontWeight: 950, fontSize: 16 }}>
                   Purchase Plan
                 </div>
-                <HelpDot title="Explain plan settings">...</HelpDot>
+                <HelpDot title="Explain Purchase Plan">
+                  <div style={{ fontWeight: 950, marginBottom: 8 }}>
+                    Purchase Plan
+                  </div>
+                  <div style={{ display: "grid", gap: 8, fontSize: 13 }}>
+                    <div style={{ fontWeight: 800 }}>
+                      Set how Mozi generates orders from your inventory and
+                      supplier data.
+                    </div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                      <span style={{ fontWeight: 950, color: COLORS.text }}>
+                        Strategy
+                      </span>{" "}
+                      controls whether Mozi prioritizes minimizing waste,
+                      balancing, or avoiding stockouts.
+                    </div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                      <span style={{ fontWeight: 950, color: COLORS.text }}>
+                        Planning Horizon
+                      </span>{" "}
+                      is how many days ahead Mozi plans demand (5–30 days).
+                    </div>
+                    <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
+                      <span style={{ fontWeight: 950, color: COLORS.text }}>
+                        Additional Context
+                      </span>{" "}
+                      are temporary notes (like events or promotions) that
+                      influence ordering.
+                    </div>
+                  </div>
+                </HelpDot>
               </div>
 
               {/* Right */}
@@ -1594,18 +1755,33 @@ export default function LocationPage() {
               }}
             >
               <div style={{ display: "grid", gap: 10, gridColumn: "1 / -1" }}>
-                {/* Strategy + Planning Horizon */}
-                <div style={{ display: "grid", gap: 10, gridColumn: "1 / -1" }}>
-                  {/* Strategy */}
+                {/* Strategy (row 1) + Planning Horizon (row 2) */}
+                <div
+                  style={{
+                    display: "grid",
+                    gap: 10,
+                    gridColumn: "1 / -1",
+                    minWidth: 0,
+                  }}
+                >
+                  {/* Left group: Strategy */}
                   <div
                     style={{
                       display: "flex",
                       alignItems: "center",
-                      gap: 12,
+                      gap: 10,
                       flexWrap: "wrap",
+                      minWidth: 0,
+                      flex: "1 1 260px", // allows wrap instead of overflow
                     }}
                   >
-                    <div style={{ fontWeight: 900, color: COLORS.subtext }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        color: COLORS.subtext,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
                       Strategy
                     </div>
 
@@ -1628,6 +1804,7 @@ export default function LocationPage() {
                           color: COLORS.text,
                           fontWeight: 850,
                           outline: "none",
+                          minWidth: 220,
                         }}
                       >
                         <option value="balanced">
@@ -1643,16 +1820,25 @@ export default function LocationPage() {
                     )}
                   </div>
 
-                  {/* Planning Horizon */}
+                  {/* Right group: Planning Horizon */}
                   <div
                     style={{
                       display: "flex",
                       alignItems: "center",
-                      gap: 12,
+                      gap: 10,
                       flexWrap: "wrap",
+                      minWidth: 0,
+                      flex: "0 0 auto", // ✅ don’t expand / push away
+                      justifyContent: "flex-start", // ✅ don’t right-align internally
                     }}
                   >
-                    <div style={{ fontWeight: 900, color: COLORS.subtext }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        color: COLORS.subtext,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
                       Planning Horizon
                     </div>
 
@@ -1996,7 +2182,10 @@ export default function LocationPage() {
                       Number(b.executeAfter ?? 0) - Number(a.executeAfter ?? 0)
                   );
 
-                  return sortedIntents.map((intent) => {
+                  // Only show the last 10 (newest) payment intents
+                  const visibleIntents = sortedIntents.slice(0, 10);
+
+                  return visibleIntents.map((intent) => {
                     const key = String(intent.ref || "");
                     const isOpen = Boolean(openOrderKeys[key]);
                     const toggleOpen = () =>
@@ -2008,6 +2197,38 @@ export default function LocationPage() {
                     const items = Array.isArray(intent.items)
                       ? intent.items
                       : [];
+
+                    // ✅ Flatten to one row per SKU (instead of one row per supplier-order item)
+                    const skuRows = items.flatMap((it) => {
+                      const sup = supplierLabel(String(it.supplier || ""));
+                      const execAt = Number(
+                        it.executeAfter ?? intent.executeAfter ?? 0
+                      );
+                      const lines = Array.isArray(it.lines) ? it.lines : [];
+
+                      return lines.map((ln) => ({
+                        supplierName: sup.name,
+                        supplierAddr: sup.address,
+                        executeAfter: execAt,
+                        orderId: String(it.orderId || ""),
+                        sku: String(ln.sku || ""),
+                        name: ln.name ? String(ln.name) : "",
+                        qty: Number(ln.qty ?? 0),
+                        uom: ln.uom ? String(ln.uom) : "",
+                      }));
+                    });
+
+                    const arrivalLabelForSupplier = (
+                      supplierAddr: string,
+                      executeAfterUnix: number
+                    ) => {
+                      const sup = supplierLabel(String(supplierAddr || ""));
+                      const leadDays = Number(sup.leadTimeDays ?? 0);
+                      const etaUnix =
+                        Number(executeAfterUnix || 0) +
+                        Math.max(0, leadDays) * 24 * 60 * 60;
+                      return etaUnix ? fmtWhen(etaUnix) : "—";
+                    };
 
                     // Totals + supplier summary
                     const totalRaw = items.reduce((acc, it) => {
@@ -2067,7 +2288,7 @@ export default function LocationPage() {
                           text: COLORS.warnText,
                         });
 
-                    const nowUnix = Math.floor(Date.now() / 1000);
+                    const nowUnix = demoNowUnix();
                     const pendingEnded =
                       Number(intent.executeAfter ?? 0) > 0 &&
                       nowUnix >= Number(intent.executeAfter);
@@ -2304,17 +2525,9 @@ export default function LocationPage() {
                                           fontWeight: 950,
                                         }}
                                       >
-                                        Supplier
+                                        SKU
                                       </th>
-                                      <th
-                                        style={{
-                                          textAlign: "left",
-                                          padding: 12,
-                                          fontWeight: 950,
-                                        }}
-                                      >
-                                        Execution
-                                      </th>
+
                                       <th
                                         style={{
                                           textAlign: "right",
@@ -2322,75 +2535,130 @@ export default function LocationPage() {
                                           fontWeight: 950,
                                         }}
                                       >
-                                        Cost
+                                        Quantity
+                                      </th>
+
+                                      <th
+                                        style={{
+                                          textAlign: "right",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Price
+                                      </th>
+
+                                      <th
+                                        style={{
+                                          textAlign: "left",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Supplier
+                                      </th>
+
+                                      <th
+                                        style={{
+                                          textAlign: "left",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Arrival Time
                                       </th>
                                     </tr>
                                   </thead>
 
                                   <tbody>
-                                    {items.map((it, idx) => {
-                                      const sup = supplierLabel(
-                                        String(it.supplier || "")
-                                      );
-                                      const execAt = Number(
-                                        it.executeAfter ??
-                                          intent.executeAfter ??
-                                          0
-                                      );
-                                      const cost = fmtCostUsdFromRawAmount(
-                                        String(it.amount ?? "0")
-                                      );
+                                    {skuRows.map((r, idx) => (
+                                      <tr key={`${r.orderId}:${r.sku}:${idx}`}>
+                                        {/* SKU */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            fontFamily:
+                                              "ui-monospace, Menlo, monospace",
+                                            fontWeight: 900,
+                                            color: COLORS.text,
+                                            whiteSpace: "nowrap",
+                                          }}
+                                        >
+                                          {r.sku || "—"}
+                                        </td>
 
-                                      return (
-                                        <tr key={idx}>
-                                          <td
-                                            style={{
-                                              padding: 12,
-                                              borderTop: "1px solid #eef2f7",
-                                              fontWeight: 850,
-                                              color: COLORS.text,
-                                            }}
-                                          >
-                                            <div style={{ fontWeight: 950 }}>
-                                              {sup.name}
-                                            </div>
-                                            <div
-                                              style={{
-                                                fontFamily:
-                                                  "ui-monospace, Menlo, monospace",
-                                                color: COLORS.subtext,
-                                                fontWeight: 800,
-                                                fontSize: 12,
-                                              }}
-                                            >
-                                              {shortenId(sup.address)}
-                                            </div>
-                                          </td>
+                                        {/* Quantity */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            textAlign: "right",
+                                            fontWeight: 950,
+                                            color: COLORS.text,
+                                            whiteSpace: "nowrap",
+                                          }}
+                                        >
+                                          {Number.isFinite(r.qty) ? r.qty : "—"}
+                                          {r.uom ? ` ${r.uom}` : ""}
+                                        </td>
 
-                                          <td
+                                        {/* Price (placeholder until you have SKU price wired) */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            textAlign: "right",
+                                            fontWeight: 950,
+                                            color: COLORS.text,
+                                            whiteSpace: "nowrap",
+                                          }}
+                                        >
+                                          —
+                                        </td>
+
+                                        {/* Supplier */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            fontWeight: 850,
+                                            color: COLORS.text,
+                                          }}
+                                        >
+                                          <div style={{ fontWeight: 950 }}>
+                                            {r.supplierName}
+                                          </div>
+                                          <div
                                             style={{
-                                              padding: 12,
-                                              borderTop: "1px solid #eef2f7",
-                                              fontWeight: 850,
+                                              fontFamily:
+                                                "ui-monospace, Menlo, monospace",
                                               color: COLORS.subtext,
+                                              fontWeight: 800,
+                                              fontSize: 12,
                                             }}
                                           >
-                                            {fmtExecutionCountdown(execAt)}
-                                          </td>
+                                            {shortenId(r.supplierAddr)}
+                                          </div>
+                                        </td>
 
-                                          <td
-                                            style={{
-                                              padding: 12,
-                                              borderTop: "1px solid #eef2f7",
-                                              textAlign: "right",
-                                              fontWeight: 950,
-                                            }}
-                                          >
-                                            ${cost}
-                                          </td>
-                                        </tr>
-                                      );
-                                    })}
+                                        {/* Arrival Time */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            fontWeight: 850,
+                                            color: COLORS.subtext,
+                                            whiteSpace: "nowrap",
+                                          }}
+                                        >
+                                          {arrivalLabelForSupplier(
+                                            r.supplierAddr,
+                                            r.executeAfter
+                                          )}
+                                        </td>
+                                      </tr>
+                                    ))}
                                   </tbody>
 
                                   <tfoot>

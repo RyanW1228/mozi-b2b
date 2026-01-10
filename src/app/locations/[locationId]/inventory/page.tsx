@@ -610,7 +610,7 @@ export default function InventoryPage() {
         >
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
-              ← Purchase Plan
+              Dashboard
             </Link>
           </div>
 

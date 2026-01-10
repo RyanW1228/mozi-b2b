@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { getAddress, isAddress, ZeroAddress } from "ethers";
 
 type SupplierRow = {
   supplierId: string; // stable internal id
@@ -55,6 +56,68 @@ function draftToNonNegInt(draft: string) {
 
 function sanitizeText(input: string) {
   return input.trim();
+}
+
+function isReasonableSupplierName(nameRaw: string) {
+  const name = sanitizeText(nameRaw);
+
+  // Conditions of "reasonable":
+  // - 2..40 chars
+  // - must include at least one letter
+  // - only letters/numbers/spaces and these safe symbols: & . ' - ( )
+  // - no leading/trailing punctuation, no double spaces
+  // - not all caps longer than 6 chars (looks spammy)
+  if (name.length < 2 || name.length > 40) {
+    return { ok: false, reason: "Name must be 2–40 characters." };
+  }
+
+  if (!/[A-Za-z]/.test(name)) {
+    return { ok: false, reason: "Name must include at least one letter." };
+  }
+
+  if (!/^[A-Za-z0-9&.\-'"() ]+$/.test(name)) {
+    return {
+      ok: false,
+      reason: "Use only letters, numbers, spaces, and & . ' - ( )",
+    };
+  }
+
+  if (/^\s|[&.\-'"() ]$/.test(name)) {
+    return { ok: false, reason: "No leading/trailing punctuation or spaces." };
+  }
+
+  if (/\s{2,}/.test(name)) {
+    return { ok: false, reason: "No double spaces." };
+  }
+
+  if (name.length > 6 && name === name.toUpperCase()) {
+    return { ok: false, reason: "Avoid ALL CAPS names." };
+  }
+
+  return { ok: true, name };
+}
+
+function isValidEvmAddress(addrRaw: string) {
+  const addr = sanitizeText(addrRaw);
+
+  if (!addr) {
+    return { ok: false, reason: "Wallet address is required." };
+  }
+
+  if (!isAddress(addr)) {
+    return {
+      ok: false,
+      reason: "Wallet address must be a valid Ethereum address (0x...).",
+    };
+  }
+
+  const checksum = getAddress(addr);
+
+  if (checksum === ZeroAddress) {
+    return { ok: false, reason: "Wallet address cannot be the zero address." };
+  }
+
+  return { ok: true, addr: checksum };
 }
 
 export default function SuppliersPage() {
@@ -196,45 +259,49 @@ export default function SuppliersPage() {
 
   // NOTE: UI-only refresh. Wire to backend later.
   async function refresh() {
+    if (!locationId) return;
+
     setLoading(true);
     setMsg("");
     setMsgKind("");
 
     try {
-      // If you want a seeded demo so it looks alive:
-      // Comment these 3 lines if you don't want seed data.
-      if (rows.length === 0) {
-        const seeded: SupplierRow[] = [
-          {
-            supplierId: "meatco",
-            name: "MeatCo",
-            leadTimeDays: 2,
-            payoutAddress: "0xEd97C42cAA7eACd3F10aeC5B800f7a3e970437F8",
-          },
-          {
-            supplierId: "produceco",
-            name: "ProduceCo",
-            leadTimeDays: 1,
-            payoutAddress: "0x13706179d0408038ae3Bfc6a2FF19AD9Ac718935",
-          },
-        ];
-        setRows(seeded);
+      const res = await fetch(
+        `/api/suppliers?locationId=${encodeURIComponent(locationId)}`,
+        { cache: "no-store" }
+      );
+      const json = await res.json().catch(() => null);
 
-        setDraftName(
-          Object.fromEntries(seeded.map((s) => [s.supplierId, s.name]))
-        );
-        setDraftAddress(
-          Object.fromEntries(seeded.map((s) => [s.supplierId, s.payoutAddress]))
-        );
-        setDraftLead(
-          Object.fromEntries(
-            seeded.map((s) => [s.supplierId, String(s.leadTimeDays)])
-          )
-        );
-        setEditingId(
-          Object.fromEntries(seeded.map((s) => [s.supplierId, false]))
-        );
+      if (!res.ok || !json?.ok) {
+        setRows([]);
+        setMessage("error", JSON.stringify(json, null, 2));
+        return;
       }
+
+      const next = (json.suppliers ?? []) as SupplierRow[];
+      setRows(next);
+
+      // Initialize drafts from server data
+      setDraftName(Object.fromEntries(next.map((s) => [s.supplierId, s.name])));
+      setDraftAddress(
+        Object.fromEntries(next.map((s) => [s.supplierId, s.payoutAddress]))
+      );
+      setDraftLead(
+        Object.fromEntries(
+          next.map((s) => [s.supplierId, String(s.leadTimeDays)])
+        )
+      );
+
+      // Default: view-only
+      setEditingId((prev) => {
+        const n = { ...prev };
+        for (const s of next) {
+          if (n[s.supplierId] === undefined) n[s.supplierId] = false;
+        }
+        return n;
+      });
+
+      if (!next.length) setMessage("warn", "No suppliers returned yet.");
     } catch (e: any) {
       setMessage("error", String(e));
     } finally {
@@ -279,9 +346,17 @@ export default function SuppliersPage() {
     setMessage("success", `Added ${supplierId}. Click Save to persist.`);
   }
 
-  function deleteLocalSupplier(supplierId: string) {
-    setRows((prev) => prev.filter((r) => r.supplierId !== supplierId));
+  async function deleteLocalSupplier(supplierId: string) {
+    if (!locationId) return;
 
+    const prevRows = rows;
+    const prevDraftName = draftName;
+    const prevDraftAddress = draftAddress;
+    const prevDraftLead = draftLead;
+    const prevEditing = editingId;
+
+    // optimistic UI
+    setRows((prev) => prev.filter((r) => r.supplierId !== supplierId));
     setDraftName((prev) => {
       const next = { ...prev };
       delete next[supplierId];
@@ -303,30 +378,81 @@ export default function SuppliersPage() {
       return next;
     });
 
-    setMessage("success", `Deleted ${supplierId}.`);
+    try {
+      const res = await fetch(
+        `/api/suppliers?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ supplierId }),
+        }
+      );
+
+      const json = await res.json().catch(() => null);
+      if (!res.ok || !json?.ok) {
+        // rollback
+        setRows(prevRows);
+        setDraftName(prevDraftName);
+        setDraftAddress(prevDraftAddress);
+        setDraftLead(prevDraftLead);
+        setEditingId(prevEditing);
+
+        throw new Error(
+          `SUPPLIERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+      }
+
+      setMessage("success", `Deleted ${supplierId}.`);
+    } catch (e: any) {
+      setMessage("error", String(e?.message ?? e));
+    }
   }
 
   async function saveAll() {
+    if (!locationId) return;
+
     setMsg("");
     setMsgKind("");
+    setLoading(true);
+
     try {
-      // UI-only save right now.
-      // Later: call POST /api/suppliers with payload from drafts.
-      // Still validate here so your data stays clean.
       for (const r of rows) {
-        const id = r.supplierId;
-        const name = sanitizeText(draftName[id] ?? "");
-        const payoutAddress = sanitizeText(draftAddress[id] ?? "");
-        const leadTimeDays = draftToNonNegInt(draftLead[id] ?? "0");
+        const supplierId = r.supplierId;
 
-        if (!name) throw new Error(`Supplier name is required for ${id}.`);
+        const name = sanitizeText(draftName[supplierId] ?? "");
+        const payoutAddress = sanitizeText(draftAddress[supplierId] ?? "");
+        const leadTimeDays = draftToNonNegInt(draftLead[supplierId] ?? "0");
+
+        if (!name)
+          throw new Error(`Supplier name is required for ${supplierId}.`);
         if (!payoutAddress)
-          throw new Error(`Wallet address is required for ${id}.`);
+          throw new Error(`Wallet address is required for ${supplierId}.`);
 
-        // Update canonical rows from drafts (so UI reflects saved values)
+        const res = await fetch(
+          `/api/suppliers?locationId=${encodeURIComponent(locationId)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              supplierId,
+              name,
+              payoutAddress,
+              leadTimeDays,
+            }),
+          }
+        );
+
+        const json = await res.json().catch(() => null);
+        if (!res.ok || !json?.ok) {
+          throw new Error(
+            `SUPPLIERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+          );
+        }
+
+        // keep canonical rows synced with drafts
         setRows((prev) =>
           prev.map((x) =>
-            x.supplierId === id
+            x.supplierId === supplierId
               ? { ...x, name, payoutAddress, leadTimeDays }
               : x
           )
@@ -343,6 +469,8 @@ export default function SuppliersPage() {
       setMessage("success", "Saved.");
     } catch (e: any) {
       setMessage("error", String(e?.message ?? e));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -399,24 +527,27 @@ export default function SuppliersPage() {
             marginBottom: 24,
           }}
         >
+          {/* LEFT: Dashboard */}
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Link
-              href={`/locations/${locationId}/inventory`}
-              style={btnSoft(false)}
-            >
-              ← Inventory
+            <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
+              Dashboard
             </Link>
           </div>
 
+          {/* CENTER: Title */}
           <div style={{ textAlign: "center" }}>
             <div style={{ fontSize: 30, fontWeight: 950, letterSpacing: -0.4 }}>
               Suppliers
             </div>
           </div>
 
+          {/* RIGHT: Inventory */}
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <Link href={`/locations/${locationId}`} style={btnSoft(false)}>
-              Purchase Plan →
+            <Link
+              href={`/locations/${locationId}/inventory`}
+              style={btnSoft(false)}
+            >
+              Inventory
             </Link>
           </div>
         </header>
@@ -460,48 +591,85 @@ export default function SuppliersPage() {
           {showAdd && (
             <div
               style={{
-                display: "flex",
-                gap: 10,
-                flexWrap: "wrap",
-                alignItems: "center",
                 border: `1px solid ${COLORS.border}`,
                 borderRadius: 12,
                 padding: 12,
                 background: "rgba(255,255,255,0.75)",
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 12,
+                alignItems: "flex-end",
               }}
             >
-              <input
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="Supplier Name (e.g., MeatCo)"
-                style={{ ...inputStyle, width: 220 }}
-              />
+              {/* Supplier Name */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 950,
+                    color: COLORS.subtext,
+                  }}
+                >
+                  Supplier Name
+                </div>
+                <input
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="e.g., MeatCo"
+                  style={{ ...inputStyle, width: 220 }}
+                />
+              </div>
 
-              <input
-                value={newWallet}
-                onChange={(e) => setNewWallet(e.target.value)}
-                placeholder="Wallet address (0x...)"
-                style={{
-                  ...inputStyle,
-                  width: 360,
-                  fontFamily: "ui-monospace, Menlo, monospace",
-                }}
-              />
+              {/* Wallet Address */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 950,
+                    color: COLORS.subtext,
+                  }}
+                >
+                  Wallet Address
+                </div>
+                <input
+                  value={newWallet}
+                  onChange={(e) => setNewWallet(e.target.value)}
+                  placeholder="0x..."
+                  style={{
+                    ...inputStyle,
+                    width: 360,
+                    fontFamily: "ui-monospace, Menlo, monospace",
+                  }}
+                />
+              </div>
 
-              <input
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={newLeadDraft}
-                onChange={(e) =>
-                  setNewLeadDraft(sanitizeUnitsDraft(e.target.value))
-                }
-                onBlur={() =>
-                  setNewLeadDraft(String(draftToNonNegInt(newLeadDraft)))
-                }
-                placeholder="Lead time (days)"
-                style={{ ...inputStyle, width: 160, textAlign: "right" }}
-              />
+              {/* Delivery Time */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 950,
+                    color: COLORS.subtext,
+                  }}
+                >
+                  Delivery Time (days)
+                </div>
+                <input
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={newLeadDraft}
+                  onChange={(e) =>
+                    setNewLeadDraft(sanitizeUnitsDraft(e.target.value))
+                  }
+                  onBlur={() =>
+                    setNewLeadDraft(String(draftToNonNegInt(newLeadDraft)))
+                  }
+                  placeholder="0"
+                  style={{ ...inputStyle, width: 160, textAlign: "right" }}
+                />
+              </div>
 
+              {/* Buttons */}
               <button
                 type="button"
                 onClick={addLocalSupplier}
@@ -537,7 +705,7 @@ export default function SuppliersPage() {
                   <th
                     style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
                   >
-                    Lead time (days)
+                    Delivery time (days)
                   </th>
                   <th
                     style={{ textAlign: "right", padding: 10, fontWeight: 950 }}
@@ -577,17 +745,6 @@ export default function SuppliersPage() {
                         ) : (
                           <div style={{ fontWeight: 900 }}>
                             {nameVal || "—"}
-                            <div
-                              style={{
-                                fontSize: 12,
-                                fontWeight: 800,
-                                color: COLORS.subtext,
-                                fontFamily: "ui-monospace, Menlo, monospace",
-                                marginTop: 2,
-                              }}
-                            >
-                              {r.supplierId}
-                            </div>
                           </div>
                         )}
                       </td>
