@@ -15,32 +15,15 @@ contract MoziTreasuryHub {
     // Owner -> agent authorization
     mapping(address => mapping(address => bool)) public isAgentFor;
 
-    // Supplier claimable (executed) amounts
+    // Supplier claimable amounts
     mapping(address => uint256) public owed;
     uint256 public totalOwed;
-
-    // Owner -> total reserved in pending orders (not withdrawable)
-    mapping(address => uint256) public reservedOf;
 
     // Owner mode: if true, require explicit intent approval before execution
     mapping(address => bool) public requireApprovalForExecution;
 
     // Owner -> intent ref -> approved?
     mapping(address => mapping(bytes32 => bool)) public isIntentApproved;
-
-    struct PendingOrder {
-        address owner; // whose treasury this draws from
-        address supplier;
-        uint256 amount;
-        uint64 executeAfter; // unix seconds, chosen per-order (NOT hardcoded)
-        bool canceled;
-        bool executed;
-        bytes32 ref; // idempotency/audit id (optional)
-        bytes32 restaurantId; // optional metadata
-    }
-
-    uint256 public nextOrderId;
-    mapping(uint256 => PendingOrder) public pendingOrders;
 
     event Deposited(
         address indexed owner,
@@ -58,20 +41,13 @@ contract MoziTreasuryHub {
         bool approved
     );
 
-    event OrderProposed(
-        uint256 indexed orderId,
+    // New: immediate payment event
+    event OrderPaid(
         address indexed owner,
         address indexed supplier,
         uint256 amount,
-        uint64 executeAfter,
-        bytes32 ref,
+        bytes32 indexed ref,
         bytes32 restaurantId
-    );
-    event OrderCanceled(uint256 indexed orderId);
-    event OrderExecuted(
-        uint256 indexed orderId,
-        address indexed supplier,
-        uint256 amount
     );
 
     event Claimed(address indexed supplier, uint256 amount);
@@ -93,7 +69,7 @@ contract MoziTreasuryHub {
         emit Deposited(msg.sender, msg.sender, amount);
     }
 
-    // Owner withdraws unreserved funds
+    // Owner withdraws funds
     function withdraw(uint256 amount) external {
         require(amount > 0, "amount=0");
         require(
@@ -142,88 +118,33 @@ contract MoziTreasuryHub {
         _;
     }
 
-    // Reserve funds immediately (so owner can't withdraw them),
-    // but supplier can't claim until executed after executeAfter.
-    function proposeOrderFor(
+    // NEW: Agent immediately pays for an order (no pending/cancel period).
+    // Funds move from owner's hub balance into supplier claim pool (owed).
+    function payOrderFor(
         address owner,
         address supplier,
         uint256 amount,
-        uint64 executeAfter,
         bytes32 ref,
         bytes32 restaurantId
-    ) external onlyAgentFor(owner) returns (uint256 orderId) {
+    ) external onlyAgentFor(owner) {
         require(owner != address(0), "owner=0");
         require(supplier != address(0), "supplier=0");
         require(amount > 0, "amount=0");
-        require(executeAfter > block.timestamp, "executeAfter must be future");
-
-        // Owner must have enough free funds to reserve
-        require(amount <= availableToWithdraw(owner), "insufficient available");
-
-        // Reserve immediately
-        reservedOf[owner] += amount;
-
-        orderId = nextOrderId++;
-        pendingOrders[orderId] = PendingOrder({
-            owner: owner,
-            supplier: supplier,
-            amount: amount,
-            executeAfter: executeAfter,
-            canceled: false,
-            executed: false,
-            ref: ref,
-            restaurantId: restaurantId
-        });
-
-        emit OrderProposed(
-            orderId,
-            owner,
-            supplier,
-            amount,
-            executeAfter,
-            ref,
-            restaurantId
-        );
-    }
-
-    // Owner can cancel pending orders anytime before execution
-    function cancelOrder(uint256 orderId) external {
-        PendingOrder storage o = pendingOrders[orderId];
-        require(o.owner == msg.sender, "not order owner");
-        require(!o.canceled, "already canceled");
-        require(!o.executed, "already executed");
-
-        o.canceled = true;
-        reservedOf[o.owner] -= o.amount;
-
-        emit OrderCanceled(orderId);
-    }
-
-    // Agent executes after executeAfter: move from reserved -> supplier owed
-    function executeOrder(uint256 orderId) external {
-        PendingOrder storage o = pendingOrders[orderId];
-        require(o.owner != address(0), "bad order");
-        require(isAgentFor[o.owner][msg.sender], "not agent");
-        require(!o.canceled, "canceled");
-        require(!o.executed, "executed");
-        require(block.timestamp >= o.executeAfter, "too early");
+        require(balanceOf[owner] >= amount, "insufficient balance");
 
         // Manual mode: owner must approve the whole intent (ref) before execution
-        if (requireApprovalForExecution[o.owner]) {
-            require(isIntentApproved[o.owner][o.ref], "intent not approved");
+        if (requireApprovalForExecution[owner]) {
+            require(ref != bytes32(0), "ref=0");
+            require(isIntentApproved[owner][ref], "intent not approved");
         }
 
-        o.executed = true;
+        // funds now belong to supplier claim pool
+        balanceOf[owner] -= amount;
 
-        reservedOf[o.owner] -= o.amount;
+        owed[supplier] += amount;
+        totalOwed += amount;
 
-        // Decrease owner's internal balance (funds now belong to supplier claim pool)
-        balanceOf[o.owner] -= o.amount;
-
-        owed[o.supplier] += o.amount;
-        totalOwed += o.amount;
-
-        emit OrderExecuted(orderId, o.supplier, o.amount);
+        emit OrderPaid(owner, supplier, amount, ref, restaurantId);
     }
 
     // -------------------------
@@ -246,9 +167,6 @@ contract MoziTreasuryHub {
     // -------------------------
 
     function availableToWithdraw(address owner) public view returns (uint256) {
-        uint256 bal = balanceOf[owner];
-        uint256 res = reservedOf[owner];
-        if (bal <= res) return 0;
-        return bal - res;
+        return balanceOf[owner];
     }
 }

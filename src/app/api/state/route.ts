@@ -33,6 +33,7 @@ type PipelineItem = {
 
 type PipelineIntent = {
   ref: string;
+  env?: "testing" | "production";
   ownerAddress: string;
   locationId: string;
   executeAfterUnix?: number;
@@ -66,24 +67,6 @@ export async function GET(req: Request) {
   );
   const horizonEndUnix = nowUnix + horizonDays * 86400;
 
-  // -----------------------------
-  // Warm intentStore from chain (best-effort)
-  // This ensures pipelineBySku can return inbound even after server restart.
-  // -----------------------------
-  if (ownerAddress) {
-    try {
-      const origin = new URL(req.url).origin;
-      await fetch(
-        `${origin}/api/orders/list?env=${encodeURIComponent(env)}` +
-          `&owner=${encodeURIComponent(ownerAddress)}` +
-          `&locationId=${encodeURIComponent(locationId)}`,
-        { method: "GET" }
-      );
-    } catch {
-      // best-effort only
-    }
-  }
-
   // inventory map (source of truth for "arrived on hand")
   const inventoryMap = new Map<string, number>();
   for (const row of (base as any)?.inventory ?? []) {
@@ -92,13 +75,11 @@ export async function GET(req: Request) {
     inventoryMap.set(sku, num(row?.onHandUnits));
   }
 
-  // Pull pipeline from intentStore
-  // pipelineBySku expects an object (not a string)
-  const pipelineRaw: any = pipelineBySku({ ownerAddress, locationId, nowUnix });
+  // Pull pipeline from intentStore (written by /api/orders/propose via upsertIntent)
+  const pipelineRaw: any = ownerAddress
+    ? pipelineBySku({ env, ownerAddress, locationId, nowUnix })
+    : { bySku: {}, open: [] };
 
-  // Support both shapes:
-  // (A) { bySku: Record<string, number>, open: Intent[] }
-  // (B) Record<string, number> (older/simple)
   const open: PipelineIntent[] = Array.isArray(pipelineRaw?.open)
     ? pipelineRaw.open
     : [];

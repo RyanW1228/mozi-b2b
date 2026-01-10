@@ -9,11 +9,49 @@ import {
   Wallet,
   keccak256,
   toUtf8Bytes,
+  Interface,
+  parseUnits,
 } from "ethers";
-import { upsertIntent } from "@/lib/intentStore";
+
+import { upsertIntent, pipelineBySku } from "@/lib/intentStore";
+import { getState } from "@/lib/stateStore";
+import { generatePlan } from "@/lib/server/generatePlan";
+
+import { buildPaymentIntentFromPlan } from "@/lib/pricing";
+import { MOZI_TREASURY_HUB_ABI } from "@/lib/abis/moziTreasuryHub";
+import type { IntentRow } from "@/lib/types/intentRow";
+
+const TREASURY_HUB_ADDRESS =
+  process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
 
 type ExecuteCall = { to: string; data: string };
 
+// -------------------------
+// Option A store (this is what /api/orders/list reads)
+// -------------------------
+type OrderLine = { sku: string; name?: string; qty: number; uom?: string };
+
+type IntentItem = {
+  orderId: string;
+  supplier: string; // payout address
+  amount: string; // raw token amount (18 decimals assumed)
+  executeAfter?: number; // unix seconds
+  lines: OrderLine[];
+
+  // execution metadata
+  txHash?: string;
+  to?: string;
+  createdAtUnix?: number;
+};
+
+function intentStore(): Map<string, IntentRow> {
+  if (!global.__moziIntentStore) global.__moziIntentStore = new Map();
+  return global.__moziIntentStore;
+}
+
+// -------------------------
+// Helpers
+// -------------------------
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const id = setTimeout(
@@ -36,14 +74,163 @@ function getLocationIdFromUrl(url: string): string | null {
   return locationId && locationId.trim().length > 0 ? locationId : null;
 }
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __moziWarmupLastAt: Map<string, number> | undefined;
+function asBytes32OrNull(v: any): string | null {
+  const s = typeof v === "string" ? v : "";
+  if (s.startsWith("0x") && s.length === 66) return s;
+  return null;
 }
 
-function warmupLastAtStore(): Map<string, number> {
-  if (!global.__moziWarmupLastAt) global.__moziWarmupLastAt = new Map();
-  return global.__moziWarmupLastAt;
+function pickSupplierPayoutById(input: any): Map<string, string> {
+  const m = new Map<string, string>();
+  const sups = Array.isArray(input?.suppliers) ? input.suppliers : [];
+  for (const s of sups) {
+    const sid = String(s?.supplierId ?? "");
+    const payout = String(s?.payoutAddress ?? "");
+    if (sid && payout) m.set(sid, payout);
+  }
+  return m;
+}
+
+function normalizeUom(v: any): string | undefined {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s ? s : undefined;
+}
+
+function num(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function buildCallsNoFetch(args: {
+  locationId: string;
+  ownerAddress: string;
+  plan: any;
+  pendingWindowHours: number;
+}) {
+  const { locationId, ownerAddress, plan, pendingWindowHours } = args;
+
+  if (!TREASURY_HUB_ADDRESS) {
+    throw new Error("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in env");
+  }
+
+  const input = getState(locationId);
+
+  const paymentIntent = buildPaymentIntentFromPlan({
+    input,
+    plan,
+    pendingWindowHours,
+  });
+
+  const ref = keccak256(toUtf8Bytes(paymentIntent.intentId));
+  const restaurantId = keccak256(toUtf8Bytes(locationId));
+
+  const supplierPayout = new Map(
+    (input.suppliers ?? []).map((s: any) => [
+      String(s.supplierId),
+      String(s.payoutAddress),
+    ])
+  );
+
+  const iface = new Interface(MOZI_TREASURY_HUB_ABI);
+
+  const calls = (paymentIntent.transfers ?? []).map((t: any) => {
+    const supplier = supplierPayout.get(String(t.supplierId));
+    if (!supplier || !isAddress(supplier)) {
+      throw new Error(
+        `Missing/invalid payoutAddress for supplierId=${t.supplierId}`
+      );
+    }
+
+    const amountToken = parseUnits(Number(t.amountUsd ?? 0).toFixed(2), 18);
+
+    const data = iface.encodeFunctionData("payOrderFor", [
+      ownerAddress,
+      supplier,
+      amountToken,
+      ref,
+      restaurantId,
+    ]);
+
+    return { to: TREASURY_HUB_ADDRESS, data };
+  });
+
+  return { calls, ref, restaurantId, paymentIntent };
+}
+
+/**
+ * Build the same "pipeline-aware" PlanInput that /api/state returns,
+ * but without doing an HTTP fetch to /api/state.
+ */
+function buildBaseInputNoFetch(args: {
+  env: "testing" | "production";
+  locationId: string;
+  ownerAddress: string;
+}) {
+  const { env, locationId, ownerAddress } = args;
+
+  const base: any = getState(locationId);
+
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const horizonDays = Math.max(
+    1,
+    num(base?.restaurant?.planningHorizonDays ?? 7)
+  );
+  const horizonEndUnix = nowUnix + horizonDays * 86400;
+
+  // inventory map (arrived/on-hand)
+  const inventoryMap = new Map<string, number>();
+  for (const row of base?.inventory ?? []) {
+    const sku = String(row?.sku ?? "");
+    if (!sku) continue;
+    inventoryMap.set(sku, num(row?.onHandUnits));
+  }
+
+  // pipeline from intentStore (written by upsertIntent)
+  const pipelineRaw: any = ownerAddress
+    ? pipelineBySku({ env, ownerAddress, locationId, nowUnix })
+    : { open: [] };
+
+  const open = Array.isArray(pipelineRaw?.open) ? pipelineRaw.open : [];
+
+  // inbound that arrives within horizon
+  const inboundWithinHorizon: Record<string, number> = {};
+  for (const intent of open) {
+    for (const it of intent?.items ?? []) {
+      const sku = String(it?.sku ?? "");
+      if (!sku) continue;
+
+      const units = num(it?.units);
+      if (units <= 0) continue;
+
+      const etaUnix = num(it?.etaUnix);
+      const countIt = !etaUnix || etaUnix <= horizonEndUnix;
+      if (!countIt) continue;
+
+      inboundWithinHorizon[sku] = (inboundWithinHorizon[sku] ?? 0) + units;
+    }
+  }
+
+  // skus for planning = arrived + inbound
+  const skus = (base?.skus ?? []).map((s: any) => {
+    const sku = String(s?.sku ?? "");
+    const arrivedOnHand = inventoryMap.get(sku) ?? num(s?.onHandUnits);
+    const inbound = num(inboundWithinHorizon[sku] ?? 0);
+
+    return {
+      ...s,
+      onHandUnits: arrivedOnHand + inbound,
+      inboundUnits: inbound,
+    };
+  });
+
+  // IMPORTANT: your /api/plan currently reads context.pipelineBySku (NOT context.pipeline.bySku)
+  const context = {
+    ...(base?.context ?? {}),
+    pipelineBySku: inboundWithinHorizon,
+    pipelineOpen: open,
+  };
+
+  return { ...base, skus, context };
 }
 
 export async function POST(req: Request) {
@@ -59,9 +246,10 @@ export async function POST(req: Request) {
     const body = (await req.json()) as {
       env?: "testing" | "production";
       ownerAddress: string;
+
+      // kept for backward compatibility; no longer used for on-chain pending
       pendingWindowHours?: number;
 
-      // optional “control knobs” so periodic proposer matches your UI settings
       strategy?: string;
       horizonDays?: number;
       notes?: string;
@@ -101,63 +289,18 @@ export async function POST(req: Request) {
       );
     }
 
-    // -------------------------
-    // Step 4: refresh intentStore from chain BEFORE building state/plan
-    // -------------------------
-    const origin = new URL(req.url).origin;
-
-    let warmup = { ok: false, status: 0, json: null as any };
-
-    try {
-      const warmRes = await withTimeout(
-        fetch(
-          `${origin}/api/orders/list?env=${encodeURIComponent(env)}` +
-            `&owner=${encodeURIComponent(ownerAddress)}` +
-            `&locationId=${encodeURIComponent(locationId)}`,
-          { method: "GET" }
-        ),
-        3_000,
-        "warm /api/orders/list"
-      );
-
-      warmup.ok = warmRes.ok;
-      warmup.status = warmRes.status;
-      warmup.json = await warmRes.json().catch(() => null);
-    } catch {
-      // ignore warmup failures (should never block proposing)
-    }
-
-    // Now fetch deterministic state (pipeline-aware)
-    const stateRes = await withTimeout(
-      fetch(
-        `${origin}/api/state?locationId=${encodeURIComponent(locationId)}` +
-          `&owner=${encodeURIComponent(ownerAddress)}`,
-        { method: "GET" }
-      ),
-      6_000,
-      "/api/state"
-    );
-
-    const baseInput = await stateRes.json().catch(() => null);
-
-    if (!stateRes.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "State route failed",
-          detail: baseInput,
-          warmup,
-        },
-        { status: stateRes.status }
-      );
-    }
+    // 1) Build deterministic state WITHOUT self-fetch
+    const baseInput = buildBaseInputNoFetch({
+      env,
+      locationId,
+      ownerAddress,
+    });
 
     if (!baseInput) {
       return NextResponse.json(
         {
           ok: false,
-          error: "State route returned empty JSON",
-          warmup,
+          error: "State is empty (getState returned null/undefined)",
         },
         { status: 500 }
       );
@@ -184,22 +327,23 @@ export async function POST(req: Request) {
       },
     };
 
-    // 3) Generate plan
-    const planRes = await withTimeout(
-      fetch(`${origin}/api/plan`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      }),
-      30_000,
-      "/api/plan"
-    );
-
-    const plan = await planRes.json();
-    if (!planRes.ok) {
+    // 3) Generate plan (NO self-fetch)
+    let plan: any;
+    try {
+      plan = await withTimeout(
+        generatePlan(input as any),
+        60_000,
+        "generatePlan()"
+      );
+    } catch (e: any) {
       return NextResponse.json(
-        { ok: false, error: "Plan route failed", detail: plan },
-        { status: planRes.status }
+        {
+          ok: false,
+          error: "plan generation failed",
+          where: "generatePlan()",
+          detail: String(e?.message ?? e),
+        },
+        { status: 502 }
       );
     }
 
@@ -213,120 +357,24 @@ export async function POST(req: Request) {
       );
     }
 
-    // -----------------------------
-    // STEP 5: Idempotency guard (don't re-propose inbound SKUs)
-    // -----------------------------
-    const horizonDays =
-      typeof input?.restaurant?.planningHorizonDays === "number"
-        ? input.restaurant.planningHorizonDays
-        : 7;
-
-    const horizonEndUnix =
-      Math.floor(Date.now() / 1000) + Math.max(1, horizonDays) * 86400;
-
-    // pipeline is attached by /api/state (and warmed by /api/orders/list above)
-    const pipeline = (baseInput?.context?.pipeline ?? {}) as any;
-
-    // Two possible shapes you’ve seen in logs:
-    // (A) pipeline.bySku is flat record
-    // (B) pipeline.bySku.bySku exists (older debug nesting)
-    const bySkuFlat: Record<string, number> =
-      pipeline?.bySku &&
-      typeof pipeline.bySku === "object" &&
-      !Array.isArray(pipeline.bySku)
-        ? pipeline.bySku.bySku ?? pipeline.bySku
-        : {};
-
-    // Also use open intents with ETA if available (more correct than flat counts)
-    const open = Array.isArray(pipeline?.open) ? pipeline.open : [];
-
-    // Build a set of SKUs that are "inbound soon enough to matter"
-    const inboundSoon = new Set<string>();
-
-    // If we have open intents with items + etaUnix, use those
-    for (const intent of open) {
-      for (const it of intent?.items ?? []) {
-        const sku = String(it?.sku ?? "");
-        if (!sku) continue;
-
-        const etaUnix = Number(it?.etaUnix ?? 0);
-        // If ETA missing, treat as inbound soon (safe)
-        if (!etaUnix || etaUnix <= horizonEndUnix) inboundSoon.add(sku);
-      }
-    }
-
-    // Fallback: if open intents missing, rely on flat bySku counts
-    if (inboundSoon.size === 0) {
-      for (const sku of Object.keys(bySkuFlat ?? {})) {
-        if (Number(bySkuFlat[sku] ?? 0) > 0) inboundSoon.add(sku);
-      }
-    }
-
-    // Filter plan items that are already inbound soon.
-    // (If you prefer to hard-fail instead, I’ll show that below.)
-    const filteredOrders = (plan.orders ?? [])
-      .map((o: any) => ({
-        ...o,
-        items: (o.items ?? []).filter((it: any) => {
-          const sku = String(it?.sku ?? "");
-          return sku && !inboundSoon.has(sku);
-        }),
-      }))
-      .filter((o: any) => (o.items ?? []).length > 0);
-
-    const removedCount =
-      (plan.orders ?? []).reduce(
-        (acc: number, o: any) => acc + (o.items?.length ?? 0),
-        0
-      ) -
-      filteredOrders.reduce(
-        (acc: number, o: any) => acc + (o.items?.length ?? 0),
-        0
-      );
-
-    plan.orders = filteredOrders;
-
-    // If everything got filtered out, there’s nothing new to propose
-    if ((plan.orders ?? []).length === 0) {
+    // 4) Build encoded calls (NO self-fetch)
+    let execJson: any;
+    try {
+      execJson = buildCallsNoFetch({
+        locationId,
+        ownerAddress,
+        plan,
+        pendingWindowHours: body.pendingWindowHours ?? 24,
+      });
+    } catch (e: any) {
       return NextResponse.json(
         {
-          ok: true,
-          env,
-          locationId,
-          ownerAddress,
-          note: "Nothing to propose (all suggested items already inbound within horizon).",
-          removedCount,
-          inboundSoon: Array.from(inboundSoon),
+          ok: false,
+          error: "Failed to build execution calls",
+          where: "buildCallsNoFetch()",
+          detail: String(e?.message ?? e),
         },
-        { status: 200 }
-      );
-    }
-
-    // 4) Ask /api/execute to build encoded calls
-    const executeUrl =
-      `${origin}/api/execute?locationId=` + encodeURIComponent(locationId);
-
-    const execRes = await withTimeout(
-      fetch(executeUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ownerAddress,
-          pendingWindowHours: body.pendingWindowHours ?? 24,
-          input,
-          plan,
-        }),
-      }),
-      12_000,
-      "/api/execute"
-    );
-
-    const execJson = await execRes.json();
-
-    if (!execRes.ok) {
-      return NextResponse.json(
-        { ok: false, error: "Execute route failed", detail: execJson },
-        { status: execRes.status }
+        { status: 500 }
       );
     }
 
@@ -334,98 +382,40 @@ export async function POST(req: Request) {
 
     if (!Array.isArray(calls) || calls.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "No calls produced (nothing to propose)" },
+        { ok: false, error: "No calls produced (nothing to pay)" },
         { status: 400 }
       );
     }
 
-    // -----------------------------
-    // ✅ STEP 2: Intent snapshot write
-    // -----------------------------
-    // This is what lets /api/state account for "already ordered but not arrived".
-    try {
-      const nowUnix = Math.floor(Date.now() / 1000);
-      const pendingWindowHours = body.pendingWindowHours ?? 24;
-
-      // Prefer ref from execute (best), else fall back to deterministic hash
-      const refFromExec =
-        execJson?.ref || execJson?.intentRef || execJson?.paymentIntent?.ref;
-
-      const ref =
-        typeof refFromExec === "string" &&
-        refFromExec.startsWith("0x") &&
-        refFromExec.length === 66
-          ? refFromExec
-          : keccak256(toUtf8Bytes(`${ownerAddress}|${locationId}|${nowUnix}`));
-
-      const restaurantId = keccak256(toUtf8Bytes(locationId));
-      const executeAfterUnix = nowUnix + pendingWindowHours * 3600;
-
-      // ETA heuristic v1:
-      // If you have supplier leadTimeDays in input, we can do better later.
-      // ETA using supplier lead time (best-effort)
-      // default 1 day if unknown
-      const supplierLeadDays = new Map<string, number>(
-        (input?.suppliers ?? []).map((s: any) => [
-          String(s.supplierId),
-          Number(s.leadTimeDays ?? 1),
-        ])
-      );
-
-      const skuToSupplier = new Map<string, string>(
-        (input?.skus ?? []).map((s: any) => [
-          String(s.sku),
-          String(s.supplierId),
-        ])
-      );
-
-      function etaForSku(sku: string, fallbackSupplierId?: string) {
-        const sup = fallbackSupplierId || skuToSupplier.get(sku) || "";
-        const lead = supplierLeadDays.get(sup);
-        const leadDays = Number.isFinite(lead as any) ? Number(lead) : 1;
-        return executeAfterUnix + Math.max(0, leadDays) * 86400;
-      }
-
-      const items: Array<{
-        sku: string;
-        units: number;
-        supplierId?: string;
-        etaUnix: number;
-      }> = [];
-
-      for (const ord of plan.orders ?? []) {
-        const supplierId = ord.supplierId;
-        for (const it of ord.items ?? []) {
-          const sku = String(it.sku ?? "");
-          const units = Number(it.orderUnits ?? 0);
-          if (!sku || !Number.isFinite(units) || units <= 0) continue;
-          items.push({
-            sku,
-            units,
-            supplierId,
-            etaUnix: etaForSku(sku, supplierId),
-          });
-        }
-      }
-
-      upsertIntent({
-        ref,
-        ownerAddress,
-        locationId,
-        restaurantId,
-        executeAfterUnix,
-        createdAtUnix: nowUnix,
-        items,
-      });
-    } catch {
-      // MVP: snapshot failure should not block proposing
-    }
-
-    // 5) Broadcast calls as agent wallet (fast: don't wait confirmations)
+    // 5) Broadcast calls as agent wallet (immediate execution)
     const provider = new JsonRpcProvider(SEPOLIA_RPC_URL);
     const agent = new Wallet(AGENT_PRIVATE_KEY, provider);
 
     const txs: { to: string; hash: string }[] = [];
+    const createdAtUnix = Math.floor(Date.now() / 1000);
+
+    const ref = execJson.ref;
+    const restaurantId = execJson.restaurantId;
+
+    // --- nonce + fee handling (prevents REPLACEMENT_UNDERPRICED) ---
+    const fee = await provider.getFeeData();
+
+    // Start from the *pending* nonce so we don't collide with already-pending txs
+    let nextNonce = await provider.getTransactionCount(
+      agent.address,
+      "pending"
+    );
+
+    // Pick a reasonable bump. Sepolia can be finicky; 20–40% bump is common.
+    function bump(big: bigint | null | undefined, pct: number) {
+      if (!big) return null;
+      return (big * BigInt(100 + pct)) / BigInt(100);
+    }
+
+    // If the RPC doesn't return EIP-1559 fields, fall back to gasPrice.
+    const bumpedMaxFee = bump(fee.maxFeePerGas ?? null, 30);
+    const bumpedMaxPrio = bump(fee.maxPriorityFeePerGas ?? null, 30);
+    const bumpedGasPrice = bump(fee.gasPrice ?? null, 30);
 
     for (const c of calls) {
       if (!c?.to || !isAddress(c.to) || !c?.data) {
@@ -435,14 +425,159 @@ export async function POST(req: Request) {
         );
       }
 
+      const txRequest: any = {
+        to: c.to,
+        data: c.data,
+        nonce: nextNonce++,
+      };
+
+      // Prefer EIP-1559 if available
+      if (bumpedMaxFee && bumpedMaxPrio) {
+        txRequest.maxFeePerGas = bumpedMaxFee;
+        txRequest.maxPriorityFeePerGas = bumpedMaxPrio;
+      } else if (bumpedGasPrice) {
+        // Legacy fallback
+        txRequest.gasPrice = bumpedGasPrice;
+      }
+
       const tx = await withTimeout(
-        agent.sendTransaction({ to: c.to, data: c.data }),
-        10_000,
+        agent.sendTransaction(txRequest),
+        20_000,
         "sendTransaction"
       );
-
-      // DO NOT await tx.wait() — returning hashes is enough for MVP
       txs.push({ to: c.to, hash: tx.hash });
+    }
+
+    // ✅ Write Option A IntentRow into __moziIntentStore so /api/orders/list can render it
+    const payoutBySupplierId = pickSupplierPayoutById(input);
+    const planOrders = Array.isArray(plan?.orders) ? plan.orders : [];
+
+    const items: IntentItem[] = planOrders.map((o: any, idx: number) => {
+      const supplierId = String(o?.supplierId ?? "");
+      const supplierPayout =
+        String(o?.supplierAddress ?? "") ||
+        String(o?.payoutAddress ?? "") ||
+        (supplierId ? payoutBySupplierId.get(supplierId) ?? "" : "");
+
+      const rawAmount =
+        String(o?.amount ?? "") ||
+        String(o?.amountRaw ?? "") ||
+        String(o?.totalAmount ?? "") ||
+        String(o?.totalAmountRaw ?? "") ||
+        "0";
+
+      const lines: OrderLine[] = Array.isArray(o?.items)
+        ? (o.items
+            .map((it: any) => {
+              const sku = String(it?.sku ?? "");
+              const name = it?.name ? String(it.name) : undefined;
+
+              const qtyNum = Number(
+                it?.qty ?? it?.quantity ?? it?.orderUnits ?? 0
+              );
+              const qty = Number.isFinite(qtyNum) ? qtyNum : 0;
+
+              const uom = normalizeUom(it?.uom);
+
+              if (!sku || qty <= 0) return null;
+              return { sku, name, qty, uom };
+            })
+            .filter(Boolean) as OrderLine[])
+        : [];
+
+      const txHit = txs[idx]; // best-effort
+
+      return {
+        orderId: String(o?.orderId ?? `${ref}:${idx}`),
+        supplier: supplierPayout,
+        amount: rawAmount,
+        executeAfter: createdAtUnix,
+        lines,
+        txHash: txHit?.hash,
+        to: txHit?.to,
+        createdAtUnix,
+      };
+    });
+
+    const intentRow: IntentRow = {
+      ref,
+      owner: ownerAddress,
+      restaurantId,
+      locationId,
+      executeAfter: createdAtUnix,
+      approved: true,
+      executed: true,
+      canceled: false,
+      items: items.filter(
+        (it) => Array.isArray(it.lines) && it.lines.length > 0
+      ),
+      createdAtUnix,
+      env,
+    };
+
+    const storeKey = `${env}:${ownerAddress.toLowerCase()}:${locationId}:${ref.toLowerCase()}`;
+    intentStore().set(storeKey, intentRow);
+
+    // ✅ ALSO write pipeline snapshot (intentStore.ts) so /api/state can compute inbound
+    try {
+      const nowUnix = createdAtUnix;
+
+      const supplierLeadDays = new Map<string, number>(
+        (input?.suppliers ?? []).map((s: any) => [
+          String(s?.supplierId ?? ""),
+          Number(s?.leadTimeDays ?? 1),
+        ])
+      );
+
+      const skuToSupplier = new Map<string, string>(
+        (input?.skus ?? []).map((s: any) => [
+          String(s?.sku ?? ""),
+          String(s?.supplierId ?? ""),
+        ])
+      );
+
+      function etaForSku(sku: string, fallbackSupplierId?: string) {
+        const sup = fallbackSupplierId || skuToSupplier.get(sku) || "";
+        const lead = supplierLeadDays.get(sup);
+        const leadDays = Number.isFinite(lead as any) ? Number(lead) : 1;
+        return nowUnix + Math.max(0, leadDays) * 86400;
+      }
+
+      const snapItems: Array<{
+        sku: string;
+        units: number;
+        supplierId?: string;
+        etaUnix: number;
+      }> = [];
+
+      for (const ord of planOrders) {
+        const supplierId = String(ord?.supplierId ?? "");
+        for (const it of ord?.items ?? []) {
+          const sku = String(it?.sku ?? "");
+          const units = Number(it?.orderUnits ?? it?.qty ?? it?.quantity ?? 0);
+          if (!sku || !Number.isFinite(units) || units <= 0) continue;
+
+          snapItems.push({
+            sku,
+            units,
+            supplierId: supplierId || undefined,
+            etaUnix: etaForSku(sku, supplierId),
+          });
+        }
+      }
+
+      upsertIntent({
+        ref,
+        env,
+        ownerAddress,
+        locationId,
+        restaurantId,
+        executeAfterUnix: nowUnix,
+        createdAtUnix: nowUnix,
+        items: snapItems,
+      });
+    } catch {
+      // best-effort only
     }
 
     return NextResponse.json({
@@ -451,8 +586,9 @@ export async function POST(req: Request) {
       locationId,
       ownerAddress,
       agentAddress: agent.address,
-      ref: execJson?.ref || execJson?.intentRef || execJson?.paymentIntent?.ref,
+      ref,
       txs,
+      intent: intentRow,
     });
   } catch (e: any) {
     return NextResponse.json(

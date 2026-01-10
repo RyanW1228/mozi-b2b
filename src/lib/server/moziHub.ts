@@ -1,3 +1,4 @@
+// src/lib/server/moziHub.ts
 import { JsonRpcProvider, Wallet, Contract } from "ethers";
 
 const TREASURY_HUB_ABI = [
@@ -11,12 +12,14 @@ const TREASURY_HUB_ABI = [
   "function setIntentApproval(bytes32 ref, bool approved) external",
   "function isIntentApproved(address owner, bytes32 ref) view returns (bool)",
 
-  // --- core order lifecycle ---
-  "function nextOrderId() view returns (uint256)",
-  "function pendingOrders(uint256) view returns (address owner,address supplier,uint256 amount,uint64 executeAfter,bool canceled,bool executed,bytes32 ref,bytes32 restaurantId)",
-  "function proposeOrderFor(address owner,address supplier,uint256 amount,uint64 executeAfter,bytes32 ref,bytes32 restaurantId) returns (uint256)",
-  "function executeOrder(uint256 orderId) external",
-  "function cancelOrder(uint256 orderId) external",
+  // --- immediate pay (no pending/cancel) ---
+  "function payOrderFor(address owner,address supplier,uint256 amount,bytes32 ref,bytes32 restaurantId) external",
+
+  // --- balances / claims ---
+  "function availableToWithdraw(address owner) view returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function owed(address supplier) view returns (uint256)",
+  "function totalOwed() view returns (uint256)",
 ] as const;
 
 export type MoziEnv = "testing" | "production";
@@ -25,6 +28,7 @@ const SEPOLIA_NETWORK = { name: "sepolia", chainId: 11155111 } as const;
 
 let cachedReadProvider: JsonRpcProvider | null = null;
 let cachedReadHub: Contract | null = null;
+let cachedReadHubAddr: string | null = null;
 
 let cachedWriteProvider: JsonRpcProvider | null = null;
 
@@ -82,22 +86,28 @@ export function getHubRead(env: MoziEnv) {
     );
   }
 
+  const hubAddr = getHubAddress();
+
   if (env === "testing") {
     if (!cachedReadProvider) {
       cachedReadProvider = new JsonRpcProvider(rpc, SEPOLIA_NETWORK);
     }
-    if (!cachedReadHub) {
+
+    // Rebuild cached hub if address changed (common after redeploy)
+    if (!cachedReadHub || cachedReadHubAddr !== hubAddr) {
       cachedReadHub = new Contract(
-        getHubAddress(),
+        hubAddr,
         TREASURY_HUB_ABI,
         cachedReadProvider
       );
+      cachedReadHubAddr = hubAddr;
     }
+
     return cachedReadHub;
   }
 
   const provider = new JsonRpcProvider(rpc);
-  return new Contract(getHubAddress(), TREASURY_HUB_ABI, provider);
+  return new Contract(hubAddr, TREASURY_HUB_ABI, provider);
 }
 
 export function getHubWrite(env: MoziEnv) {

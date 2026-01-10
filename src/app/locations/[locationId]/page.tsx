@@ -114,6 +114,10 @@ function strategyLabel(
   }
 }
 
+function demoTimeKey(locationId: string) {
+  return `mozi_demo_time_offset_ms:${locationId}`;
+}
+
 function chatMemoryKey(env: string, owner: string, locationId: string) {
   return `mozi_chat_memory:${env}:${owner.toLowerCase()}:${locationId}`;
 }
@@ -316,9 +320,154 @@ export default function LocationPage() {
   // --- Demo time travel (UI-only) ---
   const [demoNowOffsetMs, setDemoNowOffsetMs] = useState(0);
 
+  // --- Demo time travel (UI-only) ---
+  const demoTimeHydratedRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!locationId) return;
+
+    try {
+      const raw = window.localStorage.getItem(demoTimeKey(locationId));
+      if (raw != null) {
+        const n = Number(raw);
+        if (Number.isFinite(n)) setDemoNowOffsetMs(n);
+      }
+    } catch {
+      // ignore
+    } finally {
+      demoTimeHydratedRef.current = true;
+    }
+  }, [locationId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!locationId) return;
+
+    // don't save until we've loaded once
+    if (!demoTimeHydratedRef.current) return;
+
+    try {
+      window.localStorage.setItem(
+        demoTimeKey(locationId),
+        String(demoNowOffsetMs)
+      );
+    } catch {
+      // ignore
+    }
+  }, [demoNowOffsetMs, locationId]);
+
   function demoNowMs() {
     return Date.now() + demoNowOffsetMs;
   }
+
+  // --- Simulate inventory depletion (UI-only time travel drives server inventory) ---
+  function makeSeededRng(seed: number) {
+    // deterministic LCG (good enough for demo)
+    let s = seed >>> 0;
+    return () => {
+      s = (1664525 * s + 1013904223) >>> 0;
+      return s / 2 ** 32; // [0,1)
+    };
+  }
+
+  function clampInt(n: number, lo: number, hi: number) {
+    const x = Math.floor(n);
+    return Math.max(lo, Math.min(hi, x));
+  }
+
+  async function consumeInventoryForSimulatedDays(daysAdvanced: number) {
+    if (!locationId || daysAdvanced <= 0) return;
+
+    // pull latest state snapshot so depletion uses current inventory + sales
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    const stateRes = await fetch(
+      `/api/state?locationId=${encodeURIComponent(locationId)}` +
+        (owner ? `&owner=${encodeURIComponent(owner)}` : "") +
+        `&env=${encodeURIComponent(env)}`
+    ).catch(() => null);
+
+    if (!stateRes || !stateRes.ok) return;
+    const state = await stateRes.json().catch(() => null);
+    if (!state) return;
+
+    const inventory = Array.isArray(state.inventory) ? state.inventory : [];
+    const salesBySku = Array.isArray(state?.sales?.bySku)
+      ? state.sales.bySku
+      : [];
+    const windowDays = Number(state?.sales?.windowDays ?? 7) || 7;
+
+    // deterministic randomness per simulated day (so it feels stable)
+    // seed changes each simulated day but repeats if you reload
+    const dayIndex = Math.floor(demoNowMs() / (24 * 60 * 60 * 1000));
+    const rng = makeSeededRng(dayIndex ^ 0x9e3779b9);
+
+    // build avg daily consumption from sales window (fallback small baseline)
+    const dailyRateBySku = new Map<string, number>();
+    for (const row of salesBySku) {
+      const sku = String(row?.sku ?? "");
+      const unitsSold = Number(row?.unitsSold ?? 0);
+      if (!sku) continue;
+      const rate = Math.max(0, unitsSold / Math.max(1, windowDays));
+      dailyRateBySku.set(sku, rate);
+    }
+
+    // Optional: mild “event lift” if any upcoming event matches the simulated date
+    // (keeps it simple but believable)
+    const today = new Date(demoNowMs());
+    const todayIso = today.toISOString().slice(0, 10);
+    const upcomingEvents = Array.isArray(state?.context?.upcomingEvents)
+      ? state.context.upcomingEvents
+      : [];
+    const todaysEventLiftPct = upcomingEvents
+      .filter((e: any) => String(e?.date ?? "") === todayIso)
+      .reduce(
+        (acc: number, e: any) =>
+          acc + Number(e?.expectedDemandLiftPercent ?? 0),
+        0
+      );
+
+    const demandLift = 1 + Math.max(0, todaysEventLiftPct) / 100;
+
+    // pick ~10-14 SKUs to consume per day (fast + avoids huge payloads)
+    const shuffled = [...inventory].sort(() => rng() - 0.5);
+    const pickCount = clampInt(10 + rng() * 5, 8, 16);
+    const picked = shuffled.slice(0, pickCount);
+
+    const lines = picked
+      .map((invRow: any) => {
+        const sku = String(invRow?.sku ?? "");
+        const onHand = Number(invRow?.onHandUnits ?? 0);
+        if (!sku || !Number.isFinite(onHand) || onHand <= 0) return null;
+
+        const base = dailyRateBySku.get(sku) ?? 0.4; // fallback: slow drip
+        // randomness: 0.6–1.6x, plus event lift
+        const mult = (0.6 + rng() * 1.0) * demandLift;
+
+        // consume at least 0, typically 0–(base*mult*daysAdvanced*~1.3)
+        const rawConsume = base * mult * daysAdvanced;
+        const jitter = (rng() - 0.5) * rawConsume * 0.35; // +/- 35% of that
+        const consume = clampInt(rawConsume + jitter, 0, Math.max(0, onHand));
+
+        if (consume <= 0) return null;
+        return { sku, units: consume };
+      })
+      .filter(Boolean);
+
+    if (lines.length === 0) return;
+
+    await fetch(
+      `/api/inventory/consume?locationId=${encodeURIComponent(locationId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines }),
+      }
+    ).catch(() => null);
+  }
+
   function demoNowUnix() {
     return Math.floor(demoNowMs() / 1000);
   }
@@ -337,33 +486,44 @@ export default function LocationPage() {
   const [strategyDraft, setStrategyDraft] =
     useState<PlanInput["ownerPrefs"]["strategy"]>("balanced");
 
+  const [priceBySku, setPriceBySku] = useState<Record<string, number>>({});
+  const [uomBySku, setUomBySku] = useState<Record<string, string>>({});
+
   // -------------------------
   // On-chain orders (grouped by intent ref)
   // -------------------------
-  type IntentRow = {
-    ref: string;
-    owner: string;
-    restaurantId: string;
-    executeAfter: number;
-    canceled: boolean;
-    executed: boolean;
-    approved: boolean;
-    items: Array<{
-      orderId: string;
-      supplier: string;
-      amount: string; // raw uint256 string
-      executeAfter: number;
-      canceled: boolean;
-      executed: boolean;
+  // -------------------------
+  // Executed order receipts (from /api/orders/list; source=backend_receipts)
+  // -------------------------
+  type OrderLine = {
+    sku: string;
+    name?: string;
+    qty: number;
+    uom?: string;
+  };
 
-      // ✅ off-chain metadata merged in by /api/orders/list
-      lines?: Array<{
-        sku: string;
-        name?: string;
-        qty: number;
-        uom?: string; // "units", "lbs", "cases", etc.
-      }>;
-    }>;
+  type IntentItem = {
+    orderId: string;
+    supplier: string;
+    amount: string; // raw token amount (18 decimals assumed)
+    executeAfter?: number; // unix seconds (optional; can fall back to intent.executeAfter)
+    lines: OrderLine[];
+
+    // optional receipt-ish fields (won't break if present/absent)
+    txHash?: string;
+    createdAtUnix?: number;
+    to?: string;
+  };
+
+  type IntentRow = {
+    ref: string; // bytes32
+    owner: string;
+    restaurantId: string; // bytes32
+    executeAfter?: number; // unix seconds
+    approved?: boolean;
+    executed?: boolean;
+    canceled?: boolean;
+    items: IntentItem[];
   };
 
   type ChatMsg = { role: "user" | "assistant"; content: string };
@@ -415,7 +575,12 @@ export default function LocationPage() {
 
   function isContextActive(item: AdditionalContextItem) {
     const d = Number(item.durationDays ?? 0);
-    if (!Number.isFinite(d) || d <= 0) return false;
+
+    // ✅ durationDays === 0 means indefinite (always active)
+    if (d === 0) return true;
+
+    if (!Number.isFinite(d) || d < 0) return false;
+
     const expiresAt = item.createdAtMs + d * 24 * 60 * 60 * 1000;
     return Date.now() < expiresAt;
   }
@@ -446,47 +611,7 @@ export default function LocationPage() {
   // Draft inputs
   const [contextDraft, setContextDraft] = useState("");
   const [contextDaysDraft, setContextDaysDraft] = useState("7");
-
-  useEffect(() => {
-    if (!locationId) return;
-
-    let stopped = false;
-
-    const tick = async () => {
-      if (stopped) return;
-      if (typeof document !== "undefined" && document.hidden) return;
-
-      const owner = getSavedOwnerAddress();
-      const env = getSavedEnv();
-
-      // Optional: only execute for this owner+location
-      const url =
-        `/api/orders/execute?env=${encodeURIComponent(env)}` +
-        `&locationId=${encodeURIComponent(locationId)}` +
-        (owner ? `&owner=${encodeURIComponent(owner)}` : "") +
-        `&limit=120`;
-
-      try {
-        await fetch(url, { method: "POST" });
-        // then refresh UI so executed orders disappear
-        await refreshOrders();
-      } catch {
-        // ignore for MVP
-      }
-    };
-
-    // run every 30s
-    const id = window.setInterval(() => tick(), 30_000);
-    // run once immediately
-    tick();
-
-    return () => {
-      stopped = true;
-      window.clearInterval(id);
-    };
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationId]);
+  const [contextIndefDraft, setContextIndefDraft] = useState(false);
 
   useEffect(() => {
     if (!editingPlan) setStrategyDraft(strategy);
@@ -687,25 +812,83 @@ export default function LocationPage() {
     return mm ?? eth;
   }
 
+  async function getSignerAndHub() {
+    const injected = getInjectedProvider();
+    if (!injected) throw new Error("No injected wallet found (MetaMask).");
+
+    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
+      throw new Error("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS");
+    }
+
+    const provider = new BrowserProvider(injected);
+    // prompts connect if needed
+    await provider.send("eth_requestAccounts", []);
+    const signer = await provider.getSigner();
+
+    const hub = new Contract(
+      TREASURY_HUB_ADDRESS,
+      MOZI_TREASURY_HUB_ABI,
+      signer
+    );
+
+    return { signer, hub };
+  }
+
+  async function approveIntent(ref: string) {
+    if (!ref) return;
+
+    try {
+      setApprovingRef(ref);
+      const { hub } = await getSignerAndHub();
+
+      // NOTE: this assumes your hub ABI exposes approveIntent(bytes32)
+      const tx = await hub.approveIntent(ref);
+      await tx.wait();
+
+      await refreshOrders();
+    } catch (e: any) {
+      setOrdersError(String(e?.message ?? e));
+    } finally {
+      setApprovingRef(null);
+    }
+  }
+
+  async function cancelIntentCard(intent: IntentRow) {
+    const key = String(intent?.ref || "");
+    if (!key) return;
+
+    // already canceling something → ignore
+    if (cancelAnyInFlight.current) return;
+
+    try {
+      cancelAnyInFlight.current = true;
+      setCancelAnyUi(true);
+      setCancelingOrderKey(key);
+
+      const { hub } = await getSignerAndHub();
+
+      // NOTE: this assumes your hub ABI exposes cancelIntent(bytes32)
+      const tx = await hub.cancelIntent(key);
+      await tx.wait();
+
+      // Immediately remove from UI (optimistic), then refresh canonical state.
+      setIntents((prev) => prev.filter((x) => String(x.ref || "") !== key));
+
+      await refreshOrders();
+    } catch (e: any) {
+      setOrdersError(String(e?.message ?? e));
+      // if cancel failed, refresh to restore correct UI
+      await refreshOrders().catch(() => {});
+    } finally {
+      setCancelingOrderKey(null);
+      setCancelAnyUi(false);
+      cancelAnyInFlight.current = false;
+    }
+  }
+
   function getSavedOwnerAddress(): string | null {
     if (typeof window === "undefined") return null;
     return window.localStorage.getItem("mozi_wallet_address");
-  }
-
-  function fmtExecutionCountdown(executeAfterUnix: number) {
-    if (!executeAfterUnix) return "Execution time unknown";
-
-    const ms = executeAfterUnix * 1000 - demoNowMs();
-    if (ms <= 0) return "Ready to execute";
-
-    const totalSec = Math.floor(ms / 1000);
-    const hours = Math.floor(totalSec / 3600);
-    const minutes = Math.floor((totalSec % 3600) / 60);
-    const seconds = totalSec % 60;
-
-    if (hours > 0) return `Execution in ${hours}h ${minutes}m`;
-    if (minutes > 0) return `Execution in ${minutes}m ${seconds}s`;
-    return `Execution in ${seconds}s`;
   }
 
   function fmtWhen(ts: number) {
@@ -796,47 +979,16 @@ export default function LocationPage() {
 
       const raw = (json.intents ?? []) as IntentRow[];
 
-      const scoped = raw.filter(
-        (i) =>
-          String(i.restaurantId || "").toLowerCase() ===
-          String(locationRestaurantId || "").toLowerCase()
+      // In receipts mode, server already filtered by owner/locationId,
+      // and there is no canceled item concept. Just keep non-empty.
+      const cleaned = raw.filter(
+        (it) => Array.isArray(it.items) && it.items.length > 0
       );
-
-      // ✅ Remove canceled intents entirely (don't show deleted cards)
-      // ✅ Remove canceled items inside active intents
-      const cleaned = scoped
-        .filter((intent) => !intent.canceled) // <-- key change: drop deleted cards
-        .map((intent) => {
-          const items = Array.isArray(intent.items) ? intent.items : [];
-          const filteredItems = items.filter((it) => !it.canceled);
-          return { ...intent, items: filteredItems };
-        })
-        .filter((intent) => (intent.items ?? []).length > 0);
 
       setIntents(cleaned);
 
-      // manual/autonomous mode read
-      if (
-        !TREASURY_HUB_ADDRESS ||
-        !isAddress(TREASURY_HUB_ADDRESS) ||
-        typeof window === "undefined" ||
-        !(window as any).ethereum
-      ) {
-        setRequireApproval(null);
-        return;
-      }
-
-      const provider = new BrowserProvider((window as any).ethereum);
-      const hub = new Contract(
-        TREASURY_HUB_ADDRESS,
-        MOZI_TREASURY_HUB_ABI,
-        provider
-      );
-
-      const req = (await (hub as any).requireApprovalForExecution(
-        owner
-      )) as boolean;
-      setRequireApproval(Boolean(req));
+      // Optional: you can stop fetching requireApproval entirely (not relevant now)
+      setRequireApproval(null);
     } catch (e: any) {
       setIntents([]);
       setRequireApproval(null);
@@ -844,299 +996,6 @@ export default function LocationPage() {
     } finally {
       setOrdersLoading(false);
       refreshOrdersInFlight.current = false;
-    }
-  }
-
-  async function approveIntent(ref: string) {
-    const owner = getSavedOwnerAddress();
-    if (!owner || !isAddress(owner)) {
-      setOrdersError(
-        "No valid wallet found. Connect wallet on homepage first."
-      );
-      return;
-    }
-    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
-      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
-      return;
-    }
-    if (typeof window === "undefined" || !(window as any).ethereum) {
-      setOrdersError("No injected wallet found (window.ethereum missing).");
-      return;
-    }
-
-    try {
-      setOrdersError("");
-      setApprovingRef(ref);
-
-      const injected = getInjectedProvider();
-      if (!injected) {
-        setOrdersError("No injected wallet found (window.ethereum missing).");
-        return;
-      }
-
-      const provider = new BrowserProvider(injected);
-      const signer = await provider.getSigner();
-
-      // optional: sanity check signer matches saved owner
-      const signerAddr = await signer.getAddress();
-      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setOrdersError("Connected wallet does not match saved owner address.");
-        return;
-      }
-
-      const hub = new Contract(
-        TREASURY_HUB_ADDRESS,
-        MOZI_TREASURY_HUB_ABI,
-        signer
-      );
-
-      // Approve this intent ref
-      const tx = await (hub as any).setIntentApproval(ref, true);
-      await tx.wait();
-
-      await refreshOrders();
-    } catch (e: any) {
-      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
-    } finally {
-      setApprovingRef(null);
-    }
-  }
-
-  async function cancelIntentCard(intent: IntentRow) {
-    const owner = getSavedOwnerAddress();
-    if (!owner || !isAddress(owner)) {
-      setOrdersError(
-        "No valid wallet found. Connect wallet on homepage first."
-      );
-      return;
-    }
-    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
-      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
-      return;
-    }
-    if (typeof window === "undefined" || !(window as any).ethereum) {
-      setOrdersError("No injected wallet found (window.ethereum missing).");
-      return;
-    }
-
-    if (cancelAnyInFlight.current) return;
-    cancelAnyInFlight.current = true;
-    setCancelAnyUi(true);
-
-    const key = String(intent.ref || "");
-    const items = Array.isArray(intent.items) ? intent.items : [];
-
-    // Collect cancellable ids
-    const ids: bigint[] = [];
-    for (const it of items) {
-      if (it.canceled || it.executed) continue;
-      const raw = String(it.orderId ?? "").trim();
-      if (!raw) continue;
-      try {
-        ids.push(BigInt(raw));
-      } catch {}
-    }
-
-    if (ids.length === 0) {
-      setOrdersError("No cancellable order IDs found in this intent.");
-      cancelAnyInFlight.current = false;
-      setCancelAnyUi(false);
-      return;
-    }
-
-    try {
-      setOrdersError("");
-      setCancelingOrderKey(key);
-
-      // Optimistic UI: remove the whole intent immediately
-      setIntents((prev) =>
-        prev.filter((x) => String(x.ref) !== String(intent.ref))
-      );
-      setOpenOrderKeys((prev) => {
-        const copy = { ...prev };
-        delete copy[key];
-        return copy;
-      });
-
-      const injected = getInjectedProvider();
-      if (!injected) {
-        setOrdersError("No injected wallet found (window.ethereum missing).");
-        return;
-      }
-
-      const provider = new BrowserProvider(injected);
-      const signer = await provider.getSigner();
-
-      const signerAddr = await signer.getAddress();
-      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setOrdersError("Connected wallet does not match saved owner address.");
-        return;
-      }
-
-      const hub = new Contract(
-        TREASURY_HUB_ADDRESS,
-        MOZI_TREASURY_HUB_ABI,
-        signer
-      );
-
-      for (const id of ids) {
-        const tx = await (hub as any).cancelOrder(id);
-        try {
-          await provider.waitForTransaction(tx.hash, 1, 60_000);
-        } catch {
-          // ignore timeout
-        }
-      }
-
-      await refreshOrders();
-    } catch (e: any) {
-      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
-    } finally {
-      setCancelingOrderKey(null);
-      cancelAnyInFlight.current = false;
-      setCancelAnyUi(false);
-    }
-  }
-
-  async function cancelOrderCard(o: {
-    key: string;
-    supplier: string;
-    executeAfter: number;
-    lines: Array<{ orderId?: string; canceled: boolean; executed: boolean }>;
-  }) {
-    const owner = getSavedOwnerAddress();
-    if (!owner || !isAddress(owner)) {
-      setOrdersError(
-        "No valid wallet found. Connect wallet on homepage first."
-      );
-      return;
-    }
-    if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
-      setOrdersError("Missing/invalid NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS.");
-      return;
-    }
-    if (typeof window === "undefined" || !(window as any).ethereum) {
-      setOrdersError("No injected wallet found (window.ethereum missing).");
-      return;
-    }
-
-    // ✅ Prevent concurrent cancels (MetaMask can only reliably handle one prompt at a time)
-    if (cancelAnyInFlight.current) return;
-    cancelAnyInFlight.current = true;
-    setCancelAnyUi(true);
-
-    // Collect all cancellable orderIds in this card
-    const ids: bigint[] = [];
-    for (const ln of o.lines || []) {
-      const raw = String(ln?.orderId ?? "").trim();
-      if (!raw) continue;
-
-      // Skip lines already canceled/executed (defensive)
-      if (ln.canceled || ln.executed) continue;
-
-      try {
-        // uint256 orderId -> bigint
-        ids.push(BigInt(raw));
-      } catch {
-        // ignore bad ids
-      }
-    }
-
-    if (ids.length === 0) {
-      setOrdersError("No cancellable order IDs found in this order card.");
-      cancelAnyInFlight.current = false;
-      setCancelAnyUi(false);
-      return;
-    }
-
-    try {
-      setOrdersError("");
-      setCancelingOrderKey(o.key);
-      // ✅ Optimistic UI: remove this order card immediately (don’t wait for chain/indexer)
-      setIntents((prev) => {
-        const supKey = String(o.supplier || "").toLowerCase();
-        const execKey = Number(o.executeAfter || 0);
-
-        const next = prev
-          .map((intent) => {
-            const items = Array.isArray(intent.items) ? intent.items : [];
-
-            const filtered = items.filter((it: any) => {
-              const itSup = String(it?.supplier || "").toLowerCase();
-              const itExec = Number(
-                it?.executeAfter ?? intent.executeAfter ?? 0
-              );
-
-              // If this line item belongs to the card being canceled, drop it
-              const matchesCard = itSup === supKey && itExec === execKey;
-              return !matchesCard;
-            });
-
-            return { ...intent, items: filtered };
-          })
-          // drop empty intents
-          .filter((intent) => (intent.items ?? []).length > 0);
-
-        return next;
-      });
-
-      // Also close its expanded state if it was open
-      setOpenOrderKeys((prev) => {
-        const copy = { ...prev };
-        delete copy[o.key];
-        return copy;
-      });
-
-      const injected = getInjectedProvider();
-      if (!injected) {
-        setOrdersError("No injected wallet found (window.ethereum missing).");
-        return;
-      }
-
-      const provider = new BrowserProvider(injected);
-      const signer = await provider.getSigner();
-
-      // Safety: ensure signer matches saved owner
-      const signerAddr = await signer.getAddress();
-      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setOrdersError("Connected wallet does not match saved owner address.");
-        return;
-      }
-
-      const hub = new Contract(
-        TREASURY_HUB_ADDRESS,
-        MOZI_TREASURY_HUB_ABI,
-        signer
-      );
-
-      // Cancel every order in this card (1 tx per orderId)
-      for (const id of ids) {
-        try {
-          const tx = await (hub as any).cancelOrder(id);
-
-          // Wait up to 60s for 1 confirmation. If it doesn't confirm, we still proceed.
-          try {
-            await provider.waitForTransaction(tx.hash, 1, 60_000);
-          } catch {
-            // timeout (tx may still confirm later) — continue
-          }
-        } catch (e: any) {
-          // If one cancel fails, stop and show why (so you don't hang silently)
-          setOrdersError(
-            `Cancel failed for orderId=${id.toString()}: ` +
-              String(e?.shortMessage || e?.reason || e?.message || e)
-          );
-          break;
-        }
-      }
-
-      await refreshOrders();
-    } catch (e: any) {
-      setOrdersError(String(e?.shortMessage || e?.reason || e?.message || e));
-    } finally {
-      setCancelingOrderKey(null);
-      cancelAnyInFlight.current = false;
-      setCancelAnyUi(false);
     }
   }
 
@@ -1212,11 +1071,14 @@ export default function LocationPage() {
   async function generateOrders() {
     if (!locationId) return;
 
+    // prevent double-clicks
+    if (manualGenerateInFlight.current) return;
+
     setLoading(true);
     manualGenerateInFlight.current = true;
 
     setError("");
-    setPlan(null); // optional: if you want to stop showing the plan UI
+    setPlan(null);
     setPaymentIntent(null);
     setExecuteResp(null);
 
@@ -1231,7 +1093,8 @@ export default function LocationPage() {
         return;
       }
 
-      // This creates new on-chain orders through your proposer route
+      // ✅ This is the flow:
+      // UI → /api/orders/propose → server runs AI planning and broadcasts txs immediately
       const res = await fetch(
         `/api/orders/propose?locationId=${encodeURIComponent(locationId)}`,
         {
@@ -1240,7 +1103,11 @@ export default function LocationPage() {
           body: JSON.stringify({
             env,
             ownerAddress: owner,
-            pendingWindowHours: 24,
+
+            // ✅ no pending period / no approval step
+            pendingWindowHours: 0,
+
+            // ✅ pass control knobs
             strategy,
             horizonDays,
             notes: formatContextForNotes(additionalContext),
@@ -1257,7 +1124,7 @@ export default function LocationPage() {
         return;
       }
 
-      // refresh list immediately so the new orders appear
+      // ✅ immediately refresh Orders section so executed order details appear
       await refreshOrders();
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -1314,6 +1181,25 @@ export default function LocationPage() {
         }
 
         setSupplierByAddress(map);
+        // ✅ Build price + uom maps from state.skus[]
+        const skus = Array.isArray(json?.skus) ? json.skus : [];
+
+        const nextPriceBySku: Record<string, number> = {};
+        const nextUomBySku: Record<string, string> = {};
+
+        for (const s of skus) {
+          const sku = String(s?.sku ?? "");
+          if (!sku) continue;
+
+          const unitCost = Number(s?.unitCostUsd ?? 0);
+          nextPriceBySku[sku] = Number.isFinite(unitCost) ? unitCost : 0;
+
+          const uom = String(s?.unit ?? "");
+          if (uom) nextUomBySku[sku] = uom;
+        }
+
+        setPriceBySku(nextPriceBySku);
+        setUomBySku(nextUomBySku);
       })
       .catch(() => {
         // ignore
@@ -1347,42 +1233,6 @@ export default function LocationPage() {
     if (!locationId) return;
     // one fetch on mount for this location
     refreshOrders();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationId]);
-
-  useEffect(() => {
-    if (!locationId) return;
-
-    let canceled = false;
-
-    // Function to check if we should auto-update orders
-    const checkAndUpdateOrders = async () => {
-      if (canceled) return;
-      if (typeof document !== "undefined" && document.hidden) return;
-
-      const nowMs = Date.now();
-      const timeSinceLastUpdate = nowMs - lastOrdersAutoUpdateAt.current;
-
-      // Only update if 12 hours have passed since last auto-update
-      if (timeSinceLastUpdate >= ordersAutoUpdateIntervalMs) {
-        lastOrdersAutoUpdateAt.current = nowMs;
-        await refreshOrders();
-      }
-    };
-
-    // Check immediately on mount
-    checkAndUpdateOrders();
-
-    // Then check every hour (every 60 minutes), reducing unnecessary checks
-    const id = window.setInterval(() => {
-      checkAndUpdateOrders();
-    }, 60 * 60 * 1000); // 1 hour
-
-    return () => {
-      canceled = true;
-      window.clearInterval(id);
-    };
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
@@ -1620,9 +1470,23 @@ export default function LocationPage() {
 
                 <button
                   type="button"
-                  onClick={() =>
-                    setDemoNowOffsetMs((x) => x + 24 * 60 * 60 * 1000)
-                  }
+                  onClick={async () => {
+                    const DAY = 24 * 60 * 60 * 1000;
+                    const next = demoNowOffsetMs + DAY;
+
+                    // update state
+                    setDemoNowOffsetMs(next);
+
+                    // ✅ write immediately so navigation can't skip persistence
+                    try {
+                      window.localStorage.setItem(
+                        demoTimeKey(locationId),
+                        String(next)
+                      );
+                    } catch {}
+
+                    await consumeInventoryForSimulatedDays(1);
+                  }}
                   style={btnSoft(false)}
                   title="Fast-forward the UI by 1 day"
                 >
@@ -1900,58 +1764,123 @@ export default function LocationPage() {
                   </HelpDot>
                 </div>
 
-                {/* Input row: context + days + add */}
+                {/* Input row: context + (days label+input) + indefinite toggle + add */}
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 160px auto",
+                    gridTemplateColumns: "1fr 220px auto",
                     gap: 10,
-                    alignItems: "center",
+                    alignItems: "end", // ✅ makes inputs line up even with labels
                   }}
                 >
-                  <input
-                    value={contextDraft}
-                    onChange={(e) => setContextDraft(e.target.value)}
-                    placeholder='e.g. "Big game Sunday → expect +20% wings"'
-                    style={{
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                      border: `1px solid ${COLORS.border}`,
-                      background: "rgba(255,255,255,0.85)",
-                      color: COLORS.text,
-                      fontWeight: 800,
-                      outline: "none",
-                    }}
-                  />
+                  {/* Context text */}
+                  <div style={{ display: "grid", gap: 6, minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        color: COLORS.subtext,
+                        fontSize: 12,
+                      }}
+                    >
+                      Context
+                    </div>
 
-                  <input
-                    inputMode="numeric"
-                    pattern="[0-9]*"
-                    value={contextDaysDraft}
-                    onChange={(e) =>
-                      setContextDaysDraft(sanitizeIntDraft(e.target.value))
-                    }
-                    onBlur={() => {
-                      const normalized = draftToClampedInt(
-                        contextDaysDraft,
-                        1,
-                        365
-                      );
-                      setContextDaysDraft(String(normalized));
-                    }}
-                    onFocus={(e) => e.currentTarget.select()}
-                    placeholder="Days"
-                    style={{
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                      border: `1px solid ${COLORS.border}`,
-                      background: "rgba(255,255,255,0.85)",
-                      color: COLORS.text,
-                      fontWeight: 800,
-                      outline: "none",
-                    }}
-                  />
+                    <textarea
+                      value={contextDraft}
+                      onChange={(e) => setContextDraft(e.target.value)}
+                      placeholder='e.g. "Big game Sunday → expect +20% wings"'
+                      rows={1} // 👈 starts taller than 1 line
+                      style={{
+                        padding: "12px 12px",
+                        borderRadius: 12,
+                        border: `1px solid ${COLORS.border}`,
+                        background: "rgba(255,255,255,0.85)",
+                        color: COLORS.text,
+                        fontWeight: 800,
+                        outline: "none",
+                        width: "100%",
+                        resize: "vertical", // 👈 user can drag taller if needed
+                        lineHeight: 1.35,
+                        whiteSpace: "pre-wrap",
+                      }}
+                    />
+                  </div>
 
+                  {/* Applies for (days) + Indefinite checkbox underneath */}
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        color: COLORS.subtext,
+                        fontSize: 12,
+                      }}
+                    >
+                      Applies for (days)
+                    </div>
+
+                    <input
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={contextIndefDraft ? "∞" : contextDaysDraft}
+                      readOnly={contextIndefDraft}
+                      onChange={(e) => {
+                        if (contextIndefDraft) return;
+                        setContextDaysDraft(sanitizeIntDraft(e.target.value));
+                      }}
+                      onBlur={() => {
+                        if (contextIndefDraft) return;
+                        const normalized = draftToClampedInt(
+                          contextDaysDraft,
+                          1,
+                          365
+                        );
+                        setContextDaysDraft(String(normalized));
+                      }}
+                      onFocus={(e) => {
+                        if (contextIndefDraft) return;
+                        e.currentTarget.select();
+                      }}
+                      placeholder="Days"
+                      style={{
+                        padding: "10px 12px",
+                        borderRadius: 12,
+                        border: `1px solid ${COLORS.border}`,
+                        background: contextIndefDraft
+                          ? "rgba(15,23,42,0.04)"
+                          : "rgba(255,255,255,0.85)",
+                        color: COLORS.text,
+                        fontWeight: 900,
+                        outline: "none",
+                        textAlign: "right",
+                        cursor: contextIndefDraft ? "default" : "text",
+                      }}
+                    />
+
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        fontWeight: 800, // slightly lighter
+                        fontSize: 12, // 👈 smaller text
+                        color: COLORS.subtext, // softer color
+                        cursor: "pointer",
+                        userSelect: "none",
+                        marginTop: 2,
+                      }}
+                      title="If enabled, this context will never expire"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={contextIndefDraft}
+                        onChange={(e) => setContextIndefDraft(e.target.checked)}
+                        style={{ width: 14, height: 14 }} // slightly smaller checkbox
+                      />
+                      Make Indefinite
+                    </label>
+                  </div>
+
+                  {/* Add button */}
                   <button
                     type="button"
                     onClick={() => {
@@ -1960,9 +1889,12 @@ export default function LocationPage() {
                       if (!owner || !locationId) return;
 
                       const text = contextDraft.trim();
-                      const days = draftToClampedInt(contextDaysDraft, 1, 365);
-
                       if (!text) return;
+
+                      // ✅ durationDays: 0 means indefinite
+                      const days = contextIndefDraft
+                        ? 0
+                        : draftToClampedInt(contextDaysDraft, 1, 365);
 
                       const nextItem: AdditionalContextItem = {
                         id: `${Date.now()}_${Math.random()
@@ -1980,8 +1912,7 @@ export default function LocationPage() {
                       });
 
                       setContextDraft("");
-                      // keep days as-is (nice UX), or reset if you want:
-                      // setContextDaysDraft("7");
+                      // keep days/toggle as-is for quick entry
                     }}
                     disabled={!contextDraft.trim()}
                     style={btnSoft(!contextDraft.trim())}
@@ -2000,8 +1931,11 @@ export default function LocationPage() {
                   <div style={{ display: "grid", gap: 8 }}>
                     {additionalContext.map((it) => {
                       const active = isContextActive(it);
-                      const expiresAtMs =
-                        it.createdAtMs + it.durationDays * 24 * 60 * 60 * 1000;
+                      const indefinite = Number(it.durationDays ?? 0) === 0;
+                      const expiresAtMs = indefinite
+                        ? null
+                        : it.createdAtMs +
+                          it.durationDays * 24 * 60 * 60 * 1000;
 
                       return (
                         <div
@@ -2075,10 +2009,22 @@ export default function LocationPage() {
                               fontSize: 12,
                             }}
                           >
-                            <div>Applies for: {it.durationDays} days</div>
                             <div>
-                              Expires: {new Date(expiresAtMs).toLocaleString()}
+                              Applies for:{" "}
+                              {indefinite
+                                ? "Indefinite"
+                                : `${it.durationDays} days`}
                             </div>
+
+                            <div>
+                              Expires:{" "}
+                              {indefinite
+                                ? "Never"
+                                : new Date(
+                                    expiresAtMs as number
+                                  ).toLocaleString()}
+                            </div>
+
                             <div style={{ fontWeight: 950 }}>
                               {active ? "Active" : "Expired"}
                             </div>
@@ -2204,19 +2150,51 @@ export default function LocationPage() {
                       const execAt = Number(
                         it.executeAfter ?? intent.executeAfter ?? 0
                       );
-                      const lines = Array.isArray(it.lines) ? it.lines : [];
+                      const lines = Array.isArray((it as any).lines)
+                        ? (it as any).lines
+                        : [];
 
-                      return lines.map((ln) => ({
-                        supplierName: sup.name,
-                        supplierAddr: sup.address,
-                        executeAfter: execAt,
-                        orderId: String(it.orderId || ""),
-                        sku: String(ln.sku || ""),
-                        name: ln.name ? String(ln.name) : "",
-                        qty: Number(ln.qty ?? 0),
-                        uom: ln.uom ? String(ln.uom) : "",
-                      }));
+                      return lines.map((ln: any) => {
+                        const qty =
+                          Number(ln?.qty ?? ln?.units ?? ln?.quantity ?? 0) ||
+                          0;
+
+                        const sku = String(ln?.sku || ln?.skuId || "");
+                        const unitPrice = priceBySku[sku] ?? 0;
+                        const lineTotal = qty * unitPrice;
+
+                        return {
+                          supplierName: sup.name,
+                          supplierAddr: sup.address,
+                          executeAfter: execAt,
+                          orderId: String(
+                            (it as any).orderId || (it as any).id || ""
+                          ),
+                          sku,
+                          name: ln?.name ? String(ln.name) : "",
+                          qty,
+                          uom: ln?.uom ? String(ln.uom) : uomBySku[sku] ?? "",
+                          unitPrice,
+                          lineTotal,
+                        };
+                      });
                     });
+
+                    // -------------------------
+                    // ✅ Real computed totals (qty × unitPrice)
+                    // -------------------------
+                    const computedTotalUsd = skuRows.reduce((acc, r) => {
+                      const qty = Number(r.qty) || 0;
+                      const unitPrice = Number(r.unitPrice) || 0;
+                      if (!Number.isFinite(qty) || !Number.isFinite(unitPrice))
+                        return acc;
+                      return acc + qty * unitPrice;
+                    }, 0);
+
+                    // Helpful flags for fallback logic
+                    const hasAnyPricedLine = skuRows.some(
+                      (r) => Number.isFinite(r.unitPrice) && r.unitPrice > 0
+                    );
 
                     const arrivalLabelForSupplier = (
                       supplierAddr: string,
@@ -2239,11 +2217,20 @@ export default function LocationPage() {
                       }
                     }, BigInt(0));
 
+                    // ✅ Prefer computed price totals. Fallback to raw on-chain total if we have no priced lines.
                     let costStr = "—";
-                    try {
-                      const usd = Number(formatUnits(totalRaw, 18));
-                      costStr = `$${usd.toFixed(2)}`;
-                    } catch {}
+
+                    if (hasAnyPricedLine) {
+                      costStr = `$${computedTotalUsd.toFixed(2)}`;
+                    } else {
+                      // fallback (old behavior)
+                      try {
+                        const usd = Number(formatUnits(totalRaw, 18));
+                        costStr = `$${usd.toFixed(2)}`;
+                      } catch {
+                        costStr = "—";
+                      }
+                    }
 
                     const supplierAddrs = Array.from(
                       new Set(
@@ -2335,19 +2322,6 @@ export default function LocationPage() {
                             >
                               Suppliers: {supplierSummary || "—"}
                             </div>
-
-                            {/* Row 3: Execution timer (intent-level) */}
-                            <div
-                              style={{
-                                color: COLORS.subtext,
-                                fontWeight: 800,
-                                fontSize: 13,
-                              }}
-                            >
-                              {fmtExecutionCountdown(
-                                Number(intent.executeAfter)
-                              )}
-                            </div>
                           </div>
 
                           <div
@@ -2395,35 +2369,6 @@ export default function LocationPage() {
                                   : "Approve"}
                               </button>
                             ) : null}
-
-                            <button
-                              type="button"
-                              onClick={() => cancelIntentCard(intent)}
-                              disabled={
-                                cancelAnyUi || cancelingOrderKey === key
-                              }
-                              title="Cancel all orders in this intent (owner override)"
-                              style={{
-                                padding: "10px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.dangerBorder}`,
-                                background: COLORS.dangerBg,
-                                color: COLORS.dangerText,
-                                fontWeight: 950,
-                                cursor:
-                                  cancelAnyUi || cancelingOrderKey === key
-                                    ? "not-allowed"
-                                    : "pointer",
-                                opacity:
-                                  cancelAnyUi || cancelingOrderKey === key
-                                    ? 0.7
-                                    : 1,
-                              }}
-                            >
-                              {cancelAnyUi || cancelingOrderKey === key
-                                ? "Deleting…"
-                                : "Delete"}
-                            </button>
 
                             <button
                               type="button"
@@ -2538,16 +2483,7 @@ export default function LocationPage() {
                                         Quantity
                                       </th>
 
-                                      <th
-                                        style={{
-                                          textAlign: "right",
-                                          padding: 12,
-                                          fontWeight: 950,
-                                        }}
-                                      >
-                                        Price
-                                      </th>
-
+                                      {/* ✅ Supplier becomes 3rd column */}
                                       <th
                                         style={{
                                           textAlign: "left",
@@ -2556,6 +2492,17 @@ export default function LocationPage() {
                                         }}
                                       >
                                         Supplier
+                                      </th>
+
+                                      {/* ✅ Price becomes 4th column */}
+                                      <th
+                                        style={{
+                                          textAlign: "right",
+                                          padding: 12,
+                                          fontWeight: 950,
+                                        }}
+                                      >
+                                        Price
                                       </th>
 
                                       <th
@@ -2603,21 +2550,7 @@ export default function LocationPage() {
                                           {r.uom ? ` ${r.uom}` : ""}
                                         </td>
 
-                                        {/* Price (placeholder until you have SKU price wired) */}
-                                        <td
-                                          style={{
-                                            padding: 12,
-                                            borderTop: "1px solid #eef2f7",
-                                            textAlign: "right",
-                                            fontWeight: 950,
-                                            color: COLORS.text,
-                                            whiteSpace: "nowrap",
-                                          }}
-                                        >
-                                          —
-                                        </td>
-
-                                        {/* Supplier */}
+                                        {/* Supplier (✅ now 3rd column) */}
                                         <td
                                           style={{
                                             padding: 12,
@@ -2642,6 +2575,22 @@ export default function LocationPage() {
                                           </div>
                                         </td>
 
+                                        {/* Price (✅ now 4th column) */}
+                                        <td
+                                          style={{
+                                            padding: 12,
+                                            borderTop: "1px solid #eef2f7",
+                                            textAlign: "right",
+                                            fontWeight: 950,
+                                            color: COLORS.text,
+                                            whiteSpace: "nowrap",
+                                          }}
+                                        >
+                                          {r.unitPrice > 0
+                                            ? `$${r.unitPrice.toFixed(2)}`
+                                            : "—"}
+                                        </td>
+
                                         {/* Arrival Time */}
                                         <td
                                           style={{
@@ -2663,6 +2612,7 @@ export default function LocationPage() {
 
                                   <tfoot>
                                     <tr>
+                                      {/* Total label spans SKU + Quantity + Supplier */}
                                       <td
                                         style={{
                                           padding: 12,
@@ -2670,10 +2620,12 @@ export default function LocationPage() {
                                           fontWeight: 950,
                                           color: COLORS.text,
                                         }}
-                                        colSpan={2}
+                                        colSpan={3}
                                       >
                                         Total
                                       </td>
+
+                                      {/* Total amount goes in the Price column */}
                                       <td
                                         style={{
                                           padding: 12,
@@ -2681,10 +2633,19 @@ export default function LocationPage() {
                                           textAlign: "right",
                                           fontWeight: 950,
                                           color: COLORS.text,
+                                          whiteSpace: "nowrap",
                                         }}
                                       >
                                         {costStr}
                                       </td>
+
+                                      {/* Blank cell for Arrival Time column */}
+                                      <td
+                                        style={{
+                                          padding: 12,
+                                          borderTop: `2px solid ${COLORS.border}`,
+                                        }}
+                                      />
                                     </tr>
                                   </tfoot>
                                 </table>

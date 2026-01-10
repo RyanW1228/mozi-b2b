@@ -65,16 +65,6 @@ const TREASURY_HUB_ABI = [
   "function withdraw(uint256 amount) external",
   "function withdrawAvailable() external",
   "function balanceOf(address owner) view returns (uint256)",
-  "function reservedOf(address owner) view returns (uint256)",
-  "function availableToWithdraw(address owner) view returns (uint256)",
-
-  // Agent permission (still needed for auto-proposals)
-  "function setAgent(address agent, bool allowed) external",
-  "function isAgentFor(address owner, address agent) view returns (bool)",
-
-  // ✅ Execution mode (THIS is what your toggle controls now)
-  "function setRequireApprovalForExecution(bool required) external",
-  "function requireApprovalForExecution(address owner) view returns (bool)",
 ] as const;
 
 const ERC20_APPROVE_ABI = [
@@ -156,7 +146,6 @@ export default function Home() {
   const [availableToWithdraw, setAvailableToWithdraw] = useState<string | null>(
     null
   );
-  const [lockedMnee, setLockedMnee] = useState<string | null>(null);
 
   const [treasuryAvailable, setTreasuryAvailable] = useState<string | null>(
     null
@@ -167,56 +156,14 @@ export default function Home() {
 
   const [isDepositing, setIsDepositing] = useState(false);
 
-  const [agentEnabled, setAgentEnabled] = useState<boolean | null>(null);
-
-  // execution mode: true => Manual (approval required), false => Autonomous
-  const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
-
-  const [isEnablingAgent, setIsEnablingAgent] = useState(false);
-  const attemptedEnableRef = useRef<string>(""); // `${env}:${owner}:${chainIdHex}`
-
-  const [isTogglingMode, setIsTogglingMode] = useState(false);
-
-  const [showAutonomyInfo, setShowAutonomyInfo] = useState(false);
-  const autonomyInfoWrapRef = useRef<HTMLDivElement | null>(null);
-
   const cfg = env === "testing" ? TESTING : PRODUCTION;
 
   const isCorrectChain =
     !!chainIdHex && chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
 
-  // Hard guard: only allow enabling autonomy if treasury has funds (available or locked)
-  const hasTreasuryFunds =
-    (availableToWithdraw !== null && availableToWithdraw !== "0") ||
-    (lockedMnee !== null && lockedMnee !== "0");
-
   useEffect(() => {
     addressRef.current = address;
   }, [address]);
-
-  useEffect(() => {
-    function onDown(e: MouseEvent | TouchEvent) {
-      if (!showAutonomyInfo) return;
-      const el = autonomyInfoWrapRef.current;
-      if (!el) return;
-      if (e.target instanceof Node && el.contains(e.target)) return;
-      setShowAutonomyInfo(false);
-    }
-
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setShowAutonomyInfo(false);
-    }
-
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("touchstart", onDown);
-    document.addEventListener("keydown", onKey);
-
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("touchstart", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [showAutonomyInfo]);
 
   useEffect(() => {
     chainIdHexRef.current = chainIdHex;
@@ -561,20 +508,8 @@ export default function Home() {
         // ✅ Validate addresses BEFORE passing them to ethers
         if (!isAddress(TREASURY_HUB_ADDRESS)) {
           setAvailableToWithdraw(null);
-          setLockedMnee(null);
-          setAgentEnabled(null);
           setError(`Invalid TREASURY_HUB_ADDRESS: ${TREASURY_HUB_ADDRESS}`);
           return;
-        }
-
-        const agentOk = MOZI_AGENT_ADDRESS
-          ? isAddress(MOZI_AGENT_ADDRESS)
-          : false;
-        if (MOZI_AGENT_ADDRESS && !agentOk) {
-          // Still allow showing balances; just treat autonomy as unknown.
-          setAgentEnabled(null);
-          setError(`Invalid MOZI_AGENT_ADDRESS: ${MOZI_AGENT_ADDRESS}`);
-          // Do NOT return; continue reading balances without isAgentFor
         }
 
         try {
@@ -584,41 +519,20 @@ export default function Home() {
             provider
           );
 
-          const [rawAvail, rawReserved, allowed, reqApproval] =
-            await Promise.all([
-              (hub as any).availableToWithdraw(address) as Promise<bigint>,
-              (hub as any).reservedOf(address) as Promise<bigint>,
-              agentOk
-                ? ((hub as any).isAgentFor(
-                    address,
-                    MOZI_AGENT_ADDRESS
-                  ) as Promise<boolean>)
-                : Promise.resolve(false),
-              (hub as any).requireApprovalForExecution(
-                address
-              ) as Promise<boolean>,
-            ]);
+          // New hub: show the owner's treasury balance.
+          // (This is what you want for Testing; it also works for Production.)
+          const rawBal = (await (hub as any).balanceOf(address)) as bigint;
 
           setAvailableToWithdraw(
-            trimTo6Decimals(formatUnits(rawAvail, decimals))
+            trimTo6Decimals(formatUnits(rawBal, decimals))
           );
-          setLockedMnee(trimTo6Decimals(formatUnits(rawReserved, decimals)));
-          setAgentEnabled(Boolean(allowed));
-          setRequireApproval(Boolean(reqApproval));
         } catch (e: any) {
           setAvailableToWithdraw(null);
-          setLockedMnee(null);
-          setAgentEnabled(null);
-          setRequireApproval(null);
-
           const msg = e?.shortMessage || e?.reason || e?.message || String(e);
           setError(`Treasury read failed: ${msg}`);
         }
       } else {
         setAvailableToWithdraw(null);
-        setLockedMnee(null);
-        setAgentEnabled(null);
-        setRequireApproval(null);
       }
     } catch (e: any) {
       setError(e?.message ?? String(e));
@@ -770,124 +684,6 @@ export default function Home() {
       setIsWithdrawing(false);
     }
   }
-
-  async function setExecutionMode(nextAutonomous: boolean) {
-    if (!hasProvider || !address) return;
-
-    if (!isCorrectChain) {
-      setError(`Switch to ${cfg.name} to change mode.`);
-      return;
-    }
-
-    if (!TREASURY_HUB_ADDRESS) {
-      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
-      return;
-    }
-
-    try {
-      setError(null);
-      setIsTogglingMode(true);
-
-      const ethereum = (window as any).ethereum;
-      const provider = new BrowserProvider(ethereum);
-      const signer = await provider.getSigner();
-
-      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
-
-      // Manual = requireApprovalForExecution(true)
-      // Autonomous = requireApprovalForExecution(false)
-      const nextRequired = !nextAutonomous;
-
-      const tx = await (hub as any).setRequireApprovalForExecution(
-        nextRequired
-      );
-      await tx.wait();
-
-      await refreshBalances();
-    } catch (e: any) {
-      if (!shouldSuppressWalletError(e)) {
-        setError(e?.message ?? String(e));
-      }
-    } finally {
-      setIsTogglingMode(false);
-    }
-  }
-
-  async function ensureAgentEnabled() {
-    if (!hasProvider || !address) return;
-    if (!isCorrectChain) return;
-    if (!TREASURY_HUB_ADDRESS || !MOZI_AGENT_ADDRESS) return;
-
-    // Validate addresses
-    if (!isAddress(TREASURY_HUB_ADDRESS) || !isAddress(MOZI_AGENT_ADDRESS))
-      return;
-
-    // Only attempt once per (env, owner, chain)
-    const attemptKey = `${env}:${address.toLowerCase()}:${
-      chainIdHex?.toLowerCase() ?? ""
-    }`;
-    if (attemptedEnableRef.current === attemptKey) return;
-
-    // If we already know it's enabled, skip
-    if (agentEnabled === true) {
-      attemptedEnableRef.current = attemptKey;
-      return;
-    }
-
-    try {
-      setIsEnablingAgent(true);
-
-      const ethereum = (window as any).ethereum;
-      const provider = new BrowserProvider(ethereum);
-      const signer = await provider.getSigner();
-
-      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
-
-      // Double-check on-chain (don’t rely only on state)
-      const allowed = (await (hub as any).isAgentFor(
-        address,
-        MOZI_AGENT_ADDRESS
-      )) as boolean;
-
-      if (allowed) {
-        setAgentEnabled(true);
-        attemptedEnableRef.current = attemptKey;
-        return;
-      }
-
-      const tx = await (hub as any).setAgent(MOZI_AGENT_ADDRESS, true);
-      await tx.wait();
-
-      attemptedEnableRef.current = attemptKey;
-      await refreshBalances();
-    } catch (e: any) {
-      // If user rejects, don’t keep retrying forever
-      attemptedEnableRef.current = attemptKey;
-
-      if (!shouldSuppressWalletError(e)) {
-        setError(e?.message ?? String(e));
-      }
-    } finally {
-      setIsEnablingAgent(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!address) return;
-    if (!isCorrectChain) return;
-    if (!TREASURY_HUB_ADDRESS || !MOZI_AGENT_ADDRESS) return;
-
-    // Fire and forget (internal handles anti-spam)
-    ensureAgentEnabled();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    address,
-    env,
-    chainIdHex,
-    isCorrectChain,
-    TREASURY_HUB_ADDRESS,
-    MOZI_AGENT_ADDRESS,
-  ]);
 
   // Persist env choice locally (UI-only toggle)
   useEffect(() => {
@@ -1073,260 +869,6 @@ export default function Home() {
           </div>
         </section>
 
-        {/* AI Autonomy */}
-        {address && (
-          <section style={cardStyle}>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 12,
-                alignItems: "center",
-                flexWrap: "wrap",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={{ fontWeight: 900 }}>AI Autonomy</div>
-
-                {/* Info bubble + popover */}
-                <div
-                  ref={autonomyInfoWrapRef}
-                  style={{
-                    position: "relative",
-                    display: "inline-flex",
-                    alignItems: "center",
-                  }}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setShowAutonomyInfo((v) => !v)}
-                    aria-label="What does AI autonomy mean?"
-                    aria-expanded={showAutonomyInfo}
-                    style={{
-                      width: 20,
-                      height: 20,
-                      borderRadius: "50%",
-                      background: "#e5e7eb",
-                      color: "#1f2937",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 12,
-                      fontWeight: 900,
-                      cursor: "pointer",
-                      userSelect: "none",
-                      border: "1px solid #cbd5e1",
-                      padding: 0,
-                      lineHeight: "20px",
-                    }}
-                  >
-                    ?
-                  </button>
-
-                  {showAutonomyInfo && (
-                    <div
-                      style={{
-                        position: "absolute",
-                        top: 28,
-                        left: 0,
-                        zIndex: 50,
-                        width: 320,
-                        maxWidth: "min(320px, 80vw)",
-                        background: "#ffffff",
-                        border: "1px solid #e5e7eb",
-                        borderRadius: 12,
-                        boxShadow: "0 10px 20px rgba(0,0,0,0.12)",
-                        padding: 12,
-                      }}
-                    >
-                      {/* Little arrow */}
-                      <div
-                        style={{
-                          position: "absolute",
-                          top: -6,
-                          left: 10,
-                          width: 12,
-                          height: 12,
-                          background: "#ffffff",
-                          borderLeft: "1px solid #e5e7eb",
-                          borderTop: "1px solid #e5e7eb",
-                          transform: "rotate(45deg)",
-                        }}
-                      />
-
-                      <div style={{ fontWeight: 900, marginBottom: 6 }}>
-                        What happens?
-                      </div>
-
-                      <div
-                        style={{
-                          color: COLORS.subtext,
-                          fontWeight: 700,
-                          fontSize: 13,
-                        }}
-                      >
-                        When enabled, Mozi can reserve funds and execute
-                        payments after the pending window unless you cancel/edit
-                        the order before execution.
-                      </div>
-
-                      <div
-                        style={{
-                          marginTop: 10,
-                          display: "flex",
-                          justifyContent: "flex-end",
-                        }}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => setShowAutonomyInfo(false)}
-                          style={{
-                            padding: "8px 12px",
-                            borderRadius: 10,
-                            border: "none",
-                            background: COLORS.danger, // red fill
-                            color: COLORS.buttonTextLight, // white text
-                            fontWeight: 900,
-                            cursor: "pointer",
-                          }}
-                        >
-                          Close
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                {requireApproval === null ? (
-                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                    Loading…
-                  </div>
-                ) : (
-                  <div style={{ color: COLORS.subtext, fontWeight: 900 }}>
-                    {requireApproval ? "Manual" : "Autonomous"}
-                  </div>
-                )}
-
-                <button
-                  onClick={() => {
-                    // Toggle between Manual <-> Autonomous
-                    const currentlyManual = Boolean(requireApproval);
-                    const nextAutonomous = currentlyManual; // if manual -> autonomous, else -> manual
-                    setExecutionMode(nextAutonomous);
-                  }}
-                  disabled={
-                    isTogglingMode ||
-                    requireApproval === null ||
-                    !address ||
-                    !TREASURY_HUB_ADDRESS ||
-                    !isCorrectChain
-                  }
-                  style={{
-                    width: 58,
-                    height: 34,
-                    borderRadius: 999,
-                    border: "1px solid #cbd5e1",
-                    background: !requireApproval ? "#0f172a" : "#e5e7eb",
-                    padding: 4,
-                    cursor:
-                      isTogglingMode ||
-                      requireApproval === null ||
-                      !address ||
-                      !TREASURY_HUB_ADDRESS ||
-                      !isCorrectChain
-                        ? "not-allowed"
-                        : "pointer",
-                    opacity:
-                      isTogglingMode ||
-                      requireApproval === null ||
-                      !address ||
-                      !TREASURY_HUB_ADDRESS ||
-                      !isCorrectChain
-                        ? 0.6
-                        : 1,
-                    transition: "background 150ms ease",
-                    position: "relative",
-                  }}
-                  aria-label="Toggle AI autonomy"
-                >
-                  <div
-                    style={{
-                      width: 26,
-                      height: 26,
-                      borderRadius: 999,
-                      background: "#ffffff",
-                      position: "absolute",
-                      top: 3,
-                      left: !requireApproval ? 29 : 3,
-                      transition: "left 150ms ease",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.12)",
-                    }}
-                  />
-                </button>
-                {isEnablingAgent && (
-                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                    Enabling agent…
-                  </div>
-                )}
-
-                {isTogglingMode && (
-                  <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
-                    Updating…
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {agentEnabled === false && (
-              <div
-                style={{
-                  color: "#92400e",
-                  background: "#fffbeb",
-                  border: "1px solid #fde68a",
-                  padding: 10,
-                  borderRadius: 12,
-                  fontWeight: 700,
-                }}
-              >
-                Mozi Agent is currently <b>not authorized</b> for this wallet.
-                Proposals won’t appear until it’s enabled.
-              </div>
-            )}
-
-            {!isCorrectChain && (
-              <div
-                style={{
-                  color: "#92400e",
-                  background: "#fffbeb",
-                  border: "1px solid #fde68a",
-                  padding: 10,
-                  borderRadius: 12,
-                  fontWeight: 700,
-                }}
-              >
-                Switch to <b>{cfg.name}</b> to change autonomy.
-              </div>
-            )}
-
-            {!MOZI_AGENT_ADDRESS && (
-              <div
-                style={{
-                  color: "#92400e",
-                  background: "#fffbeb",
-                  border: "1px solid #fde68a",
-                  padding: 10,
-                  borderRadius: 12,
-                  fontWeight: 700,
-                }}
-              >
-                Missing <b>NEXT_PUBLIC_MOZI_AGENT_ADDRESS</b> in .env.local.
-              </div>
-            )}
-          </section>
-        )}
-
         {/* Treasury */}
         {address && (
           <section style={cardStyle}>
@@ -1398,11 +940,6 @@ export default function Home() {
                   Denominated in {tokenSymbol ?? cfg.tokenLabel}
                 </div>
               </div>
-              {/* Locked row: label left, value right */}
-              <div style={{ color: COLORS.subtext, fontWeight: 700 }}>
-                Locked
-              </div>
-              <div style={{ fontWeight: 900 }}>{lockedMnee ?? "…"}</div>
             </div>
 
             <div
