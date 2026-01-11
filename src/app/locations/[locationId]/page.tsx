@@ -117,7 +117,16 @@ function strategyLabel(
 }
 
 function demoTimeKey(locationId: string) {
-  return `mozi_demo_time_offset_ms:${locationId}`;
+  // store the absolute simulated "now" (ms since epoch), not an offset
+  return `mozi_demo_time_now_ms:${locationId}`;
+}
+
+function demoConsumedKey(locationId: string) {
+  return `mozi_demo_consumed_units:${locationId}`;
+}
+
+function demoConsumeStatsKey(locationId: string) {
+  return `mozi_demo_consume_stats:${locationId}`;
 }
 
 function chatMemoryKey(env: string, owner: string, locationId: string) {
@@ -320,25 +329,22 @@ export default function LocationPage() {
   const [error, setError] = useState<string>("");
 
   // --- Demo time travel (UI-only) ---
-  const [demoNowOffsetMs, setDemoNowOffsetMs] = useState(0);
+  // Store absolute simulated "now" (ms since epoch). Persist to localStorage.
+  const [demoNowMsAbs, setDemoNowMsAbs] = useState<number | null>(null);
 
-  // --- Demo time travel (UI-only) ---
-  const demoTimeHydratedRef = useRef(false);
+  const [demoConsumedUnits, setDemoConsumedUnits] = useState<number>(0);
+  const [demoThrownOutUnits, setDemoThrownOutUnits] = useState<number>(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!locationId) return;
 
     try {
-      const raw = window.localStorage.getItem(demoTimeKey(locationId));
-      if (raw != null) {
-        const n = Number(raw);
-        if (Number.isFinite(n)) setDemoNowOffsetMs(n);
-      }
+      const raw = window.localStorage.getItem(demoConsumedKey(locationId));
+      const n = raw != null ? Number(raw) : NaN;
+      setDemoConsumedUnits(Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0);
     } catch {
-      // ignore
-    } finally {
-      demoTimeHydratedRef.current = true;
+      setDemoConsumedUnits(0);
     }
   }, [locationId]);
 
@@ -346,21 +352,52 @@ export default function LocationPage() {
     if (typeof window === "undefined") return;
     if (!locationId) return;
 
-    // don't save until we've loaded once
-    if (!demoTimeHydratedRef.current) return;
-
     try {
       window.localStorage.setItem(
-        demoTimeKey(locationId),
-        String(demoNowOffsetMs)
+        demoConsumedKey(locationId),
+        String(demoConsumedUnits)
       );
     } catch {
       // ignore
     }
-  }, [demoNowOffsetMs, locationId]);
+  }, [demoConsumedUnits, locationId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!locationId) return;
+
+    try {
+      const raw = window.localStorage.getItem(demoTimeKey(locationId));
+      const stored = raw != null ? Number(raw) : NaN;
+
+      if (Number.isFinite(stored) && stored > 0) {
+        setDemoNowMsAbs(stored);
+      } else {
+        setDemoNowMsAbs(Date.now());
+      }
+    } catch {
+      setDemoNowMsAbs(Date.now());
+    }
+  }, [locationId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!locationId) return;
+    if (demoNowMsAbs == null) return;
+
+    try {
+      window.localStorage.setItem(
+        demoTimeKey(locationId),
+        String(demoNowMsAbs)
+      );
+    } catch {
+      // ignore
+    }
+  }, [demoNowMsAbs, locationId]);
 
   function demoNowMs() {
-    return Date.now() + demoNowOffsetMs;
+    // fallback so UI doesn't crash before hydration completes
+    return demoNowMsAbs ?? Date.now();
   }
 
   // --- Simulate inventory depletion (UI-only time travel drives server inventory) ---
@@ -501,6 +538,8 @@ export default function LocationPage() {
 
   const [showAutonomyInfo, setShowAutonomyInfo] = useState(false);
   const autonomyInfoWrapRef = useRef<HTMLDivElement | null>(null);
+
+  const [showContextEditor, setShowContextEditor] = useState(false);
 
   // -------------------------
   // On-chain orders (grouped by intent ref)
@@ -670,10 +709,17 @@ export default function LocationPage() {
     AdditionalContextItem[]
   >([]);
 
+  const [contextListOpen, setContextListOpen] = useState(false);
+
   // Draft inputs
   const [contextDraft, setContextDraft] = useState("");
   const [contextDaysDraft, setContextDaysDraft] = useState("7");
   const [contextIndefDraft, setContextIndefDraft] = useState(false);
+
+  useEffect(() => {
+    if (additionalContext.length > 0) setContextListOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
 
   useEffect(() => {
     function onDown(e: MouseEvent | TouchEvent) {
@@ -823,6 +869,14 @@ export default function LocationPage() {
     {}
   );
 
+  // --- Planned order editing (inline in dropdown) ---
+  const [editingPlannedId, setEditingPlannedId] = useState<string | null>(null);
+
+  // plannedId -> rowKey -> draftQty
+  const [plannedQtyDrafts, setPlannedQtyDrafts] = useState<
+    Record<string, Record<string, string>>
+  >({});
+
   // Supplier display map: payoutAddress(lower) -> { name, address }
   // Supplier display map: payoutAddress(lower) -> { name, address, leadTimeDays }
   const [supplierByAddress, setSupplierByAddress] = useState<
@@ -886,11 +940,31 @@ export default function LocationPage() {
     }
 
     try {
-      const { hub } = await getSignerAndHub();
-      const required = await hub.requireApprovalForExecution(owner);
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setRequireApproval(null);
+        return;
+      }
+
+      if (!TREASURY_HUB_ADDRESS || !isAddress(TREASURY_HUB_ADDRESS)) {
+        setRequireApproval(null);
+        return;
+      }
+
+      // READ-ONLY: do NOT request accounts for a view call
+      const provider = new BrowserProvider(injected);
+      const hub = new Contract(
+        TREASURY_HUB_ADDRESS,
+        MOZI_TREASURY_HUB_ABI,
+        provider
+      );
+
+      const required = (await (hub as any).requireApprovalForExecution(
+        owner
+      )) as boolean;
+
       setRequireApproval(Boolean(required));
     } catch {
-      // If read fails, leave it unknown (won't block anything)
       setRequireApproval(null);
     }
   }
@@ -1471,8 +1545,8 @@ export default function LocationPage() {
         calls: (json.calls ?? []) as { to: string; data: string }[],
       };
 
-      setPlannedOrders((prev) => {
-        const next = [planned, ...prev].slice(0, 10);
+      setPlannedOrders(() => {
+        const next = [planned]; // ✅ only one planned order allowed
         savePlanned(env, owner, locationId, next);
         return next;
       });
@@ -1481,6 +1555,97 @@ export default function LocationPage() {
     } finally {
       setPlanningLoading(false);
     }
+  }
+
+  function deletePlannedOrder(plannedId: string) {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!owner || !locationId) return;
+
+    setPlannedOrders((prev) => {
+      const next = prev.filter((p) => p.id !== plannedId);
+      savePlanned(env, owner, locationId, next);
+      return next;
+    });
+
+    // cleanup any edit state
+    setEditingPlannedId((cur) => (cur === plannedId ? null : cur));
+    setPlannedQtyDrafts((prev) => {
+      const copy = { ...prev };
+      delete copy[plannedId];
+      return copy;
+    });
+  }
+
+  function startEditPlannedOrder(plannedId: string, skuRows: any[]) {
+    setEditingPlannedId(plannedId);
+
+    setPlannedQtyDrafts((prev) => {
+      const next = { ...prev };
+      const rowMap: Record<string, string> = {};
+
+      for (const r of skuRows) {
+        const rowKey = String(r.__rowKey || "");
+        if (!rowKey) continue;
+        rowMap[rowKey] = String(Number(r.qty ?? 0));
+      }
+
+      next[plannedId] = rowMap;
+      return next;
+    });
+  }
+
+  function cancelEditPlannedOrder(plannedId: string) {
+    setEditingPlannedId((cur) => (cur === plannedId ? null : cur));
+    setPlannedQtyDrafts((prev) => {
+      const copy = { ...prev };
+      delete copy[plannedId];
+      return copy;
+    });
+  }
+
+  function saveEditPlannedOrder(plannedId: string) {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!owner || !locationId) return;
+
+    const draftsForPlanned = plannedQtyDrafts[plannedId] || {};
+
+    setPlannedOrders((prev) => {
+      const next = prev.map((p) => {
+        if (p.id !== plannedId) return p;
+
+        const intent: any = p.intent;
+        const items = Array.isArray(intent?.items) ? intent.items : [];
+
+        const nextItems = items.map((it: any) => {
+          const lines = Array.isArray(it?.lines) ? it.lines : [];
+
+          const nextLines = lines.map((ln: any, idx: number) => {
+            const sku = String(ln?.sku || ln?.skuId || "");
+            const orderId = String(it?.orderId || it?.id || "");
+            const rowKey = `${orderId}:${sku}:${idx}`;
+
+            const draft = draftsForPlanned[rowKey];
+            if (draft == null) return ln;
+
+            const n = parseInt(String(draft).replace(/[^\d]/g, ""), 10);
+            const qty = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+
+            return { ...ln, qty };
+          });
+
+          return { ...it, lines: nextLines };
+        });
+
+        return { ...p, intent: { ...intent, items: nextItems } };
+      });
+
+      savePlanned(env, owner, locationId, next);
+      return next;
+    });
+
+    cancelEditPlannedOrder(plannedId);
   }
 
   async function executePlannedOrder(plannedId: string) {
@@ -1804,8 +1969,17 @@ export default function LocationPage() {
 
   useEffect(() => {
     if (!locationId) return;
+
     refreshOrders();
-    refreshExecutionMode();
+
+    const owner = getSavedOwnerAddress();
+    if (owner && isAddress(owner)) {
+      refreshExecutionMode();
+      refreshAutonomyFromChain(owner);
+    } else {
+      setRequireApproval(null);
+      setAgentEnabled(null);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
@@ -2045,12 +2219,14 @@ export default function LocationPage() {
                   type="button"
                   onClick={async () => {
                     const DAY = 24 * 60 * 60 * 1000;
-                    const next = demoNowOffsetMs + DAY;
+
+                    const base = demoNowMsAbs ?? Date.now();
+                    const next = base + DAY;
 
                     // update state
-                    setDemoNowOffsetMs(next);
+                    setDemoNowMsAbs(next);
 
-                    // ✅ write immediately so navigation can't skip persistence
+                    // write immediately (so navigation can’t skip persistence)
                     try {
                       window.localStorage.setItem(
                         demoTimeKey(locationId),
@@ -2315,296 +2491,375 @@ export default function LocationPage() {
                 </div>
 
                 {/* Title row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                  }}
+                >
                   <label style={{ fontWeight: 900, color: COLORS.subtext }}>
                     Additional Context
                   </label>
 
-                  <HelpDot title="What is Additional Context?">
-                    <div style={{ fontWeight: 950, marginBottom: 8 }}>
-                      Additional Context
-                    </div>
-                    <div style={{ display: "grid", gap: 8, fontSize: 13 }}>
-                      <div>
-                        Add one-off notes that should affect ordering
-                        assumptions.
-                      </div>
-                      <div style={{ color: COLORS.subtext, fontWeight: 750 }}>
-                        Each note has a duration in days. Expired notes won’t be
-                        sent when generating orders.
-                      </div>
-                    </div>
-                  </HelpDot>
-                </div>
-
-                {/* Input row: context + (days label+input) + indefinite toggle + add */}
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr 220px auto",
-                    gap: 10,
-                    alignItems: "end", // ✅ makes inputs line up even with labels
-                  }}
-                >
-                  {/* Context text */}
-                  <div style={{ display: "grid", gap: 6, minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        color: COLORS.subtext,
-                        fontSize: 12,
-                      }}
-                    >
-                      Context
-                    </div>
-
-                    <textarea
-                      value={contextDraft}
-                      onChange={(e) => setContextDraft(e.target.value)}
-                      placeholder='e.g. "Big game Sunday → expect +20% wings"'
-                      rows={1} // 👈 starts taller than 1 line
-                      style={{
-                        padding: "12px 12px",
-                        borderRadius: 12,
-                        border: `1px solid ${COLORS.border}`,
-                        background: "rgba(255,255,255,0.85)",
-                        color: COLORS.text,
-                        fontWeight: 800,
-                        outline: "none",
-                        width: "100%",
-                        resize: "vertical", // 👈 user can drag taller if needed
-                        lineHeight: 1.35,
-                        whiteSpace: "pre-wrap",
-                      }}
-                    />
-                  </div>
-
-                  {/* Applies for (days) + Indefinite checkbox underneath */}
-                  <div style={{ display: "grid", gap: 6 }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        color: COLORS.subtext,
-                        fontSize: 12,
-                      }}
-                    >
-                      Applies for (days)
-                    </div>
-
-                    <input
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      value={contextIndefDraft ? "∞" : contextDaysDraft}
-                      readOnly={contextIndefDraft}
-                      onChange={(e) => {
-                        if (contextIndefDraft) return;
-                        setContextDaysDraft(sanitizeIntDraft(e.target.value));
-                      }}
-                      onBlur={() => {
-                        if (contextIndefDraft) return;
-                        const normalized = draftToClampedInt(
-                          contextDaysDraft,
-                          1,
-                          365
-                        );
-                        setContextDaysDraft(String(normalized));
-                      }}
-                      onFocus={(e) => {
-                        if (contextIndefDraft) return;
-                        e.currentTarget.select();
-                      }}
-                      placeholder="Days"
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: 12,
-                        border: `1px solid ${COLORS.border}`,
-                        background: contextIndefDraft
-                          ? "rgba(15,23,42,0.04)"
-                          : "rgba(255,255,255,0.85)",
-                        color: COLORS.text,
-                        fontWeight: 900,
-                        outline: "none",
-                        textAlign: "right",
-                        cursor: contextIndefDraft ? "default" : "text",
-                      }}
-                    />
-
-                    <label
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        fontWeight: 800, // slightly lighter
-                        fontSize: 12, // 👈 smaller text
-                        color: COLORS.subtext, // softer color
-                        cursor: "pointer",
-                        userSelect: "none",
-                        marginTop: 2,
-                      }}
-                      title="If enabled, this context will never expire"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={contextIndefDraft}
-                        onChange={(e) => setContextIndefDraft(e.target.checked)}
-                        style={{ width: 14, height: 14 }} // slightly smaller checkbox
-                      />
-                      Make Indefinite
-                    </label>
-                  </div>
-
-                  {/* Add button */}
                   <button
                     type="button"
                     onClick={() => {
-                      const owner = getSavedOwnerAddress();
-                      const env = getSavedEnv();
-                      if (!owner || !locationId) return;
-
-                      const text = contextDraft.trim();
-                      if (!text) return;
-
-                      // ✅ durationDays: 0 means indefinite
-                      const days = contextIndefDraft
-                        ? 0
-                        : draftToClampedInt(contextDaysDraft, 1, 365);
-
-                      const nextItem: AdditionalContextItem = {
-                        id: `${Date.now()}_${Math.random()
-                          .toString(16)
-                          .slice(2)}`,
-                        text,
-                        durationDays: days,
-                        createdAtMs: Date.now(),
-                      };
-
-                      setAdditionalContext((prev) => {
-                        const next = [nextItem, ...prev];
-                        saveAdditionalContext(env, owner, locationId, next);
-                        return next;
-                      });
-
-                      setContextDraft("");
-                      // keep days/toggle as-is for quick entry
+                      // toggle editor open/closed
+                      setShowContextEditor((v) => !v);
                     }}
-                    disabled={!contextDraft.trim()}
-                    style={btnSoft(!contextDraft.trim())}
-                    title="Save this context item"
+                    style={btnSoft(false)}
+                    title={
+                      showContextEditor
+                        ? "Hide inputs"
+                        : "Add a new context item"
+                    }
                   >
-                    Add
+                    {showContextEditor ? "Close" : "Add"}
                   </button>
                 </div>
+                {showContextEditor ? (
+                  <>
+                    {/* Input row: aligned fields, checkbox on its own row */}
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "1fr 220px auto",
+                        gridTemplateRows: "auto auto auto", // labels / inputs / checkbox
+                        columnGap: 10,
+                        rowGap: 4,
+                        alignItems: "start",
+                      }}
+                    >
+                      {/* ---------- Row 1: Labels ---------- */}
+                      <div
+                        style={{
+                          fontWeight: 900,
+                          color: COLORS.subtext,
+                          fontSize: 12,
+                        }}
+                      >
+                        Context
+                      </div>
+                      <div
+                        style={{
+                          fontWeight: 900,
+                          color: COLORS.subtext,
+                          fontSize: 12,
+                        }}
+                      >
+                        Applies for (days)
+                      </div>
+                      <div /> {/* spacer for Add column */}
+                      {/* ---------- Row 2: Inputs ---------- */}
+                      <textarea
+                        value={contextDraft}
+                        onChange={(e) => setContextDraft(e.target.value)}
+                        placeholder='e.g. "Big game Sunday → expect +20% wings"'
+                        rows={1}
+                        style={{
+                          padding: "12px 12px",
+                          borderRadius: 12,
+                          border: `1px solid ${COLORS.border}`,
+                          background: "rgba(255,255,255,0.85)",
+                          color: COLORS.text,
+                          fontWeight: 800,
+                          outline: "none",
+                          width: "100%",
+                          resize: "vertical",
+                          lineHeight: 1.35,
+                          whiteSpace: "pre-wrap",
+                          boxSizing: "border-box",
+                          minHeight: 44,
+                        }}
+                      />
+                      <input
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        value={contextIndefDraft ? "∞" : contextDaysDraft}
+                        readOnly={contextIndefDraft}
+                        onChange={(e) => {
+                          if (contextIndefDraft) return;
+                          setContextDaysDraft(sanitizeIntDraft(e.target.value));
+                        }}
+                        onBlur={() => {
+                          if (contextIndefDraft) return;
+                          const normalized = draftToClampedInt(
+                            contextDaysDraft,
+                            1,
+                            365
+                          );
+                          setContextDaysDraft(String(normalized));
+                        }}
+                        onFocus={(e) => {
+                          if (contextIndefDraft) return;
+                          e.currentTarget.select();
+                        }}
+                        placeholder="Days"
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 12,
+                          border: `1px solid ${COLORS.border}`,
+                          background: contextIndefDraft
+                            ? "rgba(15,23,42,0.04)"
+                            : "rgba(255,255,255,0.85)",
+                          color: COLORS.text,
+                          fontWeight: 900,
+                          outline: "none",
+                          textAlign: "right",
+                          cursor: contextIndefDraft ? "default" : "text",
+                          boxSizing: "border-box",
+                          height: 44,
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const owner = getSavedOwnerAddress();
+                          const env = getSavedEnv();
+                          if (!owner || !locationId) return;
 
-                {/* Saved items list */}
+                          const text = contextDraft.trim();
+                          if (!text) return;
+
+                          const days = contextIndefDraft
+                            ? 0
+                            : draftToClampedInt(contextDaysDraft, 1, 365);
+
+                          const nextItem: AdditionalContextItem = {
+                            id: `${Date.now()}_${Math.random()
+                              .toString(16)
+                              .slice(2)}`,
+                            text,
+                            durationDays: days,
+                            createdAtMs: Date.now(),
+                          };
+
+                          setAdditionalContext((prev) => {
+                            const next = [nextItem, ...prev];
+                            saveAdditionalContext(env, owner, locationId, next);
+                            return next;
+                          });
+
+                          setContextDraft("");
+
+                          // optional resets
+                          // setContextIndefDraft(false);
+                          // setContextDaysDraft("7");
+
+                          // ✅ hide inputs after saving
+                          setShowContextEditor(false);
+                        }}
+                        disabled={!contextDraft.trim()}
+                        style={{
+                          ...btnSoft(!contextDraft.trim()),
+                          height: 44,
+                          alignSelf: "start",
+                        }}
+                        title="Save this context item"
+                      >
+                        Save
+                      </button>
+                      {/* ---------- Row 3: Checkbox (only under days column) ---------- */}
+                      <div /> {/* empty under Context */}
+                      <label
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          fontWeight: 800,
+                          fontSize: 12,
+                          color: COLORS.subtext,
+                          cursor: "pointer",
+                          userSelect: "none",
+                        }}
+                        title="If enabled, this context will never expire"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={contextIndefDraft}
+                          onChange={(e) =>
+                            setContextIndefDraft(e.target.checked)
+                          }
+                          style={{ width: 14, height: 14 }}
+                        />
+                        Make Indefinite
+                      </label>
+                      <div /> {/* empty under Add button */}
+                    </div>
+                  </>
+                ) : null}
+
+                {/* Saved items list (collapsible) */}
                 {additionalContext.length === 0 ? (
                   <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
                     No additional context saved.
                   </div>
                 ) : (
                   <div style={{ display: "grid", gap: 8 }}>
-                    {additionalContext.map((it) => {
-                      const active = isContextActive(it);
-                      const indefinite = Number(it.durationDays ?? 0) === 0;
-                      const expiresAtMs = indefinite
-                        ? null
-                        : it.createdAtMs +
-                          it.durationDays * 24 * 60 * 60 * 1000;
+                    {/* Dropdown header */}
+                    <button
+                      type="button"
+                      onClick={() => setContextListOpen((v) => !v)}
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        padding: "10px 12px",
+                        borderRadius: 12,
+                        border: `1px solid ${COLORS.border}`,
+                        background: "rgba(255,255,255,0.75)",
+                        cursor: "pointer",
+                      }}
+                      aria-expanded={contextListOpen}
+                      title={
+                        contextListOpen
+                          ? "Hide saved context"
+                          : "Show saved context"
+                      }
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                        }}
+                      >
+                        <div style={{ fontWeight: 950, color: COLORS.text }}>
+                          Saved Context
+                        </div>
 
-                      return (
-                        <div
-                          key={it.id}
+                        <span
                           style={{
-                            border: `1px solid ${COLORS.border}`,
-                            background: "rgba(255,255,255,0.75)",
-                            borderRadius: 12,
-                            padding: 12,
-                            display: "grid",
-                            gap: 6,
-                            opacity: active ? 1 : 0.55,
+                            ...pillStyle({
+                              bg: "rgba(15,23,42,0.06)",
+                              border: COLORS.border,
+                              text: COLORS.subtext,
+                            }),
+                            fontWeight: 950,
                           }}
                         >
-                          <div
-                            style={{
-                              display: "grid",
-                              gridTemplateColumns: "1fr auto",
-                              gap: 10,
-                              alignItems: "start",
-                            }}
-                          >
+                          {additionalContext.length}
+                        </span>
+                      </div>
+
+                      <ChevronDown open={contextListOpen} />
+                    </button>
+
+                    {/* Collapsible body */}
+                    {contextListOpen ? (
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {additionalContext.map((it) => {
+                          const active = isContextActive(it);
+                          const indefinite = Number(it.durationDays ?? 0) === 0;
+                          const expiresAtMs = indefinite
+                            ? null
+                            : it.createdAtMs +
+                              it.durationDays * 24 * 60 * 60 * 1000;
+
+                          return (
                             <div
-                              style={{ fontWeight: 900, color: COLORS.text }}
-                            >
-                              {it.text}
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const owner = getSavedOwnerAddress();
-                                const env = getSavedEnv();
-                                if (!owner || !locationId) return;
-
-                                setAdditionalContext((prev) => {
-                                  const next = prev.filter(
-                                    (x) => x.id !== it.id
-                                  );
-                                  saveAdditionalContext(
-                                    env,
-                                    owner,
-                                    locationId,
-                                    next
-                                  );
-                                  return next;
-                                });
-                              }}
+                              key={it.id}
                               style={{
-                                padding: "8px 10px",
-                                borderRadius: 10,
-                                border: `1px solid ${COLORS.dangerBorder}`,
-                                background: COLORS.dangerBg,
-                                color: COLORS.dangerText,
-                                fontWeight: 950,
-                                cursor: "pointer",
+                                border: `1px solid ${COLORS.border}`,
+                                background: "rgba(255,255,255,0.75)",
+                                borderRadius: 12,
+                                padding: 12,
+                                display: "grid",
+                                gap: 6,
+                                opacity: active ? 1 : 0.55,
                               }}
-                              title="Remove this context item"
                             >
-                              Remove
-                            </button>
-                          </div>
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "1fr auto",
+                                  gap: 10,
+                                  alignItems: "start",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    fontWeight: 900,
+                                    color: COLORS.text,
+                                  }}
+                                >
+                                  {it.text}
+                                </div>
 
-                          <div
-                            style={{
-                              display: "flex",
-                              gap: 12,
-                              flexWrap: "wrap",
-                              color: COLORS.subtext,
-                              fontWeight: 800,
-                              fontSize: 12,
-                            }}
-                          >
-                            <div>
-                              Applies for:{" "}
-                              {indefinite
-                                ? "Indefinite"
-                                : `${it.durationDays} days`}
-                            </div>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const owner = getSavedOwnerAddress();
+                                    const env = getSavedEnv();
+                                    if (!owner || !locationId) return;
 
-                            <div>
-                              Expires:{" "}
-                              {indefinite
-                                ? "Never"
-                                : new Date(
-                                    expiresAtMs as number
-                                  ).toLocaleString()}
-                            </div>
+                                    setAdditionalContext((prev) => {
+                                      const next = prev.filter(
+                                        (x) => x.id !== it.id
+                                      );
+                                      saveAdditionalContext(
+                                        env,
+                                        owner,
+                                        locationId,
+                                        next
+                                      );
+                                      return next;
+                                    });
+                                  }}
+                                  style={{
+                                    padding: "8px 10px",
+                                    borderRadius: 10,
+                                    border: `1px solid ${COLORS.dangerBorder}`,
+                                    background: COLORS.dangerBg,
+                                    color: COLORS.dangerText,
+                                    fontWeight: 950,
+                                    cursor: "pointer",
+                                  }}
+                                  title="Remove this context item"
+                                >
+                                  Remove
+                                </button>
+                              </div>
 
-                            <div style={{ fontWeight: 950 }}>
-                              {active ? "Active" : "Expired"}
+                              <div
+                                style={{
+                                  display: "flex",
+                                  gap: 12,
+                                  flexWrap: "wrap",
+                                  color: COLORS.subtext,
+                                  fontWeight: 800,
+                                  fontSize: 12,
+                                }}
+                              >
+                                <div>
+                                  Applies for:{" "}
+                                  {indefinite
+                                    ? "Indefinite"
+                                    : `${it.durationDays} days`}
+                                </div>
+
+                                <div>
+                                  Expires:{" "}
+                                  {indefinite
+                                    ? "Never"
+                                    : new Date(
+                                        expiresAtMs as number
+                                      ).toLocaleString()}
+                                </div>
+
+                                <div style={{ fontWeight: 950 }}>
+                                  {active ? "Active" : "Expired"}
+                                </div>
+                              </div>
                             </div>
-                          </div>
-                        </div>
-                      );
-                    })}
+                          );
+                        })}
+                      </div>
+                    ) : null}
                   </div>
                 )}
               </div>
@@ -2729,7 +2984,9 @@ export default function LocationPage() {
                   fontWeight: 800,
                   whiteSpace: "pre-wrap",
                 }}
-              ></div>
+              >
+                {ordersError}
+              </div>
             ) : intents.length === 0 ? (
               <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
                 No orders found.
@@ -2737,16 +2994,59 @@ export default function LocationPage() {
             ) : (
               <div style={{ display: "grid", gap: 12 }}>
                 {(() => {
-                  // force re-render per second for countdowns
                   void nowTick;
 
-                  const sortedIntents = [...intents].sort(
-                    (a, b) =>
-                      Number(b.executeAfter ?? 0) - Number(a.executeAfter ?? 0)
+                  // 1) Convert plannedOrders -> “intent-like” rows
+                  type DisplayIntent =
+                    | (IntentRow & { __kind: "chain" })
+                    | (IntentRow & {
+                        __kind: "planned";
+                        __plannedId: string;
+                        __createdAtMs: number;
+                      });
+
+                  const plannedAsIntents: DisplayIntent[] = plannedOrders.map(
+                    (p) => ({
+                      ...(p.intent as any),
+                      ref: `planned:${p.id}`, // IMPORTANT: unique key
+                      __kind: "planned",
+                      __plannedId: p.id,
+                      __createdAtMs: p.createdAtMs,
+                    })
                   );
 
-                  // Only show the last 10 (newest) payment intents
-                  const visibleIntents = sortedIntents.slice(0, 10);
+                  const chainAsIntents: DisplayIntent[] = (
+                    intents as any[]
+                  ).map((it) => ({
+                    ...(it as any),
+                    __kind: "chain",
+                  }));
+
+                  // 2) Merge them
+                  const merged: DisplayIntent[] = [
+                    ...plannedAsIntents,
+                    ...chainAsIntents,
+                  ];
+
+                  // 3) Sort newest first:
+                  // - planned: by createdAtMs
+                  // - chain: by executeAfter
+                  const sorted = merged.sort((a, b) => {
+                    const aKey =
+                      a.__kind === "planned"
+                        ? Number((a as any).__createdAtMs || 0)
+                        : Number(a.executeAfter || 0) * 1000;
+
+                    const bKey =
+                      b.__kind === "planned"
+                        ? Number((b as any).__createdAtMs || 0)
+                        : Number(b.executeAfter || 0) * 1000;
+
+                    return bKey - aKey;
+                  });
+
+                  // Show last 10 total (planned + chain)
+                  const visibleIntents = sorted.slice(0, 10);
 
                   return visibleIntents.map((intent) => {
                     const key = String(intent.ref || "");
@@ -2771,7 +3071,7 @@ export default function LocationPage() {
                         ? (it as any).lines
                         : [];
 
-                      return lines.map((ln: any) => {
+                      return lines.map((ln: any, idx: number) => {
                         const qty =
                           Number(ln?.qty ?? ln?.units ?? ln?.quantity ?? 0) ||
                           0;
@@ -2780,13 +3080,17 @@ export default function LocationPage() {
                         const unitPrice = priceBySku[sku] ?? 0;
                         const lineTotal = qty * unitPrice;
 
+                        const orderId = String(
+                          (it as any).orderId || (it as any).id || ""
+                        );
+                        const rowKey = `${orderId}:${sku}:${idx}`;
+
                         return {
+                          __rowKey: rowKey, // ✅ add
                           supplierName: sup.name,
                           supplierAddr: sup.address,
                           executeAfter: execAt,
-                          orderId: String(
-                            (it as any).orderId || (it as any).id || ""
-                          ),
+                          orderId,
                           sku,
                           name: ln?.name ? String(ln.name) : "",
                           qty,
@@ -3241,125 +3545,6 @@ export default function LocationPage() {
                 })()}
               </div>
             )}
-            {requireApproval && plannedOrders.length > 0 ? (
-              <div style={{ display: "grid", gap: 12 }}>
-                <div style={{ fontWeight: 950, color: COLORS.text }}>
-                  Planned Orders
-                </div>
-
-                {plannedOrders.map((p) => {
-                  const key = p.id;
-                  const intent = p.intent;
-
-                  return (
-                    <div
-                      key={key}
-                      style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        background: "rgba(255,255,255,0.85)",
-                        display: "grid",
-                        gap: 10,
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr auto",
-                          gap: 10,
-                          alignItems: "start",
-                        }}
-                      >
-                        <div style={{ display: "grid", gap: 4 }}>
-                          <div style={{ fontWeight: 950 }}>Planned Order</div>
-                          <div
-                            style={{
-                              color: COLORS.subtext,
-                              fontWeight: 850,
-                              fontSize: 13,
-                            }}
-                          >
-                            Created: {new Date(p.createdAtMs).toLocaleString()}
-                          </div>
-                        </div>
-
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: 10,
-                            alignItems: "center",
-                          }}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => executePlannedOrder(p.id)}
-                            disabled={
-                              executingPlannedId === p.id ||
-                              ordersLoading ||
-                              cancelAnyUi
-                            }
-                            style={btnPrimary(
-                              executingPlannedId === p.id ||
-                                ordersLoading ||
-                                cancelAnyUi
-                            )}
-                            title="Execute this planned order on-chain"
-                          >
-                            {executingPlannedId === p.id
-                              ? "Executing…"
-                              : "Execute"}
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const owner = getSavedOwnerAddress();
-                              const env = getSavedEnv();
-                              if (!owner || !locationId) return;
-
-                              setPlannedOrders((prev) => {
-                                const next = prev.filter((x) => x.id !== p.id);
-                                savePlanned(env, owner, locationId, next);
-                                return next;
-                              });
-                            }}
-                            style={btnSoft(false)}
-                            title="Discard this planned order"
-                          >
-                            Discard
-                          </button>
-                        </div>
-                      </div>
-
-                      <div
-                        style={{
-                          color: COLORS.subtext,
-                          fontWeight: 850,
-                          fontSize: 13,
-                        }}
-                      >
-                        {(intent?.items ?? [])
-                          .flatMap((it: any) =>
-                            Array.isArray(it?.lines) ? it.lines : []
-                          )
-                          .slice(0, 5)
-                          .map(
-                            (ln: any) =>
-                              `${ln?.sku ?? "—"} × ${ln?.qty ?? ln?.units ?? 0}`
-                          )
-                          .join(" • ")}
-                        {(intent?.items ?? []).flatMap((it: any) =>
-                          Array.isArray(it?.lines) ? it.lines : []
-                        ).length > 5
-                          ? " • …"
-                          : ""}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
           </section>
         </div>
         {/* Floating Chat Button + Right Drawer */}

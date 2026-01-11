@@ -13,7 +13,7 @@ type ExecuteCall = { to: string; data: string };
 
 type OrderLine = { sku: string; name?: string; qty: number; uom?: string };
 
-type IntentItem = {
+type IntentItemReceipt = {
   orderId: string;
   supplier: string;
   amount: string;
@@ -24,14 +24,15 @@ type IntentItem = {
   createdAtUnix?: number;
 };
 
+function getLocationIdFromUrl(url: string): string | null {
+  const u = new URL(url);
+  const locationId = u.searchParams.get("locationId");
+  return locationId && locationId.trim().length > 0 ? locationId : null;
+}
+
 function intentStore(): Map<string, IntentRow> {
   if (!global.__moziIntentStore) global.__moziIntentStore = new Map();
   return global.__moziIntentStore;
-}
-
-function normalizeUom(v: any): string | undefined {
-  const s = typeof v === "string" ? v.trim() : "";
-  return s ? s : undefined;
 }
 
 function pickSupplierPayoutById(input: any): Map<string, string> {
@@ -61,25 +62,60 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+function normalizeUom(v: any): string | undefined {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s ? s : undefined;
+}
+
+function safeOrderLines(lines: any): OrderLine[] {
+  if (!Array.isArray(lines)) return [];
+  return lines
+    .map((it: any) => {
+      const sku = String(it?.sku ?? "");
+      if (!sku) return null;
+
+      const name = it?.name ? String(it.name) : undefined;
+
+      const qtyNum = Number(it?.qty ?? it?.quantity ?? it?.orderUnits ?? 0);
+      const qty = Number.isFinite(qtyNum) ? qtyNum : 0;
+      if (qty <= 0) return null;
+
+      const uom = normalizeUom(it?.uom);
+      return { sku, name, qty, uom };
+    })
+    .filter(Boolean) as OrderLine[];
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as {
       env?: "testing" | "production";
       ownerAddress: string;
-      locationId: string;
 
-      // from /api/orders/plan
-      ref: string;
-      restaurantId: string;
-      plan: any;
+      // from UI (preferred)
+      plannedId?: string;
+      intent?: IntentRow;
       calls: ExecuteCall[];
+
+      // optional legacy fields (back-compat)
+      locationId?: string;
+      ref?: string;
+      restaurantId?: string;
+      plan?: any;
     };
 
     const env = body.env ?? "testing";
     const ownerAddress = body.ownerAddress;
-    const locationId = String(body.locationId ?? "");
-    const ref = String(body.ref ?? "");
-    const restaurantId = String(body.restaurantId ?? "");
+
+    const locationId =
+      getLocationIdFromUrl(req.url) ||
+      String(body.locationId ?? "") ||
+      String(body.intent?.locationId ?? "");
+
+    const ref = String(body.ref ?? "") || String(body.intent?.ref ?? "");
+    const restaurantId =
+      String(body.restaurantId ?? "") ||
+      String(body.intent?.restaurantId ?? "");
 
     if (env !== "testing") {
       return NextResponse.json(
@@ -94,18 +130,21 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+
     if (!locationId) {
       return NextResponse.json(
         { ok: false, error: "Missing locationId" },
         { status: 400 }
       );
     }
+
     if (!ref || !ref.startsWith("0x") || ref.length !== 66) {
       return NextResponse.json(
         { ok: false, error: "Invalid ref" },
         { status: 400 }
       );
     }
+
     if (
       !restaurantId ||
       !restaurantId.startsWith("0x") ||
@@ -134,6 +173,7 @@ export async function POST(req: Request) {
         { status: 500 }
       );
     }
+
     if (!SEPOLIA_RPC_URL) {
       return NextResponse.json(
         { ok: false, error: "Missing SEPOLIA_RPC_URL (server env)" },
@@ -180,65 +220,104 @@ export async function POST(req: Request) {
         txRequest.gasPrice = bumpedGasPrice;
       }
 
-      const tx = await withTimeout(
-        agent.sendTransaction(txRequest),
-        20_000,
-        "sendTransaction"
-      );
-      txs.push({ to: c.to, hash: tx.hash });
+      // IMPORTANT: surface tx errors instead of opaque 500s
+      try {
+        const tx = await withTimeout(
+          agent.sendTransaction(txRequest),
+          20_000,
+          `sendTransaction[nonce=${txRequest.nonce}]`
+        );
+        txs.push({ to: c.to, hash: tx.hash });
+      } catch (err: any) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "sendTransaction failed",
+            detail: String(err?.message ?? err),
+            to: txRequest.to,
+            nonce: txRequest.nonce,
+            dataPrefix:
+              typeof txRequest.data === "string"
+                ? txRequest.data.slice(0, 42)
+                : undefined,
+            maxFeePerGas: txRequest.maxFeePerGas?.toString?.(),
+            maxPriorityFeePerGas: txRequest.maxPriorityFeePerGas?.toString?.(),
+            gasPrice: txRequest.gasPrice?.toString?.(),
+          },
+          { status: 502 }
+        );
+      }
     }
 
-    // Write receipts to __moziIntentStore (same idea as /propose)
+    // ---------- receipts ----------
     const input = getState(locationId);
     const payoutBySupplierId = pickSupplierPayoutById(input);
+
+    // Preferred: build from intent.items (UI sends this)
+    const intentItems = Array.isArray(body.intent?.items)
+      ? (body.intent!.items as any[])
+      : [];
+
+    // Back-compat fallback: plan.orders
     const planOrders = Array.isArray(body.plan?.orders) ? body.plan.orders : [];
 
-    const items: IntentItem[] = planOrders.map((o: any, idx: number) => {
-      const supplierId = String(o?.supplierId ?? "");
-      const supplierPayout =
-        String(o?.supplierAddress ?? "") ||
-        String(o?.payoutAddress ?? "") ||
-        (supplierId ? payoutBySupplierId.get(supplierId) ?? "" : "");
+    const receiptItems: IntentItemReceipt[] =
+      intentItems.length > 0
+        ? intentItems.map((it: any, idx: number) => {
+            const supplier =
+              String(it?.supplier ?? "") ||
+              String(it?.supplierAddress ?? "") ||
+              String(it?.payoutAddress ?? "");
 
-      const rawAmount =
-        String(o?.amount ?? "") ||
-        String(o?.amountRaw ?? "") ||
-        String(o?.totalAmount ?? "") ||
-        String(o?.totalAmountRaw ?? "") ||
-        "0";
+            const amount =
+              String(it?.amount ?? "") ||
+              String(it?.amountRaw ?? "") ||
+              String(it?.totalAmount ?? "") ||
+              String(it?.totalAmountRaw ?? "") ||
+              "0";
 
-      const lines: OrderLine[] = Array.isArray(o?.items)
-        ? (o.items
-            .map((it: any) => {
-              const sku = String(it?.sku ?? "");
-              const name = it?.name ? String(it.name) : undefined;
+            const lines = safeOrderLines(it?.lines ?? it?.items ?? []);
+            const txHit = txs[idx];
 
-              const qtyNum = Number(
-                it?.qty ?? it?.quantity ?? it?.orderUnits ?? 0
-              );
-              const qty = Number.isFinite(qtyNum) ? qtyNum : 0;
+            return {
+              orderId: String(it?.orderId ?? `${ref}:${idx}`),
+              supplier,
+              amount,
+              executeAfter: createdAtUnix,
+              lines,
+              txHash: txHit?.hash,
+              to: txHit?.to,
+              createdAtUnix,
+            };
+          })
+        : planOrders.map((o: any, idx: number) => {
+            const supplierId = String(o?.supplierId ?? "");
+            const supplier =
+              String(o?.supplierAddress ?? "") ||
+              String(o?.payoutAddress ?? "") ||
+              (supplierId ? payoutBySupplierId.get(supplierId) ?? "" : "");
 
-              const uom = normalizeUom(it?.uom);
+            const amount =
+              String(o?.amount ?? "") ||
+              String(o?.amountRaw ?? "") ||
+              String(o?.totalAmount ?? "") ||
+              String(o?.totalAmountRaw ?? "") ||
+              "0";
 
-              if (!sku || qty <= 0) return null;
-              return { sku, name, qty, uom };
-            })
-            .filter(Boolean) as OrderLine[])
-        : [];
+            const lines = safeOrderLines(o?.items ?? []);
+            const txHit = txs[idx];
 
-      const txHit = txs[idx];
-
-      return {
-        orderId: String(o?.orderId ?? `${ref}:${idx}`),
-        supplier: supplierPayout,
-        amount: rawAmount,
-        executeAfter: createdAtUnix,
-        lines,
-        txHash: txHit?.hash,
-        to: txHit?.to,
-        createdAtUnix,
-      };
-    });
+            return {
+              orderId: String(o?.orderId ?? `${ref}:${idx}`),
+              supplier,
+              amount,
+              executeAfter: createdAtUnix,
+              lines,
+              txHash: txHit?.hash,
+              to: txHit?.to,
+              createdAtUnix,
+            };
+          });
 
     const intentRow: IntentRow = {
       ref,
@@ -249,9 +328,9 @@ export async function POST(req: Request) {
       approved: true,
       executed: true,
       canceled: false,
-      items: items.filter(
+      items: receiptItems.filter(
         (it) => Array.isArray(it.lines) && it.lines.length > 0
-      ),
+      ) as any,
       createdAtUnix,
       env,
     };
@@ -259,7 +338,7 @@ export async function POST(req: Request) {
     const storeKey = `${env}:${ownerAddress.toLowerCase()}:${locationId}:${ref.toLowerCase()}`;
     intentStore().set(storeKey, intentRow);
 
-    // Optional: also upsert pipeline snapshot (best-effort)
+    // ---------- pipeline snapshot (best-effort) ----------
     try {
       const nowUnix = createdAtUnix;
 
@@ -291,19 +370,38 @@ export async function POST(req: Request) {
         etaUnix: number;
       }> = [];
 
-      for (const ord of planOrders) {
-        const supplierId = String(ord?.supplierId ?? "");
-        for (const it of ord?.items ?? []) {
-          const sku = String(it?.sku ?? "");
-          const units = Number(it?.orderUnits ?? it?.qty ?? it?.quantity ?? 0);
-          if (!sku || !Number.isFinite(units) || units <= 0) continue;
+      if (intentItems.length > 0) {
+        for (const ord of intentItems) {
+          for (const it of ord?.lines ?? []) {
+            const sku = String(it?.sku ?? "");
+            const units = Number(it?.qty ?? 0);
+            if (!sku || !Number.isFinite(units) || units <= 0) continue;
 
-          snapItems.push({
-            sku,
-            units,
-            supplierId: supplierId || undefined,
-            etaUnix: etaForSku(sku, supplierId),
-          });
+            snapItems.push({
+              sku,
+              units,
+              supplierId: undefined,
+              etaUnix: etaForSku(sku, undefined),
+            });
+          }
+        }
+      } else {
+        for (const ord of planOrders) {
+          const supplierId = String(ord?.supplierId ?? "");
+          for (const it of ord?.items ?? []) {
+            const sku = String(it?.sku ?? "");
+            const units = Number(
+              it?.orderUnits ?? it?.qty ?? it?.quantity ?? 0
+            );
+            if (!sku || !Number.isFinite(units) || units <= 0) continue;
+
+            snapItems.push({
+              sku,
+              units,
+              supplierId: supplierId || undefined,
+              etaUnix: etaForSku(sku, supplierId),
+            });
+          }
         }
       }
 
@@ -333,7 +431,11 @@ export async function POST(req: Request) {
     });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: String(e?.message ?? e) },
+      {
+        ok: false,
+        error: String(e?.message ?? e),
+        stack: e?.stack ? String(e.stack) : undefined,
+      },
       { status: 500 }
     );
   }

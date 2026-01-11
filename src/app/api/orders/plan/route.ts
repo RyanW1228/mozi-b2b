@@ -378,16 +378,41 @@ export async function POST(req: Request) {
       );
     }
 
+    const intent = {
+      ref: exec.ref,
+      owner: ownerAddress,
+      restaurantId: exec.restaurantId,
+      executeAfter:
+        Math.floor(Date.now() / 1000) + (body.pendingWindowHours ?? 24) * 3600,
+      approved: false,
+      executed: false,
+      canceled: false,
+
+      // UI expects items[] with {orderId, supplier, amount, lines}
+      items: (exec.paymentIntent?.transfers ?? []).map((t: any) => {
+        // Build the same "lines" shape your UI reads (sku, qty, uom, name)
+        // If your paymentIntent contains line-level detail elsewhere, use that.
+        return {
+          orderId: String(t?.orderId ?? ""), // or derive one
+          supplier: String(
+            (getState(locationId).suppliers ?? []).find(
+              (s: any) => String(s.supplierId) === String(t.supplierId)
+            )?.payoutAddress ?? ""
+          ),
+          amount: String(parseUnits(Number(t.amountUsd ?? 0).toFixed(2), 18)),
+          executeAfter: Math.floor(Date.now() / 1000),
+          lines: Array.isArray(t?.lines) ? t.lines : [], // if you don’t have lines, send []
+        };
+      }),
+    };
+
     // IMPORTANT: this is a PLANNED object, not broadcast
     return NextResponse.json({
       ok: true,
       env,
       locationId,
       ownerAddress,
-      ref: exec.ref,
-      restaurantId: exec.restaurantId,
-      plannedAtUnix: Math.floor(Date.now() / 1000),
-      plan,
+      intent,
       calls,
     });
   } catch (e: any) {
