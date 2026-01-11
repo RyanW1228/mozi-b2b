@@ -12,7 +12,9 @@ import {
   isAddress,
   keccak256,
   toUtf8Bytes,
+  verifyMessage,
 } from "ethers";
+
 import { MOZI_TREASURY_HUB_ABI } from "@/lib/abis/moziTreasuryHub";
 
 const COLORS = {
@@ -489,6 +491,17 @@ export default function LocationPage() {
   const [priceBySku, setPriceBySku] = useState<Record<string, number>>({});
   const [uomBySku, setUomBySku] = useState<Record<string, string>>({});
 
+  // --- AI Autonomy (same UX as old homepage) ---
+  const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
+  const [isTogglingMode, setIsTogglingMode] = useState(false);
+
+  const [agentEnabled, setAgentEnabled] = useState<boolean | null>(null);
+  const [isEnablingAgent, setIsEnablingAgent] = useState(false);
+  const attemptedEnableRef = useRef<string>("");
+
+  const [showAutonomyInfo, setShowAutonomyInfo] = useState(false);
+  const autonomyInfoWrapRef = useRef<HTMLDivElement | null>(null);
+
   // -------------------------
   // On-chain orders (grouped by intent ref)
   // -------------------------
@@ -525,6 +538,55 @@ export default function LocationPage() {
     canceled?: boolean;
     items: IntentItem[];
   };
+
+  type PlannedOrder = {
+    id: string; // local id
+    createdAtMs: number;
+
+    env: "testing" | "production";
+    owner: string;
+    locationId: string;
+
+    // for display
+    intent: IntentRow;
+
+    // what we’ll execute later
+    calls: { to: string; data: string }[];
+  };
+
+  function plannedKey(env: string, owner: string, locationId: string) {
+    return `mozi_planned_orders:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function loadPlanned(
+    env: string,
+    owner: string,
+    locationId: string
+  ): PlannedOrder[] {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(
+        plannedKey(env, owner, locationId)
+      );
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function savePlanned(
+    env: string,
+    owner: string,
+    locationId: string,
+    items: PlannedOrder[]
+  ) {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      plannedKey(env, owner, locationId),
+      JSON.stringify(items)
+    );
+  }
 
   type ChatMsg = { role: "user" | "assistant"; content: string };
 
@@ -612,6 +674,30 @@ export default function LocationPage() {
   const [contextDraft, setContextDraft] = useState("");
   const [contextDaysDraft, setContextDaysDraft] = useState("7");
   const [contextIndefDraft, setContextIndefDraft] = useState(false);
+
+  useEffect(() => {
+    function onDown(e: MouseEvent | TouchEvent) {
+      if (!showAutonomyInfo) return;
+      const el = autonomyInfoWrapRef.current;
+      if (!el) return;
+      if (e.target instanceof Node && el.contains(e.target)) return;
+      setShowAutonomyInfo(false);
+    }
+
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setShowAutonomyInfo(false);
+    }
+
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("touchstart", onDown);
+    document.addEventListener("keydown", onKey);
+
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("touchstart", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [showAutonomyInfo]);
 
   useEffect(() => {
     if (!editingPlan) setStrategyDraft(strategy);
@@ -722,6 +808,12 @@ export default function LocationPage() {
     }
   }
 
+  const [plannedOrders, setPlannedOrders] = useState<PlannedOrder[]>([]);
+  const [planningLoading, setPlanningLoading] = useState(false);
+  const [executingPlannedId, setExecutingPlannedId] = useState<string | null>(
+    null
+  );
+
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState<string>("");
   const [intents, setIntents] = useState<IntentRow[]>([]);
@@ -769,12 +861,182 @@ export default function LocationPage() {
   const ordersAutoUpdateIntervalMs = 12 * 60 * 60 * 1000; // 12 hours
 
   useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!owner || !locationId) return;
+
+    const items = loadPlanned(env, owner, locationId);
+    setPlannedOrders(items);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
+
+  useEffect(() => {
     const id = window.setInterval(() => setNowTick((x) => x + 1), 1000);
     return () => window.clearInterval(id);
   }, []);
 
   // Manual vs Autonomous (from chain)
-  const [requireApproval, setRequireApproval] = useState<boolean | null>(null);
+  const [modeLoading, setModeLoading] = useState(false);
+
+  async function refreshExecutionMode() {
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) {
+      setRequireApproval(null);
+      return;
+    }
+
+    try {
+      const { hub } = await getSignerAndHub();
+      const required = await hub.requireApprovalForExecution(owner);
+      setRequireApproval(Boolean(required));
+    } catch {
+      // If read fails, leave it unknown (won't block anything)
+      setRequireApproval(null);
+    }
+  }
+
+  async function refreshAutonomyFromChain(ownerAddress: string) {
+    try {
+      const hubAddr = process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
+      const agentAddr = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
+
+      if (!hubAddr || !isAddress(hubAddr)) {
+        setRequireApproval(null);
+        setAgentEnabled(null);
+        return;
+      }
+
+      // You should already have a provider on this page; if not, this is the same pattern as old homepage
+      const ethereum = (window as any).ethereum;
+      if (!ethereum) return;
+
+      const provider = new BrowserProvider(ethereum);
+      const hub = new Contract(hubAddr, MOZI_TREASURY_HUB_ABI, provider);
+
+      const agentOk = agentAddr ? isAddress(agentAddr) : false;
+
+      const [reqApproval, allowed] = await Promise.all([
+        (hub as any).requireApprovalForExecution(
+          ownerAddress
+        ) as Promise<boolean>,
+        agentOk
+          ? ((hub as any).isAgentFor(
+              ownerAddress,
+              agentAddr
+            ) as Promise<boolean>)
+          : Promise.resolve(false),
+      ]);
+
+      setRequireApproval(Boolean(reqApproval));
+      setAgentEnabled(Boolean(allowed));
+    } catch {
+      setRequireApproval(null);
+      setAgentEnabled(null);
+    }
+  }
+  async function setExecutionMode(
+    nextAutonomous: boolean,
+    ownerAddress: string
+  ) {
+    const hubAddr = process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
+    if (!hubAddr || !isAddress(hubAddr)) return;
+
+    try {
+      setIsTogglingMode(true);
+
+      const ethereum = (window as any).ethereum;
+      if (!ethereum) return;
+
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+
+      const hub = new Contract(hubAddr, MOZI_TREASURY_HUB_ABI, signer);
+
+      // Manual = requireApprovalForExecution(true)
+      // Autonomous = requireApprovalForExecution(false)
+      const nextRequired = !nextAutonomous;
+
+      const tx = await (hub as any).setRequireApprovalForExecution(
+        nextRequired
+      );
+      await tx.wait();
+
+      await refreshAutonomyFromChain(ownerAddress);
+    } finally {
+      setIsTogglingMode(false);
+    }
+  }
+  async function ensureAgentEnabled(ownerAddress: string, locationId: string) {
+    const hubAddr = process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
+    const agentAddr = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
+    if (!hubAddr || !agentAddr) return;
+    if (!isAddress(hubAddr) || !isAddress(agentAddr)) return;
+
+    // only attempt once per owner+location
+    const attemptKey = `${ownerAddress.toLowerCase()}:${locationId}`;
+    if (attemptedEnableRef.current === attemptKey) return;
+    if (agentEnabled === true) {
+      attemptedEnableRef.current = attemptKey;
+      return;
+    }
+
+    try {
+      setIsEnablingAgent(true);
+
+      const ethereum = (window as any).ethereum;
+      if (!ethereum) return;
+
+      const provider = new BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const hub = new Contract(hubAddr, MOZI_TREASURY_HUB_ABI, signer);
+
+      const allowed = (await (hub as any).isAgentFor(
+        ownerAddress,
+        agentAddr
+      )) as boolean;
+
+      if (allowed) {
+        setAgentEnabled(true);
+        attemptedEnableRef.current = attemptKey;
+        return;
+      }
+
+      const tx = await (hub as any).setAgent(agentAddr, true);
+      await tx.wait();
+
+      attemptedEnableRef.current = attemptKey;
+      await refreshAutonomyFromChain(ownerAddress);
+    } finally {
+      setIsEnablingAgent(false);
+    }
+  }
+
+  async function setAutonomy(enabled: boolean) {
+    // enabled=true => Autonomous => requireApproval=false
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) {
+      setOrdersError(
+        "No valid wallet found. Connect wallet on homepage first."
+      );
+      return;
+    }
+
+    try {
+      setModeLoading(true);
+      setOrdersError("");
+
+      const { hub } = await getSignerAndHub();
+      const tx = await hub.setRequireApprovalForExecution(!enabled);
+      await tx.wait();
+
+      await refreshExecutionMode();
+      await refreshOrders(); // optional: keeps UI in sync
+    } catch (e: any) {
+      setOrdersError(String(e?.message ?? e));
+    } finally {
+      setModeLoading(false);
+    }
+  }
 
   // UI state for approve button
   const [approvingRef, setApprovingRef] = useState<string | null>(null);
@@ -901,6 +1163,52 @@ export default function LocationPage() {
     }
   }
 
+  function formatCountdown(secondsRemaining: number) {
+    // secondsRemaining can be fractional/negative; normalize
+    const s = Math.floor(secondsRemaining);
+
+    if (!Number.isFinite(s)) return "—";
+    if (s <= 0) return "Arrived";
+
+    const DAY = 24 * 60 * 60;
+    const HOUR = 60 * 60;
+    const MIN = 60;
+
+    const d = Math.floor(s / DAY);
+    const h = Math.floor((s % DAY) / HOUR);
+    const m = Math.floor((s % HOUR) / MIN);
+    const sec = s % MIN;
+
+    // Keep it clean:
+    // - Far away: "3d 2h"
+    // - Medium:   "5h 12m"
+    // - Soon:     "30m"
+    // - Very soon:"4m 15s"
+    // - Imminent: "15s"
+    if (d >= 1) return `${d}d${h ? ` ${h}h` : ""}`;
+    if (h >= 1) return `${h}h${m ? ` ${m}m` : ""}`;
+    if (m >= 10) return `${m}m`; // avoid clutter for medium-short
+    if (m >= 1) return `${m}m ${sec}s`; // show seconds only when close
+    return `${sec}s`;
+  }
+
+  function arrivalCountdownForSupplier(
+    supplierAddr: string,
+    executeAfterUnix: number
+  ) {
+    const sup = supplierLabel(String(supplierAddr || ""));
+    const leadDays = Number(sup.leadTimeDays ?? 0);
+
+    const etaUnix =
+      Number(executeAfterUnix || 0) + Math.max(0, leadDays) * 24 * 60 * 60;
+
+    if (!etaUnix) return "—";
+
+    // IMPORTANT: use demo clock so Simulate Time affects countdown
+    const nowUnix = demoNowUnix();
+    return formatCountdown(etaUnix - nowUnix);
+  }
+
   async function refreshOrders() {
     if (cancelAnyInFlight.current) return;
 
@@ -914,7 +1222,6 @@ export default function LocationPage() {
 
     if (!owner || !isAddress(owner)) {
       setIntents([]);
-      setRequireApproval(null);
       setOrdersError(
         "No valid wallet found. Go to the homepage, connect wallet, then come back."
       );
@@ -924,7 +1231,6 @@ export default function LocationPage() {
 
     if (!locationId) {
       setIntents([]);
-      setRequireApproval(null);
       setOrdersError("Missing locationId.");
       refreshOrdersInFlight.current = false;
       return;
@@ -986,9 +1292,6 @@ export default function LocationPage() {
       );
 
       setIntents(cleaned);
-
-      // Optional: you can stop fetching requireApproval entirely (not relevant now)
-      setRequireApproval(null);
     } catch (e: any) {
       setIntents([]);
       setRequireApproval(null);
@@ -1068,10 +1371,230 @@ export default function LocationPage() {
     justifySelf: "end",
   });
 
+  async function planOrder() {
+    if (!locationId) return;
+    if (planningLoading) return;
+
+    setPlanningLoading(true);
+    setError("");
+    try {
+      const owner = getSavedOwnerAddress();
+      const env = getSavedEnv();
+
+      if (!owner || !isAddress(owner)) {
+        setError("No valid wallet found. Go connect wallet first.");
+        return;
+      }
+
+      // 1) nonce
+      const nonceRes = await fetch(
+        `/api/auth/nonce?env=${encodeURIComponent(
+          env
+        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
+          locationId
+        )}`,
+        { method: "GET" }
+      );
+      const nonceJson = await nonceRes.json().catch(() => null);
+      if (!nonceRes.ok || !nonceJson?.ok) {
+        setError(
+          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
+        );
+        return;
+      }
+
+      const nonce: string = String(nonceJson.nonce ?? "");
+      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
+
+      // 2) signature
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setError("No injected wallet found (MetaMask).");
+        return;
+      }
+
+      const provider = new BrowserProvider(injected);
+      await provider.send("eth_requestAccounts", []);
+      const signer = await provider.getSigner();
+      const signerAddr = await signer.getAddress();
+
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setError(
+          `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
+        );
+        return;
+      }
+
+      const message =
+        `Mozi: Plan Order\n` +
+        `env: ${env}\n` +
+        `locationId: ${locationId}\n` +
+        `owner: ${owner}\n` +
+        `nonce: ${nonce}\n` +
+        `issuedAtMs: ${issuedAtMs}\n`;
+
+      const signature = await signer.signMessage(message);
+
+      // 3) plan (NO BROADCAST)
+      const res = await fetch(
+        `/api/orders/plan?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            env,
+            ownerAddress: owner,
+            auth: { message, signature, nonce, issuedAtMs },
+            strategy,
+            horizonDays,
+            notes: formatContextForNotes(additionalContext),
+          }),
+        }
+      );
+
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.ok) {
+        setError(
+          `PLAN ORDER HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+        return;
+      }
+
+      const planned: PlannedOrder = {
+        id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        createdAtMs: Date.now(),
+        env,
+        owner,
+        locationId,
+        intent: json.intent as IntentRow,
+        calls: (json.calls ?? []) as { to: string; data: string }[],
+      };
+
+      setPlannedOrders((prev) => {
+        const next = [planned, ...prev].slice(0, 10);
+        savePlanned(env, owner, locationId, next);
+        return next;
+      });
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setPlanningLoading(false);
+    }
+  }
+
+  async function executePlannedOrder(plannedId: string) {
+    if (!locationId) return;
+    if (executingPlannedId) return;
+
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!owner || !isAddress(owner)) {
+      setError("No valid wallet found. Go connect wallet first.");
+      return;
+    }
+
+    const planned = plannedOrders.find((p) => p.id === plannedId);
+    if (!planned) return;
+
+    setExecutingPlannedId(plannedId);
+    setError("");
+
+    try {
+      // nonce
+      const nonceRes = await fetch(
+        `/api/auth/nonce?env=${encodeURIComponent(
+          env
+        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
+          locationId
+        )}`,
+        { method: "GET" }
+      );
+      const nonceJson = await nonceRes.json().catch(() => null);
+      if (!nonceRes.ok || !nonceJson?.ok) {
+        setError(
+          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
+        );
+        return;
+      }
+
+      const nonce: string = String(nonceJson.nonce ?? "");
+      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
+
+      // signature
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setError("No injected wallet found (MetaMask).");
+        return;
+      }
+      const provider = new BrowserProvider(injected);
+      await provider.send("eth_requestAccounts", []);
+      const signer = await provider.getSigner();
+      const signerAddr = await signer.getAddress();
+
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setError(
+          `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
+        );
+        return;
+      }
+
+      const message =
+        `Mozi: Execute Planned Order\n` +
+        `env: ${env}\n` +
+        `locationId: ${locationId}\n` +
+        `owner: ${owner}\n` +
+        `plannedId: ${plannedId}\n` +
+        `nonce: ${nonce}\n` +
+        `issuedAtMs: ${issuedAtMs}\n`;
+
+      const signature = await signer.signMessage(message);
+
+      const res = await fetch(
+        `/api/orders/execute-planned?locationId=${encodeURIComponent(
+          locationId
+        )}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            env,
+            ownerAddress: owner,
+            auth: { message, signature, nonce, issuedAtMs },
+            plannedId,
+            intent: planned.intent,
+            calls: planned.calls,
+          }),
+        }
+      );
+
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.ok) {
+        setError(
+          `EXECUTE PLANNED HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
+        );
+        return;
+      }
+
+      // remove planned from local list
+      setPlannedOrders((prev) => {
+        const next = prev.filter((p) => p.id !== plannedId);
+        savePlanned(env, owner, locationId, next);
+        return next;
+      });
+
+      await refreshOrders();
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setExecutingPlannedId(null);
+    }
+  }
+
   async function generateOrders() {
     if (!locationId) return;
 
-    // prevent double-clicks
     if (manualGenerateInFlight.current) return;
 
     setLoading(true);
@@ -1093,8 +1616,56 @@ export default function LocationPage() {
         return;
       }
 
-      // ✅ This is the flow:
-      // UI → /api/orders/propose → server runs AI planning and broadcasts txs immediately
+      // 1) Ask server for a nonce (prevents replay)
+      const nonceRes = await fetch(
+        `/api/auth/nonce?env=${encodeURIComponent(
+          env
+        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
+          locationId
+        )}`,
+        { method: "GET" }
+      );
+      const nonceJson = await nonceRes.json().catch(() => null);
+      if (!nonceRes.ok || !nonceJson?.ok) {
+        setError(
+          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
+        );
+        return;
+      }
+
+      const nonce: string = String(nonceJson.nonce ?? "");
+      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
+
+      // 2) MetaMask signature gate (user sees a signature prompt)
+      const injected = getInjectedProvider();
+      if (!injected) {
+        setError("No injected wallet found (MetaMask).");
+        return;
+      }
+
+      const provider = new BrowserProvider(injected);
+      await provider.send("eth_requestAccounts", []);
+      const signer = await provider.getSigner();
+
+      const signerAddr = await signer.getAddress();
+      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
+        setError(
+          `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
+        );
+        return;
+      }
+
+      const message =
+        `Mozi: Generate Orders\n` +
+        `env: ${env}\n` +
+        `locationId: ${locationId}\n` +
+        `owner: ${owner}\n` +
+        `nonce: ${nonce}\n` +
+        `issuedAtMs: ${issuedAtMs}\n`;
+
+      const signature = await signer.signMessage(message);
+
+      // 3) Proceed with your existing server flow, but include signature proof
       const res = await fetch(
         `/api/orders/propose?locationId=${encodeURIComponent(locationId)}`,
         {
@@ -1104,10 +1675,13 @@ export default function LocationPage() {
             env,
             ownerAddress: owner,
 
-            // ✅ no pending period / no approval step
+            // auth
+            auth: { message, signature, nonce, issuedAtMs },
+
+            // no pending period / no approval step
             pendingWindowHours: 0,
 
-            // ✅ pass control knobs
+            // control knobs
             strategy,
             horizonDays,
             notes: formatContextForNotes(additionalContext),
@@ -1124,7 +1698,6 @@ export default function LocationPage() {
         return;
       }
 
-      // ✅ immediately refresh Orders section so executed order details appear
       await refreshOrders();
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -1231,8 +1804,8 @@ export default function LocationPage() {
 
   useEffect(() => {
     if (!locationId) return;
-    // one fetch on mount for this location
     refreshOrders();
+    refreshExecutionMode();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
@@ -2076,26 +2649,72 @@ export default function LocationPage() {
               </div>
 
               {/* Right: buttons */}
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                {/* Autonomy toggle */}
                 <button
                   type="button"
-                  onClick={generateOrders}
-                  disabled={loading || ordersLoading || cancelAnyUi}
-                  style={btnPrimary(loading || ordersLoading || cancelAnyUi)}
-                  title="Create new on-chain orders"
+                  onClick={() => {
+                    // If unknown, assume enabling autonomy (safe default UX)
+                    const currentlyAutonomous =
+                      requireApproval === null ? false : !requireApproval;
+                    setAutonomy(!currentlyAutonomous);
+                  }}
+                  disabled={
+                    modeLoading || loading || ordersLoading || cancelAnyUi
+                  }
+                  style={btnSoft(
+                    modeLoading || loading || ordersLoading || cancelAnyUi
+                  )}
+                  title={
+                    requireApproval === null
+                      ? "Toggle autonomy (mode unknown until wallet is connected)"
+                      : requireApproval
+                      ? "Switch to Autonomous (AI can execute immediately)"
+                      : "Switch to Manual (requires approval before execution)"
+                  }
                 >
-                  {loading ? "Generating…" : "Generate Orders"}
+                  {modeLoading
+                    ? "Switching…"
+                    : requireApproval === null
+                    ? "Enable Autonomy"
+                    : requireApproval
+                    ? "Enable Autonomy"
+                    : "Disable Autonomy"}
                 </button>
 
-                <button
-                  type="button"
-                  onClick={refreshOrders}
-                  disabled={ordersLoading || cancelAnyUi}
-                  style={btnSoft(ordersLoading || cancelAnyUi)}
-                  title="Refresh orders"
-                >
-                  {ordersLoading ? "Refreshing…" : "Refresh"}
-                </button>
+                {/* Generate/Plan orders */}
+                {requireApproval ? (
+                  <button
+                    type="button"
+                    onClick={planOrder}
+                    disabled={
+                      planningLoading || ordersLoading || cancelAnyUi || loading
+                    }
+                    style={btnPrimary(
+                      planningLoading || ordersLoading || cancelAnyUi || loading
+                    )}
+                    title="Plan a new order (no on-chain tx until you execute)"
+                  >
+                    {planningLoading ? "Planning…" : "Plan Order"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={generateOrders}
+                    disabled={loading || ordersLoading || cancelAnyUi}
+                    style={btnPrimary(loading || ordersLoading || cancelAnyUi)}
+                    title="Create new on-chain orders"
+                  >
+                    {loading ? "Generating…" : "Generate Orders"}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2110,9 +2729,7 @@ export default function LocationPage() {
                   fontWeight: 800,
                   whiteSpace: "pre-wrap",
                 }}
-              >
-                {ordersError}
-              </div>
+              ></div>
             ) : intents.length === 0 ? (
               <div style={{ color: COLORS.subtext, fontWeight: 800 }}>
                 No orders found.
@@ -2195,18 +2812,6 @@ export default function LocationPage() {
                     const hasAnyPricedLine = skuRows.some(
                       (r) => Number.isFinite(r.unitPrice) && r.unitPrice > 0
                     );
-
-                    const arrivalLabelForSupplier = (
-                      supplierAddr: string,
-                      executeAfterUnix: number
-                    ) => {
-                      const sup = supplierLabel(String(supplierAddr || ""));
-                      const leadDays = Number(sup.leadTimeDays ?? 0);
-                      const etaUnix =
-                        Number(executeAfterUnix || 0) +
-                        Math.max(0, leadDays) * 24 * 60 * 60;
-                      return etaUnix ? fmtWhen(etaUnix) : "—";
-                    };
 
                     // Totals + supplier summary
                     const totalRaw = items.reduce((acc, it) => {
@@ -2412,7 +3017,7 @@ export default function LocationPage() {
                               <div
                                 style={{
                                   display: "grid",
-                                  gridTemplateColumns: "1fr 1fr",
+                                  gridTemplateColumns: "1fr",
                                   gap: 10,
                                   fontSize: 13,
                                   color: COLORS.subtext,
@@ -2431,18 +3036,6 @@ export default function LocationPage() {
                                   <div>
                                     {fmtWhen(Number(intent.executeAfter))}
                                   </div>
-                                </div>
-
-                                <div>
-                                  <div
-                                    style={{
-                                      fontWeight: 950,
-                                      color: COLORS.text,
-                                    }}
-                                  >
-                                    Items
-                                  </div>
-                                  <div>{items.length}</div>
                                 </div>
                               </div>
 
@@ -2547,7 +3140,6 @@ export default function LocationPage() {
                                           }}
                                         >
                                           {Number.isFinite(r.qty) ? r.qty : "—"}
-                                          {r.uom ? ` ${r.uom}` : ""}
                                         </td>
 
                                         {/* Supplier (✅ now 3rd column) */}
@@ -2562,17 +3154,6 @@ export default function LocationPage() {
                                           <div style={{ fontWeight: 950 }}>
                                             {r.supplierName}
                                           </div>
-                                          <div
-                                            style={{
-                                              fontFamily:
-                                                "ui-monospace, Menlo, monospace",
-                                              color: COLORS.subtext,
-                                              fontWeight: 800,
-                                              fontSize: 12,
-                                            }}
-                                          >
-                                            {shortenId(r.supplierAddr)}
-                                          </div>
                                         </td>
 
                                         {/* Price (✅ now 4th column) */}
@@ -2586,8 +3167,9 @@ export default function LocationPage() {
                                             whiteSpace: "nowrap",
                                           }}
                                         >
-                                          {r.unitPrice > 0
-                                            ? `$${r.unitPrice.toFixed(2)}`
+                                          {Number.isFinite(r.lineTotal) &&
+                                          r.lineTotal > 0
+                                            ? `$${r.lineTotal.toFixed(2)}`
                                             : "—"}
                                         </td>
 
@@ -2601,7 +3183,7 @@ export default function LocationPage() {
                                             whiteSpace: "nowrap",
                                           }}
                                         >
-                                          {arrivalLabelForSupplier(
+                                          {arrivalCountdownForSupplier(
                                             r.supplierAddr,
                                             r.executeAfter
                                           )}
@@ -2659,6 +3241,125 @@ export default function LocationPage() {
                 })()}
               </div>
             )}
+            {requireApproval && plannedOrders.length > 0 ? (
+              <div style={{ display: "grid", gap: 12 }}>
+                <div style={{ fontWeight: 950, color: COLORS.text }}>
+                  Planned Orders
+                </div>
+
+                {plannedOrders.map((p) => {
+                  const key = p.id;
+                  const intent = p.intent;
+
+                  return (
+                    <div
+                      key={key}
+                      style={{
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 14,
+                        padding: 14,
+                        background: "rgba(255,255,255,0.85)",
+                        display: "grid",
+                        gap: 10,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "1fr auto",
+                          gap: 10,
+                          alignItems: "start",
+                        }}
+                      >
+                        <div style={{ display: "grid", gap: 4 }}>
+                          <div style={{ fontWeight: 950 }}>Planned Order</div>
+                          <div
+                            style={{
+                              color: COLORS.subtext,
+                              fontWeight: 850,
+                              fontSize: 13,
+                            }}
+                          >
+                            Created: {new Date(p.createdAtMs).toLocaleString()}
+                          </div>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            alignItems: "center",
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => executePlannedOrder(p.id)}
+                            disabled={
+                              executingPlannedId === p.id ||
+                              ordersLoading ||
+                              cancelAnyUi
+                            }
+                            style={btnPrimary(
+                              executingPlannedId === p.id ||
+                                ordersLoading ||
+                                cancelAnyUi
+                            )}
+                            title="Execute this planned order on-chain"
+                          >
+                            {executingPlannedId === p.id
+                              ? "Executing…"
+                              : "Execute"}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const owner = getSavedOwnerAddress();
+                              const env = getSavedEnv();
+                              if (!owner || !locationId) return;
+
+                              setPlannedOrders((prev) => {
+                                const next = prev.filter((x) => x.id !== p.id);
+                                savePlanned(env, owner, locationId, next);
+                                return next;
+                              });
+                            }}
+                            style={btnSoft(false)}
+                            title="Discard this planned order"
+                          >
+                            Discard
+                          </button>
+                        </div>
+                      </div>
+
+                      <div
+                        style={{
+                          color: COLORS.subtext,
+                          fontWeight: 850,
+                          fontSize: 13,
+                        }}
+                      >
+                        {(intent?.items ?? [])
+                          .flatMap((it: any) =>
+                            Array.isArray(it?.lines) ? it.lines : []
+                          )
+                          .slice(0, 5)
+                          .map(
+                            (ln: any) =>
+                              `${ln?.sku ?? "—"} × ${ln?.qty ?? ln?.units ?? 0}`
+                          )
+                          .join(" • ")}
+                        {(intent?.items ?? []).flatMap((it: any) =>
+                          Array.isArray(it?.lines) ? it.lines : []
+                        ).length > 5
+                          ? " • …"
+                          : ""}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
           </section>
         </div>
         {/* Floating Chat Button + Right Drawer */}

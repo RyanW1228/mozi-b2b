@@ -11,6 +11,7 @@ import {
   toUtf8Bytes,
   Interface,
   parseUnits,
+  verifyMessage,
 } from "ethers";
 
 import { upsertIntent, pipelineBySku } from "@/lib/intentStore";
@@ -47,6 +48,25 @@ type IntentItem = {
 function intentStore(): Map<string, IntentRow> {
   if (!global.__moziIntentStore) global.__moziIntentStore = new Map();
   return global.__moziIntentStore;
+}
+
+// -------------------------
+// Nonce store (for MetaMask signature verification)
+// -------------------------
+declare global {
+  // eslint-disable-next-line no-var
+  var __moziNonceStore:
+    | Map<string, { nonce: string; issuedAtMs: number }>
+    | undefined;
+}
+
+function nonceStore() {
+  if (!global.__moziNonceStore) global.__moziNonceStore = new Map();
+  return global.__moziNonceStore;
+}
+
+function nonceKey(env: string, owner: string, locationId: string) {
+  return `${env}:${owner.toLowerCase()}:${locationId}`;
 }
 
 // -------------------------
@@ -247,6 +267,14 @@ export async function POST(req: Request) {
       env?: "testing" | "production";
       ownerAddress: string;
 
+      // MetaMask signature verification payload
+      auth?: {
+        message: string;
+        signature: string;
+        nonce: string;
+        issuedAtMs: number;
+      };
+
       // kept for backward compatibility; no longer used for on-chain pending
       pendingWindowHours?: number;
 
@@ -272,6 +300,72 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+
+    // -------------------------
+    // ✅ MetaMask signature verification (owner authorizes Generate Orders)
+    // -------------------------
+    const auth = body.auth;
+
+    const message = String(auth?.message ?? "");
+    const signature = String(auth?.signature ?? "");
+    const nonce = String(auth?.nonce ?? "");
+    const issuedAtMs = Number(auth?.issuedAtMs ?? 0);
+
+    if (!message || !signature || !nonce || !Number.isFinite(issuedAtMs)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Missing auth fields (message/signature/nonce/issuedAtMs)",
+        },
+        { status: 401 }
+      );
+    }
+
+    // 1) Check nonce matches what server issued
+    const k = nonceKey(env, ownerAddress, locationId);
+    const record = nonceStore().get(k);
+
+    if (!record || record.nonce !== nonce) {
+      return NextResponse.json(
+        { ok: false, error: "Invalid nonce" },
+        { status: 401 }
+      );
+    }
+
+    // 2) Enforce freshness window (optional but recommended)
+    const NONCE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+    if (Date.now() - record.issuedAtMs > NONCE_TTL_MS) {
+      nonceStore().delete(k);
+      return NextResponse.json(
+        { ok: false, error: "Nonce expired" },
+        { status: 401 }
+      );
+    }
+
+    // 3) Verify signature recovers ownerAddress
+    let recovered = "";
+    try {
+      recovered = verifyMessage(message, signature);
+    } catch {
+      return NextResponse.json(
+        { ok: false, error: "Bad signature" },
+        { status: 401 }
+      );
+    }
+
+    if (recovered.toLowerCase() !== ownerAddress.toLowerCase()) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Signature does not match ownerAddress",
+          recovered,
+        },
+        { status: 401 }
+      );
+    }
+
+    // 4) Consume nonce (prevents replay)
+    nonceStore().delete(k);
 
     const AGENT_PRIVATE_KEY = process.env.MOZI_AGENT_PRIVATE_KEY ?? "";
     const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL ?? "";
