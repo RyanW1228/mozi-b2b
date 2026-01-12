@@ -121,6 +121,21 @@ function num(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function dbgSku(s: any) {
+  return {
+    sku: String(s?.sku ?? ""),
+    onHandUnits: Number(s?.onHandUnits ?? 0),
+    inboundUnits: Number(s?.inboundUnits ?? 0),
+    // these two are the BIG ones for whether the AI will order it
+    avgDailyConsumption: s?.avgDailyConsumption,
+    useByDays: s?.useByDays,
+    // pricing + supplier for “amount=0” issues
+    priceUsd: s?.priceUsd,
+    supplierId: s?.supplierId,
+    supplier: s?.supplier,
+  };
+}
+
 function buildCallsNoFetch(args: {
   locationId: string;
   ownerAddress: string;
@@ -451,6 +466,25 @@ export async function POST(req: Request) {
       );
     }
 
+    if (!Array.isArray(plan?.orders) || plan.orders.length === 0) {
+      const warnings = Array.isArray(plan?.summary?.warnings)
+        ? plan.summary.warnings
+        : [];
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "No orders were generated. Fix missing SKU usage/pricing and try again.",
+          where: "generatePlan()",
+          detail: warnings.length
+            ? warnings.join(" ")
+            : "Planner returned 0 orders.",
+          planSummary: plan?.summary ?? null,
+        },
+        { status: 400 }
+      );
+    }
+
     // 4) Build encoded calls (NO self-fetch)
     let execJson: any;
     try {
@@ -461,14 +495,29 @@ export async function POST(req: Request) {
         pendingWindowHours: body.pendingWindowHours ?? 24,
       });
     } catch (e: any) {
+      const detail = String(e?.message ?? e);
+
+      // Friendly message for the UI
+      let userMessage =
+        "Generate Orders didn’t create any payable orders. Check that your SKUs have usage (avgDailyConsumption) and pricing (unitCostUsd).";
+
+      // If our pricing layer emits the known “totalUsd=0” message, make it super explicit
+      if (
+        detail.includes("No payable transfers produced") ||
+        detail.includes("totalUsd=0")
+      ) {
+        userMessage =
+          "No orders were created because there was nothing payable (total = $0). This usually means the plan ordered 0 units or pricing/usage data is missing for some SKUs.";
+      }
+
       return NextResponse.json(
         {
           ok: false,
-          error: "Failed to build execution calls",
+          error: userMessage, // 👈 show this to users
           where: "buildCallsNoFetch()",
-          detail: String(e?.message ?? e),
+          detail, // 👈 keep for debugging
         },
-        { status: 500 }
+        { status: 400 } // 400 because it's a “nothing to pay / bad input data” situation
       );
     }
 

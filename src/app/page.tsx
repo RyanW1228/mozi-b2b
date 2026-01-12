@@ -2,7 +2,9 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
+
 import {
   BrowserProvider,
   Contract,
@@ -38,6 +40,7 @@ const TESTING = {
   chainId: 11155111,
   chainIdHex: "0xaa36a7",
   tokenAddress: process.env.NEXT_PUBLIC_MOCK_MNEE_ADDRESS ?? "",
+  hubAddress: process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "",
   tokenLabel: "mMNEE",
   isMintable: true,
 };
@@ -46,7 +49,8 @@ const PRODUCTION = {
   name: "Production (Mainnet)",
   chainId: 1,
   chainIdHex: "0x1",
-  tokenAddress: process.env.NEXT_PUBLIC_MNEE_MAINNET_ADDRESS ?? "",
+  tokenAddress: process.env.NEXT_PUBLIC_MAINNET_MNEE_ADDRESS ?? "",
+  hubAddress: process.env.NEXT_PUBLIC_MAINNET_TREASURY_HUB_ADDRESS ?? "",
   tokenLabel: "MNEE",
   isMintable: false,
 };
@@ -65,14 +69,14 @@ const TREASURY_HUB_ABI = [
   "function withdraw(uint256 amount) external",
   "function withdrawAvailable() external",
   "function balanceOf(address owner) view returns (uint256)",
+
+  // ✅ add this
+  "function requireApprovalForExecution() view returns (bool)",
 ] as const;
 
 const ERC20_APPROVE_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
 ] as const;
-
-const TREASURY_HUB_ADDRESS =
-  process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
 
 const MOZI_AGENT_ADDRESS = process.env.NEXT_PUBLIC_MOZI_AGENT_ADDRESS ?? "";
 
@@ -115,6 +119,8 @@ function chainLabel(chainIdHex: string | null) {
 }
 
 export default function Home() {
+  const router = useRouter();
+
   const hasProvider = useMemo(
     () => typeof window !== "undefined" && !!(window as any).ethereum,
     []
@@ -126,6 +132,7 @@ export default function Home() {
   const [chainIdHex, setChainIdHex] = useState<string | null>(null);
   const addressRef = useRef<string | null>(null);
   const chainIdHexRef = useRef<string | null>(null);
+  const [autonomyEnabled, setAutonomyEnabled] = useState<boolean | null>(null);
 
   const [ethBalance, setEthBalance] = useState<string | null>(null);
   const [tokenBalance, setTokenBalance] = useState<string | null>(null);
@@ -137,9 +144,13 @@ export default function Home() {
   const [walletReady, setWalletReady] = useState(false);
   const [isSwitchingNetwork, setIsSwitchingNetwork] = useState(false);
   const [showSwitchNetwork, setShowSwitchNetwork] = useState(false);
+  const [showAutonomyGate, setShowAutonomyGate] = useState(false);
+
+  // TEMP: replace this with the real on-chain read once you wire it
+  // true = AI can execute without approval; false = autonomy is off (requires approval)
 
   // Mint UI (Testing only)
-  const [mintAmount, setMintAmount] = useState<string>("1000");
+  const [mintAmount, setMintAmount] = useState<string>("20000");
   const [isMinting, setIsMinting] = useState(false);
 
   // Treasury UI
@@ -150,8 +161,8 @@ export default function Home() {
   const [treasuryAvailable, setTreasuryAvailable] = useState<string | null>(
     null
   );
-  const [depositAmount, setDepositAmount] = useState<string>("100");
-  const [withdrawAmount, setWithdrawAmount] = useState<string>("100");
+  const [depositAmount, setDepositAmount] = useState<string>("10000");
+  const [withdrawAmount, setWithdrawAmount] = useState<string>("1000");
   const [isWithdrawing, setIsWithdrawing] = useState(false);
 
   const [isDepositing, setIsDepositing] = useState(false);
@@ -160,6 +171,17 @@ export default function Home() {
 
   const isCorrectChain =
     !!chainIdHex && chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
+
+  const treasuryHasFunds =
+    typeof availableToWithdraw === "string" &&
+    Number.parseFloat(availableToWithdraw) > 0;
+
+  // Production rule:
+  // - Must be connected
+  // - Must be on mainnet
+  // - Must have deposited something into the mainnet treasury hub
+  const canOpenDashboard =
+    env !== "production" || (!!address && isCorrectChain && treasuryHasFunds);
 
   useEffect(() => {
     addressRef.current = address;
@@ -504,35 +526,45 @@ export default function Home() {
       setTokenSymbol(symbol || cfg.tokenLabel);
       setTokenBalance(trimTo6Decimals(formatUnits(raw, decimals)));
 
-      if (TREASURY_HUB_ADDRESS && address) {
-        // ✅ Validate addresses BEFORE passing them to ethers
-        if (!isAddress(TREASURY_HUB_ADDRESS)) {
+      if (cfg.hubAddress && address) {
+        // ✅ Don't read a hub for the wrong chain (causes "missing revert data")
+        const correctChain =
+          !!chainIdHex &&
+          chainIdHex.toLowerCase() === cfg.chainIdHex.toLowerCase();
+
+        if (!correctChain) {
           setAvailableToWithdraw(null);
-          setError(`Invalid TREASURY_HUB_ADDRESS: ${TREASURY_HUB_ADDRESS}`);
+          // if you added autonomyEnabled state, clear it too:
+          // setAutonomyEnabled(null);
+          return;
+        }
+
+        if (!isAddress(cfg.hubAddress)) {
+          setAvailableToWithdraw(null);
+          setError(`Invalid treasury hub address: ${cfg.hubAddress}`);
           return;
         }
 
         try {
-          const hub = new Contract(
-            TREASURY_HUB_ADDRESS,
-            TREASURY_HUB_ABI,
-            provider
-          );
+          const hub = new Contract(cfg.hubAddress, TREASURY_HUB_ABI, provider);
 
-          // New hub: show the owner's treasury balance.
-          // (This is what you want for Testing; it also works for Production.)
           const rawBal = (await (hub as any).balanceOf(address)) as bigint;
-
           setAvailableToWithdraw(
             trimTo6Decimals(formatUnits(rawBal, decimals))
           );
+
+          // If you added the autonomy read:
+          // const requireApproval = (await (hub as any).requireApprovalForExecution()) as boolean;
+          // setAutonomyEnabled(!requireApproval);
         } catch (e: any) {
           setAvailableToWithdraw(null);
+          // setAutonomyEnabled(null);
           const msg = e?.shortMessage || e?.reason || e?.message || String(e);
           setError(`Treasury read failed: ${msg}`);
         }
       } else {
         setAvailableToWithdraw(null);
+        // setAutonomyEnabled(null);
       }
     } catch (e: any) {
       setError(e?.message ?? String(e));
@@ -598,8 +630,12 @@ export default function Home() {
       return;
     }
 
-    if (!TREASURY_HUB_ADDRESS) {
-      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
+    if (!cfg.hubAddress) {
+      setError(
+        env === "testing"
+          ? "Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local"
+          : "Missing NEXT_PUBLIC_MAINNET_TREASURY_HUB_ADDRESS in .env.local"
+      );
       return;
     }
 
@@ -624,11 +660,11 @@ export default function Home() {
         ["function approve(address,uint256) returns (bool)"],
         signer
       );
-      const approveTx = await (token as any).approve(TREASURY_HUB_ADDRESS, amt);
+      const approveTx = await (token as any).approve(cfg.hubAddress, amt);
       await approveTx.wait();
 
       // 2) Deposit into treasury (treasury pulls via transferFrom)
-      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
+      const hub = new Contract(cfg.hubAddress, TREASURY_HUB_ABI, signer);
       const depTx = await (hub as any).deposit(amt);
 
       await depTx.wait();
@@ -652,8 +688,8 @@ export default function Home() {
       return;
     }
 
-    if (!TREASURY_HUB_ADDRESS) {
-      setError("Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local");
+    if (!cfg.hubAddress) {
+      setError("Missing treasury addresses in .env.local");
       return;
     }
 
@@ -671,7 +707,7 @@ export default function Home() {
         return;
       }
 
-      const hub = new Contract(TREASURY_HUB_ADDRESS, TREASURY_HUB_ABI, signer);
+      const hub = new Contract(cfg.hubAddress, TREASURY_HUB_ABI, signer);
       const tx = await (hub as any).withdraw(amt);
       await tx.wait();
 
@@ -814,20 +850,66 @@ export default function Home() {
 
           {/* Right navigation */}
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <Link
-              href="/locations/loc-1"
-              style={{
-                padding: "10px 16px",
-                borderRadius: 12,
-                background: "#ffffff",
-                border: `1px solid ${COLORS.border}`,
-                color: COLORS.text, // ✅ black text
-                textDecoration: "none",
-                fontWeight: 900,
-              }}
-            >
-              Dashboard
-            </Link>
+            {address ? (
+              <Link
+                href={canOpenDashboard ? "/locations/loc-1" : "#"}
+                onClick={(e) => {
+                  if (!canOpenDashboard) {
+                    e.preventDefault();
+                    return;
+                  }
+
+                  // Only gate if we KNOW autonomy is off
+                  if (autonomyEnabled === false) {
+                    e.preventDefault();
+                    setShowAutonomyGate(true);
+                    return;
+                  }
+                }}
+                title={
+                  canOpenDashboard
+                    ? "Open Dashboard"
+                    : env === "production"
+                    ? !address
+                      ? "Connect your wallet first"
+                      : !isCorrectChain
+                      ? "Switch to Mainnet first"
+                      : "Deposit into the mainnet treasury first"
+                    : "Open Dashboard"
+                }
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 12,
+                  background: "#ffffff",
+                  border: `1px solid ${COLORS.border}`,
+                  color: COLORS.text,
+                  textDecoration: "none",
+                  fontWeight: 900,
+
+                  // 👇 ONLY behavioral / state styling — no size, font, or layout changes
+                  cursor: !canOpenDashboard ? "not-allowed" : "pointer",
+                  opacity: !canOpenDashboard ? 0.55 : 1,
+                  pointerEvents: !canOpenDashboard ? "auto" : "auto",
+                }}
+              >
+                Dashboard
+              </Link>
+            ) : (
+              <div
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 12,
+                  background: "#f1f5f9",
+                  border: `1px solid ${COLORS.border}`,
+                  color: COLORS.subtext,
+                  fontWeight: 900,
+                  cursor: "not-allowed",
+                }}
+                title="Connect your wallet to access the dashboard"
+              >
+                Dashboard
+              </div>
+            )}
           </div>
         </header>
 
@@ -979,16 +1061,10 @@ export default function Home() {
               <button
                 onClick={depositToTreasury}
                 disabled={
-                  isDepositing ||
-                  !address ||
-                  !TREASURY_HUB_ADDRESS ||
-                  !isCorrectChain
+                  isDepositing || !address || !cfg.hubAddress || !isCorrectChain
                 }
                 style={btnPrimary(
-                  isDepositing ||
-                    !address ||
-                    !TREASURY_HUB_ADDRESS ||
-                    !isCorrectChain
+                  isDepositing || !address || !cfg.hubAddress || !isCorrectChain
                 )}
               >
                 {isDepositing ? "Depositing…" : "Deposit to Treasury"}
@@ -1044,7 +1120,7 @@ export default function Home() {
                 disabled={
                   isWithdrawing ||
                   !address ||
-                  !TREASURY_HUB_ADDRESS ||
+                  !cfg.hubAddress ||
                   !isCorrectChain
                 }
                 style={{
@@ -1057,14 +1133,14 @@ export default function Home() {
                   cursor:
                     isWithdrawing ||
                     !address ||
-                    !TREASURY_HUB_ADDRESS ||
+                    !cfg.hubAddress ||
                     !isCorrectChain
                       ? "not-allowed"
                       : "pointer",
                   opacity:
                     isWithdrawing ||
                     !address ||
-                    !TREASURY_HUB_ADDRESS ||
+                    !cfg.hubAddress ||
                     !isCorrectChain
                       ? 0.65
                       : 1,
@@ -1080,10 +1156,8 @@ export default function Home() {
                     setError(`Switch to ${cfg.name} to withdraw.`);
                     return;
                   }
-                  if (!TREASURY_HUB_ADDRESS) {
-                    setError(
-                      "Missing NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS in .env.local"
-                    );
+                  if (!cfg.hubAddress) {
+                    setError("Missing contract address in .env.local");
                     return;
                   }
 
@@ -1096,7 +1170,7 @@ export default function Home() {
                     const signer = await provider.getSigner();
 
                     const hub = new Contract(
-                      TREASURY_HUB_ADDRESS,
+                      cfg.hubAddress,
                       TREASURY_HUB_ABI,
                       signer
                     );
@@ -1115,7 +1189,7 @@ export default function Home() {
                 disabled={
                   isWithdrawing ||
                   !address ||
-                  !TREASURY_HUB_ADDRESS ||
+                  !cfg.hubAddress ||
                   !isCorrectChain
                 }
                 style={{
@@ -1128,14 +1202,14 @@ export default function Home() {
                   cursor:
                     isWithdrawing ||
                     !address ||
-                    !TREASURY_HUB_ADDRESS ||
+                    !cfg.hubAddress ||
                     !isCorrectChain
                       ? "not-allowed"
                       : "pointer",
                   opacity:
                     isWithdrawing ||
                     !address ||
-                    !TREASURY_HUB_ADDRESS ||
+                    !cfg.hubAddress ||
                     !isCorrectChain
                       ? 0.65
                       : 1,
@@ -1364,6 +1438,93 @@ export default function Home() {
             </div>
           )}
         </section>
+        {showAutonomyGate && (
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(15, 23, 42, 0.45)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 16,
+              zIndex: 9999,
+            }}
+            onClick={() => setShowAutonomyGate(false)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                width: "100%",
+                maxWidth: 520,
+                background: "#ffffff",
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 16,
+                padding: 16,
+                boxShadow: "0 10px 30px rgba(0,0,0,0.15)",
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 18 }}>
+                One-time autonomy verification
+              </div>
+
+              <div
+                style={{
+                  marginTop: 8,
+                  color: COLORS.subtext,
+                  fontWeight: 650,
+                  lineHeight: 1.4,
+                }}
+              >
+                AI Autonomy is currently <b>OFF</b>. Before opening the
+                Dashboard, Mozi will run a one-time verifier to confirm the
+                safety/permissions setup for autonomous execution.
+              </div>
+
+              <div
+                style={{
+                  marginTop: 14,
+                  display: "flex",
+                  gap: 10,
+                  justifyContent: "flex-end",
+                }}
+              >
+                <button
+                  onClick={() => setShowAutonomyGate(false)}
+                  style={{
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    background: "#ffffff",
+                    color: COLORS.text,
+                    border: `1px solid ${COLORS.border}`,
+                    fontWeight: 900,
+                    cursor: "pointer",
+                  }}
+                >
+                  Got it
+                </button>
+
+                <button
+                  onClick={() => {
+                    setShowAutonomyGate(false);
+                    router.push("/locations/loc-1");
+                  }}
+                  style={{
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    background: COLORS.primary,
+                    color: COLORS.buttonTextLight,
+                    border: "none",
+                    fontWeight: 900,
+                    cursor: "pointer",
+                  }}
+                >
+                  Continue to Dashboard
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

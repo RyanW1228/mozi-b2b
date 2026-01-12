@@ -16,105 +16,19 @@ import {
 } from "ethers";
 
 import { MOZI_TREASURY_HUB_ABI } from "@/lib/abis/moziTreasuryHub";
-
-const COLORS = {
-  text: "#0f172a",
-  subtext: "#64748b",
-  card: "#ffffff",
-  border: "#e5e7eb",
-
-  primary: "#2563eb",
-  buttonTextLight: "#ffffff",
-
-  dangerText: "#991b1b",
-  dangerBg: "#fef2f2",
-  dangerBorder: "#fecaca",
-
-  warnText: "#92400e",
-  warnBg: "#fffbeb",
-  warnBorder: "#fde68a",
-
-  greenText: "#065f46",
-  greenBg: "#f0fdf4",
-  greenBorder: "#bbf7d0",
-};
+import { COLORS } from "@/lib/constants";
+import {
+  shortenId,
+  sleep,
+  fetchJsonWithTimeout,
+  sanitizeIntDraft,
+  draftToClampedInt,
+  pillStyle,
+  strategyLabel,
+} from "@/lib/utils";
 
 const TREASURY_HUB_ADDRESS =
   process.env.NEXT_PUBLIC_MOZI_TREASURY_HUB_ADDRESS ?? "";
-
-function shortenId(id: string) {
-  if (!id) return "—";
-  return id.length <= 14 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function fetchJsonWithTimeout(
-  url: string,
-  opts: RequestInit,
-  timeoutMs: number
-) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, { ...opts, signal: controller.signal });
-    const json = await res.json().catch(() => null);
-    return { res, json };
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-function sanitizeIntDraft(input: string) {
-  // digits only; allow empty while typing
-  return input.replace(/[^\d]/g, "");
-}
-
-function draftToClampedInt(draft: string, min: number, max: number) {
-  if (!draft) return min; // if user leaves blank, snap to min
-  const n = parseInt(draft, 10);
-  if (!Number.isFinite(n) || Number.isNaN(n)) return min;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-
-function pillStyle(colors: {
-  bg: string;
-  border: string;
-  text: string;
-}): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: "6px 10px",
-    borderRadius: 999,
-    border: `1px solid ${colors.border}`,
-    background: colors.bg,
-    color: colors.text,
-    fontWeight: 900,
-    fontSize: 12,
-    lineHeight: 1,
-    whiteSpace: "nowrap",
-  };
-}
-
-function strategyLabel(
-  s: PlanInput["ownerPrefs"]["strategy"] | string | null | undefined
-) {
-  switch (s) {
-    case "min_waste":
-      return "Minimize Waste";
-    case "balanced":
-      return "Balanced";
-    case "min_stockouts":
-      return "Minimize Stockouts";
-    default:
-      return String(s ?? "—");
-  }
-}
 
 function demoTimeKey(locationId: string) {
   // store the absolute simulated "now" (ms since epoch), not an offset
@@ -400,6 +314,30 @@ export default function LocationPage() {
     return demoNowMsAbs ?? Date.now();
   }
 
+  function demoOffsetMs() {
+    // how far the simulated clock is ahead/behind real wall clock
+    return demoNowMs() - Date.now();
+  }
+
+  function fmtWhenDemo(tsUnix: number) {
+    if (!tsUnix) return "—";
+    try {
+      return new Date(tsUnix * 1000 + demoOffsetMs()).toLocaleString();
+    } catch {
+      return String(tsUnix);
+    }
+  }
+
+  function fmtWhenFixedUnix(tsUnix: number) {
+    if (!tsUnix) return "—";
+    try {
+      // IMPORTANT: no demoOffset here; this is a stored timestamp
+      return new Date(tsUnix * 1000).toLocaleString();
+    } catch {
+      return String(tsUnix);
+    }
+  }
+
   // --- Simulate inventory depletion (UI-only time travel drives server inventory) ---
   function makeSeededRng(seed: number) {
     // deterministic LCG (good enough for demo)
@@ -415,7 +353,10 @@ export default function LocationPage() {
     return Math.max(lo, Math.min(hi, x));
   }
 
-  async function consumeInventoryForSimulatedDays(daysAdvanced: number) {
+  async function consumeInventoryForSimulatedDays(
+    daysAdvanced: number,
+    baseNowMsOverride?: number
+  ) {
     if (!locationId || daysAdvanced <= 0) return;
 
     // pull latest state snapshot so depletion uses current inventory + sales
@@ -438,64 +379,124 @@ export default function LocationPage() {
       : [];
     const windowDays = Number(state?.sales?.windowDays ?? 7) || 7;
 
-    // deterministic randomness per simulated day (so it feels stable)
-    // seed changes each simulated day but repeats if you reload
-    const dayIndex = Math.floor(demoNowMs() / (24 * 60 * 60 * 1000));
-    const rng = makeSeededRng(dayIndex ^ 0x9e3779b9);
+    const DAY_MS = 24 * 60 * 60 * 1000;
 
-    // build avg daily consumption from sales window (fallback small baseline)
-    const dailyRateBySku = new Map<string, number>();
+    // --- Build mean daily usage per SKU from your displayed "daily usage" basis ---
+    // dailyMean = unitsSold / windowDays
+    const dailyMeanBySku = new Map<string, number>();
     for (const row of salesBySku) {
       const sku = String(row?.sku ?? "");
       const unitsSold = Number(row?.unitsSold ?? 0);
       if (!sku) continue;
-      const rate = Math.max(0, unitsSold / Math.max(1, windowDays));
-      dailyRateBySku.set(sku, rate);
+      const mean = Math.max(0, unitsSold / Math.max(1, windowDays));
+      dailyMeanBySku.set(sku, mean);
     }
 
-    // Optional: mild “event lift” if any upcoming event matches the simulated date
-    // (keeps it simple but believable)
-    const today = new Date(demoNowMs());
-    const todayIso = today.toISOString().slice(0, 10);
+    // --- Helper: deterministic normal(0,1) from seeded rng (Box–Muller) ---
+    function randNormal(rng: () => number) {
+      // avoid log(0)
+      const u1 = Math.max(1e-12, rng());
+      const u2 = rng();
+      return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    }
+
+    // --- Helper: Poisson-ish sample around mean ---
+    // - For very small means (<1): treat as Bernoulli-ish
+    // - For larger means: normal approximation with variance ~ mean
+    function sampleUnitsFromMean(mean: number, rng: () => number) {
+      if (!Number.isFinite(mean) || mean <= 0) return 0;
+
+      if (mean < 1) {
+        // e.g., mean=0.3 -> 30% chance of 1 unit
+        return rng() < mean ? 1 : 0;
+      }
+
+      // Poisson variance ≈ mean -> sd = sqrt(mean)
+      const z = randNormal(rng);
+      const raw = mean + z * Math.sqrt(mean);
+
+      // clamp at 0, round to int
+      return Math.max(0, Math.round(raw));
+    }
+
+    // Optional: upcoming event lift (same logic you already have, but per simulated day)
     const upcomingEvents = Array.isArray(state?.context?.upcomingEvents)
       ? state.context.upcomingEvents
       : [];
-    const todaysEventLiftPct = upcomingEvents
-      .filter((e: any) => String(e?.date ?? "") === todayIso)
-      .reduce(
-        (acc: number, e: any) =>
-          acc + Number(e?.expectedDemandLiftPercent ?? 0),
-        0
-      );
 
-    const demandLift = 1 + Math.max(0, todaysEventLiftPct) / 100;
+    // Collect consumption lines over N advanced days (usually N=1)
+    // We generate per-day with a per-day seed so it’s stable for a given simulated day.
+    const totalConsumeBySku = new Map<string, number>();
 
-    // pick ~10-14 SKUs to consume per day (fast + avoids huge payloads)
-    const shuffled = [...inventory].sort(() => rng() - 0.5);
-    const pickCount = clampInt(10 + rng() * 5, 8, 16);
-    const picked = shuffled.slice(0, pickCount);
+    for (let d = 0; d < daysAdvanced; d++) {
+      const baseNowMs = baseNowMsOverride ?? demoNowMs();
+      const simDayMs = baseNowMs + d * DAY_MS;
 
-    const lines = picked
-      .map((invRow: any) => {
+      const simDayIndex = Math.floor(simDayMs / DAY_MS);
+
+      const rng = makeSeededRng(simDayIndex ^ 0x9e3779b9);
+
+      const simIso = new Date(simDayMs).toISOString().slice(0, 10);
+      const todaysEventLiftPct = upcomingEvents
+        .filter((e: any) => String(e?.date ?? "") === simIso)
+        .reduce(
+          (acc: number, e: any) =>
+            acc + Number(e?.expectedDemandLiftPercent ?? 0),
+          0
+        );
+
+      const demandLift = 1 + Math.max(0, todaysEventLiftPct) / 100;
+
+      for (const invRow of inventory) {
         const sku = String(invRow?.sku ?? "");
         const onHand = Number(invRow?.onHandUnits ?? 0);
-        if (!sku || !Number.isFinite(onHand) || onHand <= 0) return null;
+        if (!sku || !Number.isFinite(onHand) || onHand <= 0) continue;
 
-        const base = dailyRateBySku.get(sku) ?? 0.4; // fallback: slow drip
-        // randomness: 0.6–1.6x, plus event lift
-        const mult = (0.6 + rng() * 1.0) * demandLift;
+        // ✅ This is the key: consumption mean is your daily usage number
+        const baseMean = dailyMeanBySku.get(sku) ?? 0;
 
-        // consume at least 0, typically 0–(base*mult*daysAdvanced*~1.3)
-        const rawConsume = base * mult * daysAdvanced;
-        const jitter = (rng() - 0.5) * rawConsume * 0.35; // +/- 35% of that
-        const consume = clampInt(rawConsume + jitter, 0, Math.max(0, onHand));
+        // If your “daily usage” is 0, consumption should usually be 0
+        if (baseMean <= 0) continue;
 
-        if (consume <= 0) return null;
-        return { sku, units: consume };
+        const meanToday = baseMean * demandLift;
+
+        const units = sampleUnitsFromMean(meanToday, rng);
+        if (units <= 0) continue;
+
+        totalConsumeBySku.set(sku, (totalConsumeBySku.get(sku) ?? 0) + units);
+      }
+    }
+
+    if (totalConsumeBySku.size === 0) return;
+
+    // Build request lines; clamp to current onHand and cap payload size
+    const MAX_LINES = 20; // keep your server call light
+
+    const invOnHandBySku = new Map<string, number>();
+    for (const invRow of inventory) {
+      const sku = String(invRow?.sku ?? "");
+      const onHand = Number(invRow?.onHandUnits ?? 0);
+      if (!sku) continue;
+      invOnHandBySku.set(
+        sku,
+        Number.isFinite(onHand) ? Math.max(0, Math.floor(onHand)) : 0
+      );
+    }
+
+    let lines = Array.from(totalConsumeBySku.entries())
+      .map(([sku, units]) => {
+        const onHand = invOnHandBySku.get(sku) ?? 0;
+        const clamped = clampInt(units, 0, onHand);
+        return clamped > 0 ? { sku, units: clamped } : null;
       })
-      .filter(Boolean);
+      .filter(Boolean) as { sku: string; units: number }[];
 
     if (lines.length === 0) return;
+
+    // If too many SKUs consumed, keep the biggest drains (most realistic + smallest payload)
+    if (lines.length > MAX_LINES) {
+      lines = lines.sort((a, b) => b.units - a.units).slice(0, MAX_LINES);
+    }
 
     await fetch(
       `/api/inventory/consume?locationId=${encodeURIComponent(locationId)}`,
@@ -509,6 +510,15 @@ export default function LocationPage() {
 
   function demoNowUnix() {
     return Math.floor(demoNowMs() / 1000);
+  }
+
+  // Treat simulated time as "real" time for UI state + stored timestamps
+  function appNowMs() {
+    return demoNowMs();
+  }
+
+  function appNowUnix() {
+    return Math.floor(appNowMs() / 1000);
   }
 
   const [strategy, setStrategy] =
@@ -597,6 +607,96 @@ export default function LocationPage() {
     return `mozi_planned_orders:${env}:${owner.toLowerCase()}:${locationId}`;
   }
 
+  type DemoOrderTimeSnapshot = {
+    execUnix: number; // fixed demo execution time (unix seconds)
+    etaBySupplier: Record<string, number>; // supplierAddrLower -> fixed eta unix
+  };
+
+  type DemoOrderTimeMap = Record<string, DemoOrderTimeSnapshot>;
+
+  function demoReceivedKey(
+    env: string,
+    owner: string,
+    locationId: string,
+    intentRef: string,
+    supplierAddr: string
+  ) {
+    return `mozi_demo_received:${env}:${owner.toLowerCase()}:${locationId}:${intentRef}:${supplierAddr.toLowerCase()}`;
+  }
+
+  function hasDemoReceived(
+    env: string,
+    owner: string,
+    locationId: string,
+    intentRef: string,
+    supplierAddr: string
+  ) {
+    if (typeof window === "undefined") return false;
+    return (
+      window.localStorage.getItem(
+        demoReceivedKey(env, owner, locationId, intentRef, supplierAddr)
+      ) === "1"
+    );
+  }
+
+  function markDemoReceived(
+    env: string,
+    owner: string,
+    locationId: string,
+    intentRef: string,
+    supplierAddr: string
+  ) {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      demoReceivedKey(env, owner, locationId, intentRef, supplierAddr),
+      "1"
+    );
+  }
+
+  function demoOrderTimesKey(env: string, owner: string, locationId: string) {
+    return `mozi_demo_order_times:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function demoPipelineDecKey(env: string, owner: string, locationId: string) {
+    return `mozi_demo_pipeline_decrement:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function loadDemoOrderTimes(
+    env: string,
+    owner: string,
+    locationId: string
+  ): DemoOrderTimeMap {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = window.localStorage.getItem(
+        demoOrderTimesKey(env, owner, locationId)
+      );
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === "object"
+        ? (parsed as DemoOrderTimeMap)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveDemoOrderTimes(
+    env: string,
+    owner: string,
+    locationId: string,
+    map: DemoOrderTimeMap
+  ) {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        demoOrderTimesKey(env, owner, locationId),
+        JSON.stringify(map)
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   function loadPlanned(
     env: string,
     owner: string,
@@ -644,6 +744,31 @@ export default function LocationPage() {
     return `mozi_additional_context:${env}:${owner.toLowerCase()}:${locationId}`;
   }
 
+  function autonomyEnforcedKey(env: string, owner: string, locationId: string) {
+    return `mozi_autonomy_enforced:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function hasEnforcedAutonomy(env: string, owner: string, locationId: string) {
+    if (typeof window === "undefined") return false;
+    return (
+      window.localStorage.getItem(
+        autonomyEnforcedKey(env, owner, locationId)
+      ) === "1"
+    );
+  }
+
+  function markEnforcedAutonomy(
+    env: string,
+    owner: string,
+    locationId: string
+  ) {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      autonomyEnforcedKey(env, owner, locationId),
+      "1"
+    );
+  }
+
   function loadAdditionalContext(
     env: string,
     owner: string,
@@ -683,7 +808,7 @@ export default function LocationPage() {
     if (!Number.isFinite(d) || d < 0) return false;
 
     const expiresAt = item.createdAtMs + d * 24 * 60 * 60 * 1000;
-    return Date.now() < expiresAt;
+    return appNowMs() < expiresAt;
   }
 
   function formatContextForNotes(items: AdditionalContextItem[]) {
@@ -764,6 +889,49 @@ export default function LocationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationId]);
 
+  useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!locationId || !owner || !isAddress(owner)) return;
+
+    // Wait until we've actually read requireApproval from chain
+    if (requireApproval === null) return;
+
+    // Already autonomous => mark it and (optionally) ensure agent
+    if (requireApproval === false) {
+      if (!hasEnforcedAutonomy(env, owner, locationId)) {
+        markEnforcedAutonomy(env, owner, locationId);
+      }
+      // optional: ensure agent is enabled too
+      void ensureAgentEnabled(owner, locationId);
+      return;
+    }
+
+    // requireApproval === true (Manual) -> flip to Autonomous ONCE (will prompt MetaMask once)
+    if (requireApproval === true) {
+      if (hasEnforcedAutonomy(env, owner, locationId)) return; // don't spam prompts
+      markEnforcedAutonomy(env, owner, locationId);
+
+      (async () => {
+        try {
+          // Flip execution mode to Autonomous (requireApproval=false)
+          await setAutonomy(true);
+
+          // Also ensure the agent is enabled (if your autonomous flow needs it)
+          await ensureAgentEnabled(owner, locationId);
+        } catch (e) {
+          // If user rejects tx, allow them to retry later by clearing the flag:
+          // (otherwise they'd be stuck in manual forever)
+          try {
+            window.localStorage.removeItem(
+              autonomyEnforcedKey(env, owner, locationId)
+            );
+          } catch {}
+        }
+      })();
+    }
+  }, [locationId, requireApproval]); // intentionally depends on requireApproval
+
   async function sendChat() {
     const owner = getSavedOwnerAddress();
     const env = getSavedEnv();
@@ -834,11 +1002,12 @@ export default function LocationPage() {
 
       // If model suggests durable info, append it to saved notes.
       if (typeof json.memoryAppend === "string" && json.memoryAppend.trim()) {
+        const nowMs = appNowMs();
         const nextItem: AdditionalContextItem = {
-          id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          id: `${nowMs}_${Math.random().toString(16).slice(2)}`,
           text: json.memoryAppend.trim(),
           durationDays: 7,
-          createdAtMs: Date.now(),
+          createdAtMs: nowMs,
         };
 
         setAdditionalContext((prev) => {
@@ -883,6 +1052,29 @@ export default function LocationPage() {
     Record<string, { name: string; address: string; leadTimeDays: number }>
   >({});
 
+  const [demoOrderTimes, setDemoOrderTimes] = useState<DemoOrderTimeMap>({});
+  type PipelineDecMap = Record<string, number>; // sku -> units to subtract
+  const [pipelineDecBySku, setPipelineDecBySku] = useState<PipelineDecMap>({});
+
+  const advanceDayInFlightRef = useRef(false);
+  const [advanceDayBusy, setAdvanceDayBusy] = useState(false);
+
+  // --- Frontend-only "effective" pipeline stats (subtract units that have arrived in demo time) ---
+  function getEffectivePipelineUnits(p: any, dec: number) {
+    const inbound = Math.max(
+      0,
+      Number(p?.inboundWithinHorizonUnits ?? 0) - dec
+    );
+    const nonArrived = Math.max(
+      0,
+      Number(p?.pipelineAllNonArrivedUnits ?? 0) - dec
+    );
+    return {
+      inboundWithinHorizonUnits: inbound,
+      pipelineAllNonArrivedUnits: nonArrived,
+    };
+  }
+
   function supplierLabel(addr: string) {
     const key = String(addr || "").toLowerCase();
     const hit = supplierByAddress[key];
@@ -907,27 +1099,11 @@ export default function LocationPage() {
   }
 
   // re-render once per second for execution countdown timers
-  const [nowTick, setNowTick] = useState(0);
 
   const lastOrdersAutoUpdateAt = useRef(0);
 
   // auto-update interval (12 hours) - for automatic on-chain order syncs
   const ordersAutoUpdateIntervalMs = 12 * 60 * 60 * 1000; // 12 hours
-
-  useEffect(() => {
-    const owner = getSavedOwnerAddress();
-    const env = getSavedEnv();
-    if (!owner || !locationId) return;
-
-    const items = loadPlanned(env, owner, locationId);
-    setPlannedOrders(items);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationId]);
-
-  useEffect(() => {
-    const id = window.setInterval(() => setNowTick((x) => x + 1), 1000);
-    return () => window.clearInterval(id);
-  }, []);
 
   // Manual vs Autonomous (from chain)
   const [modeLoading, setModeLoading] = useState(false);
@@ -1237,6 +1413,27 @@ export default function LocationPage() {
     }
   }
 
+  function getFixedEtaUnixForRow(
+    snapshotKey: string,
+    supplierAddr: string,
+    execUnix: number
+  ) {
+    const supAddrLower = String(supplierAddr || "").toLowerCase();
+    const snap = demoOrderTimes[snapshotKey];
+
+    // 1) Preferred: frozen ETA stored in localStorage snapshot map
+    const frozen = snap?.etaBySupplier?.[supAddrLower];
+    if (Number.isFinite(frozen) && (frozen as number) > 0)
+      return Number(frozen);
+
+    // 2) Fallback: derive ETA from execUnix + lead days (still deterministic)
+    const leadDays = Math.max(
+      0,
+      Number(supplierLabel(supAddrLower).leadTimeDays ?? 0) || 0
+    );
+    return Number(execUnix || 0) + leadDays * 24 * 60 * 60;
+  }
+
   function formatCountdown(secondsRemaining: number) {
     // secondsRemaining can be fractional/negative; normalize
     const s = Math.floor(secondsRemaining);
@@ -1266,21 +1463,55 @@ export default function LocationPage() {
     return `${sec}s`;
   }
 
-  function arrivalCountdownForSupplier(
-    supplierAddr: string,
-    executeAfterUnix: number
-  ) {
-    const sup = supplierLabel(String(supplierAddr || ""));
-    const leadDays = Number(sup.leadTimeDays ?? 0);
+  function persistPipelineDec(next: PipelineDecMap) {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!locationId || !owner) return;
 
-    const etaUnix =
-      Number(executeAfterUnix || 0) + Math.max(0, leadDays) * 24 * 60 * 60;
+    try {
+      window.localStorage.setItem(
+        demoPipelineDecKey(env, owner, locationId),
+        JSON.stringify(next)
+      );
+    } catch {}
+  }
 
-    if (!etaUnix) return "—";
+  const [state, setState] = useState<any>(null);
+  const [stateLoading, setStateLoading] = useState(false);
 
-    // IMPORTANT: use demo clock so Simulate Time affects countdown
-    const nowUnix = demoNowUnix();
-    return formatCountdown(etaUnix - nowUnix);
+  async function refreshState() {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+
+    if (!locationId || !owner || !isAddress(owner)) {
+      setState(null);
+      return;
+    }
+
+    setStateLoading(true);
+    try {
+      const url =
+        `/api/state?locationId=${encodeURIComponent(locationId)}` +
+        `&owner=${encodeURIComponent(owner)}` +
+        `&env=${encodeURIComponent(env)}`;
+
+      const { res, json } = await fetchJsonWithTimeout(
+        url,
+        { method: "GET" },
+        12_000
+      );
+
+      if (!res.ok) {
+        console.warn("state refresh failed", res.status, json);
+        return;
+      }
+
+      setState(json);
+    } catch (e) {
+      console.warn("state refresh error", e);
+    } finally {
+      setStateLoading(false);
+    }
   }
 
   async function refreshOrders() {
@@ -1366,6 +1597,47 @@ export default function LocationPage() {
       );
 
       setIntents(cleaned);
+      // ✅ Snapshot fixed demo execution/arrival times per order (frontend-only)
+      try {
+        const env2 = env; // already in scope
+        const owner2 = owner; // already in scope
+        const loc2 = locationId; // already in scope
+
+        setDemoOrderTimes((prev) => {
+          const next: DemoOrderTimeMap = { ...(prev || {}) };
+
+          for (const it of cleaned) {
+            const key = String(it?.ref || "");
+            if (!key) continue;
+
+            // already have a snapshot -> keep it unchanged forever
+            if (next[key]?.execUnix) continue;
+
+            const execUnix = demoNowUnix(); // ✅ snapshot "demo now" at first sight
+
+            // compute per-supplier fixed ETA using supplier lead times
+            const etaBySupplier: Record<string, number> = {};
+            const items = Array.isArray(it?.items) ? it.items : [];
+
+            for (const item of items) {
+              const supAddr = String(item?.supplier || "").toLowerCase();
+              if (!supAddr) continue;
+
+              const sup = supplierLabel(supAddr);
+              const leadDays = Math.max(0, Number(sup.leadTimeDays ?? 0) || 0);
+
+              etaBySupplier[supAddr] = execUnix + leadDays * 24 * 60 * 60;
+            }
+
+            next[key] = { execUnix, etaBySupplier };
+          }
+
+          saveDemoOrderTimes(env2, owner2, loc2, next);
+          return next;
+        });
+      } catch {
+        // ignore
+      }
     } catch (e: any) {
       setIntents([]);
       setRequireApproval(null);
@@ -1445,6 +1717,227 @@ export default function LocationPage() {
     justifySelf: "end",
   });
 
+  const receiveInFlightRef = useRef(false);
+
+  async function receiveInventory(lines: { sku: string; units: number }[]) {
+    if (!locationId) return;
+    if (receiveInFlightRef.current) return;
+
+    const env = getSavedEnv();
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) return;
+
+    const cleaned = (lines || [])
+      .map((l) => ({
+        sku: String(l?.sku ?? "").trim(),
+        units: Math.max(0, Math.floor(Number(l?.units ?? 0))),
+      }))
+      .filter((l) => l.sku && l.units > 0);
+
+    if (cleaned.length === 0) return;
+
+    receiveInFlightRef.current = true;
+    try {
+      const { res, json } = await fetchJsonWithTimeout(
+        `/api/inventory/receive?locationId=${encodeURIComponent(locationId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lines: cleaned }),
+        },
+        12_000
+      );
+
+      if (!res.ok || !json?.ok) {
+        console.warn("receive failed", res.status, json);
+        return; // ✅ IMPORTANT: do NOT decrement pipeline if receive failed
+      }
+
+      // ✅ NEW: decrement pipeline stats in demo mode (persisted)
+      const storageKey = demoPipelineDecKey(env, owner, locationId);
+      setPipelineDecBySku((prev) => {
+        const next: Record<string, number> = { ...(prev ?? {}) };
+        for (const l of cleaned) {
+          next[l.sku] = Math.max(0, Math.floor((next[l.sku] ?? 0) + l.units));
+        }
+        try {
+          window.localStorage.setItem(storageKey, JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+    } finally {
+      receiveInFlightRef.current = false;
+    }
+  }
+
+  function newlyArrivedUnitsBySku(nowUnix: number): Record<string, number> {
+    const env = getSavedEnv();
+    const owner = getSavedOwnerAddress();
+    if (!locationId || !owner || !isAddress(owner)) return {};
+
+    const out: Record<string, number> = {};
+
+    const allIntents: IntentRow[] = [
+      ...plannedOrders.map((p) => ({
+        ...(p.intent as any),
+        ref: `planned:${p.id}`,
+      })),
+      ...intents,
+    ];
+
+    for (const intent of allIntents) {
+      const intentRef = String(intent?.ref || "");
+      if (!intentRef) continue;
+
+      const items = Array.isArray(intent?.items) ? intent.items : [];
+      if (items.length === 0) continue;
+
+      const supplierAddrs = Array.from(
+        new Set(items.map((it) => String(it?.supplier || "").toLowerCase()))
+      ).filter(Boolean);
+
+      const snap = demoOrderTimes[intentRef];
+      const execUnix =
+        Number(snap?.execUnix ?? 0) ||
+        Number(
+          (intent as any).createdAtUnix ??
+            (items[0] as any)?.createdAtUnix ??
+            intent.executeAfter ??
+            0
+        );
+
+      for (const supAddrLower of supplierAddrs) {
+        // only count if it *wasn't* received before, but *is* arrived now
+        if (hasDemoReceived(env, owner, locationId, intentRef, supAddrLower))
+          continue;
+
+        const etaUnix = getFixedEtaUnixForRow(
+          intentRef,
+          supAddrLower,
+          execUnix
+        );
+        if (!etaUnix || nowUnix < etaUnix) continue;
+
+        for (const it of items) {
+          if (String(it?.supplier || "").toLowerCase() !== supAddrLower)
+            continue;
+
+          const lines = Array.isArray((it as any).lines)
+            ? (it as any).lines
+            : [];
+          for (const ln of lines) {
+            const sku = String(ln?.sku || ln?.skuId || "").trim();
+            const qty = Math.max(
+              0,
+              Math.floor(Number(ln?.qty ?? ln?.units ?? ln?.quantity ?? 0) || 0)
+            );
+            if (!sku || qty <= 0) continue;
+            out[sku] = (out[sku] ?? 0) + qty;
+          }
+        }
+      }
+    }
+
+    return out;
+  }
+
+  async function applyArrivalsNowUnix(nowUnix: number) {
+    if (!locationId) return;
+
+    const env = getSavedEnv();
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) return;
+
+    // Apply receipts for BOTH:
+    // - planned intents (ref = planned:<id>)
+    // - chain intents (ref = bytes32)
+    const allIntents: IntentRow[] = [
+      ...plannedOrders.map((p) => ({
+        ...(p.intent as any),
+        ref: `planned:${p.id}`,
+      })),
+      ...intents,
+    ];
+
+    for (const intent of allIntents) {
+      const intentRef = String(intent?.ref || "");
+      if (!intentRef) continue;
+
+      const items = Array.isArray(intent?.items) ? intent.items : [];
+      if (items.length === 0) continue;
+
+      const supplierAddrs = Array.from(
+        new Set(items.map((it) => String(it?.supplier || "").toLowerCase()))
+      ).filter(Boolean);
+
+      for (const supAddrLower of supplierAddrs) {
+        // already applied -> skip
+        if (hasDemoReceived(env, owner, locationId, intentRef, supAddrLower))
+          continue;
+
+        // exec time: prefer frozen snapshot, else fallback to receipt fields
+        const snap = demoOrderTimes[intentRef];
+        const execUnix =
+          Number(snap?.execUnix ?? 0) ||
+          Number(
+            (intent as any).createdAtUnix ??
+              (items[0] as any)?.createdAtUnix ??
+              intent.executeAfter ??
+              0
+          );
+
+        const etaUnix = getFixedEtaUnixForRow(
+          intentRef,
+          supAddrLower,
+          execUnix
+        );
+        if (!etaUnix || nowUnix < etaUnix) continue;
+
+        // Build receive lines for that supplier
+        const receiveLines: { sku: string; units: number }[] = [];
+
+        for (const it of items) {
+          const itSup = String(it?.supplier || "").toLowerCase();
+          if (itSup !== supAddrLower) continue;
+
+          const lines = Array.isArray((it as any).lines)
+            ? (it as any).lines
+            : [];
+          for (const ln of lines) {
+            const sku = String(ln?.sku || ln?.skuId || "").trim();
+            const qty = Math.max(
+              0,
+              Math.floor(Number(ln?.qty ?? ln?.units ?? ln?.quantity ?? 0) || 0)
+            );
+            if (sku && qty > 0) receiveLines.push({ sku, units: qty });
+          }
+        }
+
+        if (receiveLines.length === 0) {
+          // still mark received so we don't loop forever on empty lines
+          markDemoReceived(env, owner, locationId, intentRef, supAddrLower);
+          continue;
+        }
+
+        // combine duplicates
+        const bySku = new Map<string, number>();
+        for (const l of receiveLines) {
+          bySku.set(l.sku, (bySku.get(l.sku) ?? 0) + l.units);
+        }
+        const combined = Array.from(bySku.entries()).map(([sku, units]) => ({
+          sku,
+          units,
+        }));
+
+        // Mark first (prevents double-apply)
+        markDemoReceived(env, owner, locationId, intentRef, supAddrLower);
+
+        // Apply to server inventory immediately
+        await receiveInventory(combined);
+      }
+    }
+  }
+
   async function planOrder() {
     if (!locationId) return;
     if (planningLoading) return;
@@ -1456,7 +1949,9 @@ export default function LocationPage() {
       const env = getSavedEnv();
 
       if (!owner || !isAddress(owner)) {
-        setError("No valid wallet found. Go connect wallet first.");
+        setOrdersError(
+          "No valid wallet found. Go to the homepage, connect wallet, then come back here."
+        );
         return;
       }
 
@@ -1535,9 +2030,11 @@ export default function LocationPage() {
         return;
       }
 
+      const nowMs = appNowMs();
+
       const planned: PlannedOrder = {
-        id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
-        createdAtMs: Date.now(),
+        id: `${nowMs}_${Math.random().toString(16).slice(2)}`,
+        createdAtMs: nowMs,
         env,
         owner,
         locationId,
@@ -1555,44 +2052,6 @@ export default function LocationPage() {
     } finally {
       setPlanningLoading(false);
     }
-  }
-
-  function deletePlannedOrder(plannedId: string) {
-    const owner = getSavedOwnerAddress();
-    const env = getSavedEnv();
-    if (!owner || !locationId) return;
-
-    setPlannedOrders((prev) => {
-      const next = prev.filter((p) => p.id !== plannedId);
-      savePlanned(env, owner, locationId, next);
-      return next;
-    });
-
-    // cleanup any edit state
-    setEditingPlannedId((cur) => (cur === plannedId ? null : cur));
-    setPlannedQtyDrafts((prev) => {
-      const copy = { ...prev };
-      delete copy[plannedId];
-      return copy;
-    });
-  }
-
-  function startEditPlannedOrder(plannedId: string, skuRows: any[]) {
-    setEditingPlannedId(plannedId);
-
-    setPlannedQtyDrafts((prev) => {
-      const next = { ...prev };
-      const rowMap: Record<string, string> = {};
-
-      for (const r of skuRows) {
-        const rowKey = String(r.__rowKey || "");
-        if (!rowKey) continue;
-        rowMap[rowKey] = String(Number(r.qty ?? 0));
-      }
-
-      next[plannedId] = rowMap;
-      return next;
-    });
   }
 
   function cancelEditPlannedOrder(plannedId: string) {
@@ -1648,113 +2107,19 @@ export default function LocationPage() {
     cancelEditPlannedOrder(plannedId);
   }
 
-  async function executePlannedOrder(plannedId: string) {
-    if (!locationId) return;
-    if (executingPlannedId) return;
+  function isUserRejected(e: any) {
+    // MetaMask / EIP-1193 user rejected request
+    const code = e?.code ?? e?.info?.error?.code;
+    if (code === 4001) return true;
 
-    const owner = getSavedOwnerAddress();
-    const env = getSavedEnv();
-    if (!owner || !isAddress(owner)) {
-      setError("No valid wallet found. Go connect wallet first.");
-      return;
-    }
-
-    const planned = plannedOrders.find((p) => p.id === plannedId);
-    if (!planned) return;
-
-    setExecutingPlannedId(plannedId);
-    setError("");
-
-    try {
-      // nonce
-      const nonceRes = await fetch(
-        `/api/auth/nonce?env=${encodeURIComponent(
-          env
-        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
-          locationId
-        )}`,
-        { method: "GET" }
-      );
-      const nonceJson = await nonceRes.json().catch(() => null);
-      if (!nonceRes.ok || !nonceJson?.ok) {
-        setError(
-          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
-        );
-        return;
-      }
-
-      const nonce: string = String(nonceJson.nonce ?? "");
-      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
-
-      // signature
-      const injected = getInjectedProvider();
-      if (!injected) {
-        setError("No injected wallet found (MetaMask).");
-        return;
-      }
-      const provider = new BrowserProvider(injected);
-      await provider.send("eth_requestAccounts", []);
-      const signer = await provider.getSigner();
-      const signerAddr = await signer.getAddress();
-
-      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setError(
-          `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
-        );
-        return;
-      }
-
-      const message =
-        `Mozi: Execute Planned Order\n` +
-        `env: ${env}\n` +
-        `locationId: ${locationId}\n` +
-        `owner: ${owner}\n` +
-        `plannedId: ${plannedId}\n` +
-        `nonce: ${nonce}\n` +
-        `issuedAtMs: ${issuedAtMs}\n`;
-
-      const signature = await signer.signMessage(message);
-
-      const res = await fetch(
-        `/api/orders/execute-planned?locationId=${encodeURIComponent(
-          locationId
-        )}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            env,
-            ownerAddress: owner,
-            auth: { message, signature, nonce, issuedAtMs },
-            plannedId,
-            intent: planned.intent,
-            calls: planned.calls,
-          }),
-        }
-      );
-
-      const json = await res.json().catch(() => null);
-
-      if (!res.ok || !json?.ok) {
-        setError(
-          `EXECUTE PLANNED HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
-        );
-        return;
-      }
-
-      // remove planned from local list
-      setPlannedOrders((prev) => {
-        const next = prev.filter((p) => p.id !== plannedId);
-        savePlanned(env, owner, locationId, next);
-        return next;
-      });
-
-      await refreshOrders();
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
-    } finally {
-      setExecutingPlannedId(null);
-    }
+    const msg = String(e?.shortMessage ?? e?.message ?? "").toLowerCase();
+    return (
+      msg.includes("user rejected") ||
+      msg.includes("rejected the request") ||
+      msg.includes("denied") ||
+      msg.includes("cancelled") ||
+      msg.includes("canceled")
+    );
   }
 
   async function generateOrders() {
@@ -1762,10 +2127,12 @@ export default function LocationPage() {
 
     if (manualGenerateInFlight.current) return;
 
+    setOrdersError("");
+
     setLoading(true);
     manualGenerateInFlight.current = true;
 
-    setError("");
+    setOrdersError("");
     setPlan(null);
     setPaymentIntent(null);
     setExecuteResp(null);
@@ -1775,7 +2142,7 @@ export default function LocationPage() {
       const env = getSavedEnv();
 
       if (!owner || !isAddress(owner)) {
-        setError(
+        setOrdersError(
           "No valid wallet found. Go to the homepage, connect wallet, then come back here."
         );
         return;
@@ -1792,7 +2159,7 @@ export default function LocationPage() {
       );
       const nonceJson = await nonceRes.json().catch(() => null);
       if (!nonceRes.ok || !nonceJson?.ok) {
-        setError(
+        setOrdersError(
           `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
         );
         return;
@@ -1804,7 +2171,7 @@ export default function LocationPage() {
       // 2) MetaMask signature gate (user sees a signature prompt)
       const injected = getInjectedProvider();
       if (!injected) {
-        setError("No injected wallet found (MetaMask).");
+        setOrdersError("No injected wallet found (MetaMask).");
         return;
       }
 
@@ -1814,7 +2181,7 @@ export default function LocationPage() {
 
       const signerAddr = await signer.getAddress();
       if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setError(
+        setOrdersError(
           `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
         );
         return;
@@ -1839,17 +2206,14 @@ export default function LocationPage() {
           body: JSON.stringify({
             env,
             ownerAddress: owner,
-
-            // auth
             auth: { message, signature, nonce, issuedAtMs },
-
-            // no pending period / no approval step
             pendingWindowHours: 0,
-
-            // control knobs
             strategy,
             horizonDays,
             notes: formatContextForNotes(additionalContext),
+
+            // NEW: persist “execution time” as the simulated click moment
+            clientExecUnix: demoNowUnix(),
           }),
         }
       );
@@ -1857,7 +2221,7 @@ export default function LocationPage() {
       const json = await res.json().catch(() => null);
 
       if (!res.ok || !json?.ok) {
-        setError(
+        setOrdersError(
           `GENERATE ORDERS HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
         );
         return;
@@ -1865,12 +2229,158 @@ export default function LocationPage() {
 
       await refreshOrders();
     } catch (e: any) {
-      setError(String(e?.message ?? e));
+      // ✅ If the user cancels the MetaMask signature prompt, don't show an error.
+      if (isUserRejected(e)) return;
+
+      setOrdersError(String(e?.message ?? e));
     } finally {
       manualGenerateInFlight.current = false;
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (!locationId) return;
+
+    const env = getSavedEnv();
+    const owner = getSavedOwnerAddress();
+    if (!owner || !isAddress(owner)) return;
+
+    // Check every second (cheap), but only calls server when a new arrival is detected
+    const t = window.setInterval(() => {
+      try {
+        const nowUnix = demoNowUnix();
+
+        // We apply receipts for BOTH:
+        // - chain intents (intent.ref is bytes32)
+        // - planned intents (intent.ref is "planned:<id>")
+        const allIntents: IntentRow[] = [
+          ...plannedOrders.map((p) => ({
+            ...(p.intent as any),
+            ref: `planned:${p.id}`,
+          })),
+          ...intents,
+        ];
+
+        for (const intent of allIntents) {
+          const intentRef = String(intent?.ref || "");
+          if (!intentRef) continue;
+
+          const items = Array.isArray(intent?.items) ? intent.items : [];
+          if (items.length === 0) continue;
+
+          // For each supplier in this intent, compute its ETA using your frozen snapshot map
+          const supplierAddrs = Array.from(
+            new Set(items.map((it) => String(it?.supplier || "").toLowerCase()))
+          ).filter(Boolean);
+
+          for (const supAddrLower of supplierAddrs) {
+            // already applied -> skip
+            if (
+              hasDemoReceived(env, owner, locationId, intentRef, supAddrLower)
+            )
+              continue;
+
+            // execUnix snapshot: use your existing frozen map if present
+            const snap = demoOrderTimes[intentRef];
+            const execUnix =
+              Number(snap?.execUnix ?? 0) ||
+              Number(
+                (intent as any).createdAtUnix ??
+                  (items[0] as any)?.createdAtUnix ??
+                  intent.executeAfter ??
+                  0
+              );
+
+            const etaUnix = getFixedEtaUnixForRow(
+              intentRef,
+              supAddrLower,
+              execUnix
+            );
+
+            // Not arrived yet
+            if (!etaUnix || nowUnix < etaUnix) continue;
+
+            // ✅ It just arrived (or is overdue). Build receive lines for that supplier.
+            const receiveLines: { sku: string; units: number }[] = [];
+            for (const it of items) {
+              const itSup = String(it?.supplier || "").toLowerCase();
+              if (itSup !== supAddrLower) continue;
+
+              const lines = Array.isArray((it as any).lines)
+                ? (it as any).lines
+                : [];
+
+              for (const ln of lines) {
+                const sku = String(ln?.sku || ln?.skuId || "").trim();
+                const qty = Math.max(
+                  0,
+                  Math.floor(
+                    Number(ln?.qty ?? ln?.units ?? ln?.quantity ?? 0) || 0
+                  )
+                );
+                if (sku && qty > 0) receiveLines.push({ sku, units: qty });
+              }
+            }
+
+            // combine duplicates
+            const bySku = new Map<string, number>();
+            for (const l of receiveLines) {
+              bySku.set(l.sku, (bySku.get(l.sku) ?? 0) + l.units);
+            }
+            const combined = Array.from(bySku.entries()).map(
+              ([sku, units]) => ({
+                sku,
+                units,
+              })
+            );
+
+            // Mark first (prevents double-apply if interval ticks fast)
+            markDemoReceived(env, owner, locationId, intentRef, supAddrLower);
+
+            // Call server to update inventory
+            void receiveInventory(combined);
+          }
+        }
+      } catch (e) {
+        console.warn("arrival watcher error", e);
+      }
+    }, 1000);
+
+    return () => window.clearInterval(t);
+    // IMPORTANT deps: anything used inside must be included
+  }, [locationId, intents, plannedOrders, demoOrderTimes, demoNowMsAbs]);
+
+  useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!locationId || !owner || !isAddress(owner)) {
+      setDemoOrderTimes({});
+      return;
+    }
+
+    setDemoOrderTimes(loadDemoOrderTimes(env, owner, locationId));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationId]);
+
+  useEffect(() => {
+    const owner = getSavedOwnerAddress();
+    const env = getSavedEnv();
+    if (!locationId || !owner || !isAddress(owner)) {
+      setPipelineDecBySku({});
+      return;
+    }
+
+    try {
+      const raw = window.localStorage.getItem(
+        demoPipelineDecKey(env, owner, locationId)
+      );
+      const parsed = raw ? JSON.parse(raw) : {};
+      setPipelineDecBySku(parsed && typeof parsed === "object" ? parsed : {});
+    } catch {
+      setPipelineDecBySku({});
+    }
+  }, [locationId]);
 
   useEffect(() => {
     // On first load, bind this location to the connected owner wallet (if available)
@@ -1971,6 +2481,7 @@ export default function LocationPage() {
     if (!locationId) return;
 
     refreshOrders();
+    refreshState(); // ✅ add this
 
     const owner = getSavedOwnerAddress();
     if (owner && isAddress(owner)) {
@@ -2218,23 +2729,60 @@ export default function LocationPage() {
                 <button
                   type="button"
                   onClick={async () => {
-                    const DAY = 24 * 60 * 60 * 1000;
+                    if (advanceDayInFlightRef.current) return;
 
-                    const base = demoNowMsAbs ?? Date.now();
-                    const next = base + DAY;
+                    advanceDayInFlightRef.current = true;
+                    setAdvanceDayBusy(true);
 
-                    // update state
-                    setDemoNowMsAbs(next);
-
-                    // write immediately (so navigation can’t skip persistence)
                     try {
-                      window.localStorage.setItem(
-                        demoTimeKey(locationId),
-                        String(next)
-                      );
-                    } catch {}
+                      const DAY = 24 * 60 * 60 * 1000;
 
-                    await consumeInventoryForSimulatedDays(1);
+                      const base = demoNowMsAbs ?? appNowMs();
+                      const next = base + DAY;
+                      const nextUnix = Math.floor(next / 1000);
+
+                      // 1) update simulated clock (state + persist)
+                      setDemoNowMsAbs(next);
+                      try {
+                        window.localStorage.setItem(
+                          demoTimeKey(locationId),
+                          String(next)
+                        );
+                      } catch {}
+
+                      // 2) update pipeline decrement map for anything that just arrived at "next"
+                      const arrivedBySku = newlyArrivedUnitsBySku(nextUnix);
+                      if (Object.keys(arrivedBySku).length > 0) {
+                        setPipelineDecBySku((prev) => {
+                          const nextMap: PipelineDecMap = { ...(prev || {}) };
+                          for (const [sku, units] of Object.entries(
+                            arrivedBySku
+                          )) {
+                            nextMap[sku] =
+                              (nextMap[sku] ?? 0) + (Number(units) || 0);
+                          }
+                          persistPipelineDec(nextMap);
+                          return nextMap;
+                        });
+                      }
+
+                      // 3) apply arrivals to server inventory
+                      await applyArrivalsNowUnix(nextUnix);
+
+                      // 4) consume inventory for the simulated day on server
+                      await consumeInventoryForSimulatedDays(1, next);
+
+                      // ✅ 5) force UI to re-sync from server after mutations
+                      await refreshState(); // ✅ this is what updates pipeline from server
+                      await refreshOrders(); // keep this too
+
+                      // If you also render inventory/plan from /api/state elsewhere on this page,
+                      // you should call your “refresh state” function here too.
+                      // Example (if you have one): await refreshState();
+                    } finally {
+                      setAdvanceDayBusy(false);
+                      advanceDayInFlightRef.current = false;
+                    }
                   }}
                   style={btnSoft(false)}
                   title="Fast-forward the UI by 1 day"
@@ -2627,13 +3175,15 @@ export default function LocationPage() {
                             ? 0
                             : draftToClampedInt(contextDaysDraft, 1, 365);
 
+                          const nowMs = appNowMs();
+
                           const nextItem: AdditionalContextItem = {
-                            id: `${Date.now()}_${Math.random()
+                            id: `${nowMs}_${Math.random()
                               .toString(16)
                               .slice(2)}`,
                             text,
                             durationDays: days,
-                            createdAtMs: Date.now(),
+                            createdAtMs: nowMs,
                           };
 
                           setAdditionalContext((prev) => {
@@ -2879,28 +3429,6 @@ export default function LocationPage() {
               {/* Left: title + pill */}
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <div style={{ fontWeight: 950, fontSize: 16 }}>Orders</div>
-
-                {requireApproval === null ? null : requireApproval ? (
-                  <span
-                    style={pillStyle({
-                      bg: COLORS.warnBg,
-                      border: COLORS.warnBorder,
-                      text: COLORS.warnText,
-                    })}
-                  >
-                    Manual
-                  </span>
-                ) : (
-                  <span
-                    style={pillStyle({
-                      bg: COLORS.greenBg,
-                      border: COLORS.greenBorder,
-                      text: COLORS.greenText,
-                    })}
-                  >
-                    Autonomous
-                  </span>
-                )}
               </div>
 
               {/* Right: buttons */}
@@ -2912,64 +3440,16 @@ export default function LocationPage() {
                   flexWrap: "wrap",
                 }}
               >
-                {/* Autonomy toggle */}
+                {/* Generate/Plan orders */}
                 <button
                   type="button"
-                  onClick={() => {
-                    // If unknown, assume enabling autonomy (safe default UX)
-                    const currentlyAutonomous =
-                      requireApproval === null ? false : !requireApproval;
-                    setAutonomy(!currentlyAutonomous);
-                  }}
-                  disabled={
-                    modeLoading || loading || ordersLoading || cancelAnyUi
-                  }
-                  style={btnSoft(
-                    modeLoading || loading || ordersLoading || cancelAnyUi
-                  )}
-                  title={
-                    requireApproval === null
-                      ? "Toggle autonomy (mode unknown until wallet is connected)"
-                      : requireApproval
-                      ? "Switch to Autonomous (AI can execute immediately)"
-                      : "Switch to Manual (requires approval before execution)"
-                  }
+                  onClick={generateOrders}
+                  disabled={loading || ordersLoading || cancelAnyUi}
+                  style={btnPrimary(loading || ordersLoading || cancelAnyUi)}
+                  title="Create new on-chain orders"
                 >
-                  {modeLoading
-                    ? "Switching…"
-                    : requireApproval === null
-                    ? "Enable Autonomy"
-                    : requireApproval
-                    ? "Enable Autonomy"
-                    : "Disable Autonomy"}
+                  {loading ? "Generating…" : "Generate Orders"}
                 </button>
-
-                {/* Generate/Plan orders */}
-                {requireApproval ? (
-                  <button
-                    type="button"
-                    onClick={planOrder}
-                    disabled={
-                      planningLoading || ordersLoading || cancelAnyUi || loading
-                    }
-                    style={btnPrimary(
-                      planningLoading || ordersLoading || cancelAnyUi || loading
-                    )}
-                    title="Plan a new order (no on-chain tx until you execute)"
-                  >
-                    {planningLoading ? "Planning…" : "Plan Order"}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={generateOrders}
-                    disabled={loading || ordersLoading || cancelAnyUi}
-                    style={btnPrimary(loading || ordersLoading || cancelAnyUi)}
-                    title="Create new on-chain orders"
-                  >
-                    {loading ? "Generating…" : "Generate Orders"}
-                  </button>
-                )}
               </div>
             </div>
 
@@ -2994,8 +3474,6 @@ export default function LocationPage() {
             ) : (
               <div style={{ display: "grid", gap: 12 }}>
                 {(() => {
-                  void nowTick;
-
                   // 1) Convert plannedOrders -> “intent-like” rows
                   type DisplayIntent =
                     | (IntentRow & { __kind: "chain" })
@@ -3046,15 +3524,41 @@ export default function LocationPage() {
                   });
 
                   // Show last 10 total (planned + chain)
-                  const visibleIntents = sorted.slice(0, 10);
+                  const visibleIntents = sorted.slice(0, 50);
 
-                  return visibleIntents.map((intent) => {
-                    const key = String(intent.ref || "");
-                    const isOpen = Boolean(openOrderKeys[key]);
+                  return visibleIntents.map((intent, orderIdx) => {
                     const isPlanned = (intent as any).__kind === "planned";
                     const plannedId = isPlanned
                       ? String((intent as any).__plannedId || "")
                       : "";
+                    // FIXED execution time per order:
+                    // - planned orders: use the stored createdAtMs (already based on appNowMs when created)
+                    // - chain orders: MUST come from backend (createdAtUnix) or we fall back to executeAfter
+                    const snapshotKey = isPlanned
+                      ? `planned:${plannedId}`
+                      : String(intent.ref || "");
+                    const snap = snapshotKey
+                      ? demoOrderTimes[snapshotKey]
+                      : undefined;
+
+                    const execUnix =
+                      snap?.execUnix ??
+                      (isPlanned
+                        ? Math.floor(
+                            Number((intent as any).__createdAtMs || 0) / 1000
+                          )
+                        : Number(
+                            (intent as any).createdAtUnix ??
+                              (intent as any)?.items?.[0]?.createdAtUnix ??
+                              intent.executeAfter ??
+                              0
+                          ));
+
+                    const key = isPlanned
+                      ? `planned:${plannedId}`
+                      : String(intent.ref || "") ||
+                        `chain:${String(intent.owner || "")}`;
+                    const isOpen = Boolean(openOrderKeys[key]);
                     const isEditingThisPlanned =
                       isPlanned && editingPlannedId === plannedId;
 
@@ -3226,7 +3730,9 @@ export default function LocationPage() {
                         >
                           <div style={{ display: "grid", gap: 4 }}>
                             {/* Row 1: Order */}
-                            <div style={{ fontWeight: 950 }}>Order</div>
+                            <div style={{ fontWeight: 950 }}>
+                              Order {visibleIntents.length - orderIdx}
+                            </div>
 
                             {/* Row 2: Suppliers summary */}
                             <div
@@ -3344,9 +3850,7 @@ export default function LocationPage() {
                                   >
                                     Execution time
                                   </div>
-                                  <div>
-                                    {fmtWhen(Number(intent.executeAfter))}
-                                  </div>
+                                  <div>{fmtWhenFixedUnix(execUnix)}</div>
                                 </div>
                               </div>
 
@@ -3484,7 +3988,7 @@ export default function LocationPage() {
                                             : "—"}
                                         </td>
 
-                                        {/* Arrival Time */}
+                                        {/* Arrival Time (frozen ETA, countdown driven by demo clock) */}
                                         <td
                                           style={{
                                             padding: 12,
@@ -3494,10 +3998,26 @@ export default function LocationPage() {
                                             whiteSpace: "nowrap",
                                           }}
                                         >
-                                          {arrivalCountdownForSupplier(
-                                            r.supplierAddr,
-                                            r.executeAfter
-                                          )}
+                                          {(() => {
+                                            // snapshotKey is already defined earlier in your intent map loop
+                                            const etaUnix =
+                                              getFixedEtaUnixForRow(
+                                                snapshotKey,
+                                                r.supplierAddr,
+                                                execUnix
+                                              );
+
+                                            // demoNowUnix() uses your simulated time
+                                            const remaining =
+                                              etaUnix - demoNowUnix();
+
+                                            // ✅ After arrival
+                                            if (remaining <= 0)
+                                              return "Arrived";
+
+                                            // ✅ Countdown again
+                                            return formatCountdown(remaining);
+                                          })()}
                                         </td>
                                       </tr>
                                     ))}

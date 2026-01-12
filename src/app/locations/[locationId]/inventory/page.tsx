@@ -120,6 +120,7 @@ export default function InventoryPage() {
   const [newPriceDraft, setNewPriceDraft] = useState("0");
   const [newUseByDraft, setNewUseByDraft] = useState("0");
   const [newSupplier, setNewSupplier] = useState("");
+  const [newAvgDraft, setNewAvgDraft] = useState("0");
 
   const cardStyle: React.CSSProperties = {
     marginTop: 16,
@@ -522,6 +523,7 @@ export default function InventoryPage() {
     const units = draftToNonNegInt(newUnitsDraft);
     const priceUsd = draftToNonNegFloat(newPriceDraft);
     const useByDays = draftToNonNegInt(newUseByDraft);
+    const avgDailyConsumption = draftToNonNegFloat(newAvgDraft);
 
     setRows((prev) => [{ sku, onHandUnits: units }, ...prev]);
     setDraftUnits((prev) => ({ ...prev, [sku]: String(units) }));
@@ -529,12 +531,14 @@ export default function InventoryPage() {
     const meta: SkuMeta = {
       supplier,
       priceUsd,
-      avgDailyConsumption: 0,
+      avgDailyConsumption,
       useByDays,
     };
+
     setMetaBySku((prev) => ({ ...prev, [sku]: meta }));
     setDraftSupplier((p) => ({ ...p, [sku]: supplier }));
     setDraftPrice((p) => ({ ...p, [sku]: String(priceUsd) }));
+    setDraftAvg((p) => ({ ...p, [sku]: String(avgDailyConsumption) }));
     setDraftUseBy((p) => ({ ...p, [sku]: String(useByDays) }));
 
     // NEW: after adding, view-only by default (except On hand is always editable)
@@ -543,6 +547,7 @@ export default function InventoryPage() {
     setNewSku("");
     setNewUnitsDraft("0");
     setNewPriceDraft("0");
+    setNewAvgDraft("0");
     setNewUseByDraft("0");
     setNewSupplier("");
 
@@ -815,7 +820,7 @@ export default function InventoryPage() {
                 />
               </div>
 
-              {/* Daily Usage (calculated) */}
+              {/* Daily Usage */}
               <div style={{ display: "grid", gap: 6, width: 170 }}>
                 <div
                   style={{
@@ -828,22 +833,20 @@ export default function InventoryPage() {
                   }}
                 >
                   Daily Usage
-                  <InfoBubble text="Daily Usage is calculated automatically from platform data." />
                 </div>
 
-                <div
-                  style={{
-                    ...inputStyle,
-                    width: "100%",
-                    textAlign: "right",
-                    background: "rgba(255,255,255,0.55)",
-                    color: COLORS.subtext,
-                    cursor: "not-allowed",
-                    userSelect: "none",
-                  }}
-                >
-                  —
-                </div>
+                <input
+                  inputMode="decimal"
+                  value={newAvgDraft}
+                  onChange={(e) =>
+                    setNewAvgDraft(sanitizeNumberDraft(e.target.value))
+                  }
+                  onBlur={() =>
+                    setNewAvgDraft(String(draftToNonNegFloat(newAvgDraft)))
+                  }
+                  placeholder="0"
+                  style={{ ...inputStyle, width: "100%", textAlign: "right" }}
+                />
               </div>
 
               {/* Use-by */}
@@ -949,7 +952,6 @@ export default function InventoryPage() {
                       }}
                     >
                       Daily Usage
-                      <InfoBubble text="Daily Usage is calculated automatically from platform data." />
                     </span>
                   </th>
 

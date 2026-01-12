@@ -27,14 +27,34 @@ function jsonError(message: string, status: number) {
   return NextResponse.json({ ok: false, error: message }, { status });
 }
 
-function toNonNegNumber(x: unknown): number {
-  if (typeof x !== "number" || !Number.isFinite(x)) return 0;
-  return Math.max(0, x);
+// Match the client normalizeSku() so keys line up.
+function normalizeSku(input: string) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
+// Accept numbers OR numeric strings
+function toNonNegNumber(x: unknown): number {
+  if (typeof x === "number" && Number.isFinite(x)) return Math.max(0, x);
+  if (typeof x === "string") {
+    const n = Number(x);
+    if (Number.isFinite(n)) return Math.max(0, n);
+  }
+  return 0;
+}
+
+// Accept numbers OR numeric strings; clamp to int >= 0
 function toNonNegInt(x: unknown): number {
-  if (typeof x !== "number" || !Number.isFinite(x)) return 0;
-  return Math.max(0, Math.floor(x));
+  if (typeof x === "number" && Number.isFinite(x))
+    return Math.max(0, Math.floor(x));
+  if (typeof x === "string") {
+    const n = Number(x);
+    if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+  }
+  return 0;
 }
 
 export async function GET(req: Request) {
@@ -43,7 +63,7 @@ export async function GET(req: Request) {
 
   if (!locationId) return jsonError("Missing locationId in query string", 400);
 
-  const metaBySku = getInventoryMetaBySku(locationId);
+  const metaBySku = getInventoryMetaBySku(locationId) ?? {};
   return NextResponse.json(
     { ok: true, metaBySku },
     { headers: { "Cache-Control": "no-store" } }
@@ -61,7 +81,8 @@ export async function POST(req: Request) {
     meta?: unknown;
   } | null;
 
-  const sku = String(body?.sku ?? "").trim();
+  const skuRaw = String(body?.sku ?? "").trim();
+  const sku = normalizeSku(skuRaw);
   if (!sku) return jsonError("Missing sku", 400);
 
   const metaRaw = body?.meta as Partial<SkuMeta> | undefined;
@@ -80,7 +101,13 @@ export async function POST(req: Request) {
   };
 
   setInventoryMetaForSku(locationId, sku, meta);
-  return NextResponse.json({ ok: true });
+
+  console.log("[api/inventory/meta][POST] saved", { locationId, sku, meta });
+
+  return NextResponse.json(
+    { ok: true, sku, meta },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }
 
 export async function DELETE(req: Request) {
@@ -90,9 +117,14 @@ export async function DELETE(req: Request) {
   if (!locationId) return jsonError("Missing locationId in query string", 400);
 
   const body = (await req.json().catch(() => null)) as { sku?: unknown } | null;
-  const sku = String(body?.sku ?? "").trim();
+
+  const skuRaw = String(body?.sku ?? "").trim();
+  const sku = normalizeSku(skuRaw);
   if (!sku) return jsonError("Missing sku", 400);
 
   const deleted = deleteInventoryMetaForSku(locationId, sku);
-  return NextResponse.json({ ok: true, deleted });
+  return NextResponse.json(
+    { ok: true, deleted },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }

@@ -16,14 +16,36 @@ function jsonError(message: string, status: number) {
   return NextResponse.json({ error: message }, { status });
 }
 
+// Match the client normalizeSku() so keys line up.
+function normalizeSku(input: string) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+// Accept numbers OR numeric strings; clamp to int >= 0
+function toNonNegInt(x: unknown): number | null {
+  if (typeof x === "number" && Number.isFinite(x))
+    return Math.max(0, Math.floor(x));
+  if (typeof x === "string") {
+    const n = Number(x);
+    if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+  }
+  return null;
+}
+
 export async function GET(req: Request) {
   const locationId = getLocationIdFromUrl(req.url);
   console.log("[api/inventory][GET]", { locationId });
 
   if (!locationId) return jsonError("Missing locationId in query string", 400);
 
-  const state = getState(locationId);
-  return NextResponse.json(state.inventory, {
+  const state = getState(locationId) as any;
+  const inv = Array.isArray(state?.inventory) ? state.inventory : [];
+
+  return NextResponse.json(inv, {
     headers: { "Cache-Control": "no-store" },
   });
 }
@@ -39,19 +61,19 @@ export async function POST(req: Request) {
     onHandUnits?: unknown;
   } | null;
 
-  const sku = String(body?.sku ?? "").trim();
-  const onHandUnitsRaw = body?.onHandUnits;
-
+  const skuRaw = String(body?.sku ?? "").trim();
+  const sku = normalizeSku(skuRaw);
   if (!sku) return jsonError("Missing sku", 400);
-  if (typeof onHandUnitsRaw !== "number" || !Number.isFinite(onHandUnitsRaw)) {
-    return jsonError("Missing or invalid onHandUnits", 400);
-  }
 
-  // Enforce integer, non-negative
-  const onHandUnits = Math.max(0, Math.floor(onHandUnitsRaw));
+  const n = toNonNegInt(body?.onHandUnits);
+  if (n === null) return jsonError("Missing or invalid onHandUnits", 400);
 
-  patchInventory(locationId, sku, onHandUnits);
-  return NextResponse.json({ ok: true });
+  patchInventory(locationId, sku, n);
+
+  return NextResponse.json(
+    { ok: true, sku, onHandUnits: n },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }
 
 export async function DELETE(req: Request) {
@@ -61,19 +83,26 @@ export async function DELETE(req: Request) {
   if (!locationId) return jsonError("Missing locationId in query string", 400);
 
   const body = (await req.json().catch(() => null)) as { sku?: unknown } | null;
-  const sku = String(body?.sku ?? "").trim();
 
+  const skuRaw = String(body?.sku ?? "").trim();
+  const sku = normalizeSku(skuRaw);
   if (!sku) return jsonError("Missing sku", 400);
 
-  const state = getState(locationId);
-  const before = state.inventory ?? [];
-  const exists = before.some((r) => r.sku === sku);
+  const state = getState(locationId) as any;
+  const before = Array.isArray(state?.inventory) ? state.inventory : [];
+  const exists = before.some((r: any) => String(r?.sku ?? "") === sku);
 
-  // Idempotent delete
   if (!exists) {
-    return NextResponse.json({ ok: true, deleted: false });
+    return NextResponse.json(
+      { ok: true, deleted: false },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   }
 
   removeInventorySku(locationId, sku);
-  return NextResponse.json({ ok: true, deleted: true });
+
+  return NextResponse.json(
+    { ok: true, deleted: true },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }

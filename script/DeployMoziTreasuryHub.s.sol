@@ -6,9 +6,9 @@ import {MoziTreasuryHub} from "../contracts/MoziTreasuryHub.sol";
 
 contract DeployMoziTreasuryHub is Script {
     function run() external returns (MoziTreasuryHub hub) {
-        address tokenAddr = vm.envAddress("MNEE_TOKEN");
+        address tokenAddr = vm.envAddress("MAINNET_MNEE_TOKEN");
 
-        vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
+        vm.startBroadcast(vm.envUint("MAINNET_PRIVATE_KEY"));
         hub = new MoziTreasuryHub(tokenAddr);
         vm.stopBroadcast();
     }

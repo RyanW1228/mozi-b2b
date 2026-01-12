@@ -87,7 +87,7 @@ const SEED_STATE: RestaurantState = {
       name: "Ground Beef",
       category: "meat",
       unit: "lb",
-      shelfLifeDays: 2,
+      shelfLifeDays: 4,
       supplierId: "meatco",
       unitCostUsd: 4.0,
     },
@@ -354,13 +354,111 @@ function cloneSeedForLocation(locationId: string): RestaurantState {
   return cloned;
 }
 
+function titleFromSku(sku: string) {
+  return sku.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function deriveSupplierIdFromName(
+  state: RestaurantState,
+  supplierName: string
+) {
+  const key = String(supplierName ?? "")
+    .trim()
+    .toLowerCase();
+  if (!key) return undefined;
+
+  for (const s of state.suppliers ?? []) {
+    const idKey = String((s as any)?.supplierId ?? "")
+      .trim()
+      .toLowerCase();
+    const nameKey = String((s as any)?.name ?? "")
+      .trim()
+      .toLowerCase();
+    if (key === idKey || key === nameKey) return (s as any).supplierId;
+  }
+  return undefined;
+}
+
+function applyInventoryMetaToState(locationId: string, state: RestaurantState) {
+  const metaBySku = getInventoryMetaBySku(locationId);
+
+  const existingSkus = new Map<string, any>(
+    (state.skus ?? []).map((s: any) => [String(s?.sku ?? ""), s])
+  );
+
+  // 1) Update existing SKU rows with meta
+  const updatedSkus = (state.skus ?? []).map((s: any) => {
+    const sku = String(s?.sku ?? "");
+    const meta = metaBySku[sku];
+    if (!meta) return s;
+
+    return {
+      ...s,
+      avgDailyConsumption: meta.avgDailyConsumption,
+      shelfLifeDays: s.shelfLifeDays ?? meta.useByDays,
+      unitCostUsd: s.unitCostUsd ?? meta.priceUsd,
+    };
+  });
+
+  // 2) IMPORTANT: If meta exists for a SKU that isn't in state.skus yet,
+  // add a minimal SKU definition so generatePlan can order it.
+  for (const [sku, meta] of Object.entries(metaBySku)) {
+    if (!sku) continue;
+    if (existingSkus.has(sku)) continue;
+
+    const supplierId =
+      deriveSupplierIdFromName(state, meta.supplier) ?? "drygoodsco";
+
+    updatedSkus.push({
+      sku,
+      name: titleFromSku(sku),
+      category: "custom",
+      unit: "unit",
+      shelfLifeDays: meta.useByDays || 0,
+      supplierId,
+      unitCostUsd: meta.priceUsd || 0,
+      avgDailyConsumption: meta.avgDailyConsumption || 0,
+    });
+  }
+
+  // 3) Also ensure inventory has every SKU (so UI + effectiveOnHand stays consistent)
+  const invBySku = new Map<string, any>(
+    (state.inventory ?? []).map((i: any) => [String(i?.sku ?? ""), i])
+  );
+  for (const s of updatedSkus) {
+    const sku = String((s as any)?.sku ?? "");
+    if (!sku) continue;
+    if (!invBySku.has(sku)) invBySku.set(sku, { sku, onHandUnits: 0 });
+  }
+  const nextInventory = Array.from(invBySku.values());
+
+  return { ...state, skus: updatedSkus, inventory: nextInventory };
+}
+
+// ✅ NEW: arrived-units decrement for pipeline display
+const pipelineDecByLocationId = new Map<string, Record<string, number>>();
+
+export function addPipelineDec(locationId: string, sku: string, units: number) {
+  if (!locationId) return;
+  const s = String(sku ?? "").trim();
+  const u = Math.max(0, Math.floor(Number(units ?? 0)));
+  if (!s || u <= 0) return;
+
+  const cur = pipelineDecByLocationId.get(locationId) ?? {};
+  pipelineDecByLocationId.set(locationId, { ...cur, [s]: (cur[s] ?? 0) + u });
+}
+
+export function getPipelineDecBySku(locationId: string) {
+  return pipelineDecByLocationId.get(locationId) ?? {};
+}
+
 /**
  * ✅ NEW:
  * Seed per-location inventory meta from the seed SKUs + suppliers, if missing.
  *
  * - priceUsd: uses unitCostUsd
  * - useByDays: uses shelfLifeDays
- * - avgDailyConsumption: defaults to 0 (no seed data)
+ * - avgDailyConsumption: derived from sales unitsSold/windowDays (fallback 0)
  * - supplier: supplier name derived from supplierId
  */
 function seedInventoryMetaIfMissing(locationId: string) {
@@ -370,12 +468,31 @@ function seedInventoryMetaIfMissing(locationId: string) {
     (SEED_STATE.suppliers ?? []).map((s) => [s.supplierId, s.name])
   );
 
+  // ✅ Build avg/day from seed sales
+  const windowDaysRaw = (SEED_STATE as any).sales?.windowDays;
+  const windowDays =
+    typeof windowDaysRaw === "number" &&
+    Number.isFinite(windowDaysRaw) &&
+    windowDaysRaw > 0
+      ? windowDaysRaw
+      : 0;
+
+  const soldBySku = new Map<string, number>();
+  for (const row of ((SEED_STATE as any).sales?.bySku ?? []) as Array<any>) {
+    const sku = String(row?.sku ?? "");
+    const unitsSold = typeof row?.unitsSold === "number" ? row.unitsSold : 0;
+    if (sku) soldBySku.set(sku, Math.max(0, unitsSold));
+  }
+
   const seeded: Record<string, InventoryMeta> = {};
   for (const s of SEED_STATE.skus ?? []) {
+    const unitsSold = soldBySku.get((s as any).sku) ?? 0;
+    const avg = windowDays > 0 ? Math.max(0, unitsSold / windowDays) : 0;
+
     seeded[s.sku] = {
       priceUsd:
         typeof (s as any).unitCostUsd === "number" ? (s as any).unitCostUsd : 0,
-      avgDailyConsumption: 0,
+      avgDailyConsumption: avg,
       useByDays:
         typeof (s as any).shelfLifeDays === "number"
           ? (s as any).shelfLifeDays
@@ -422,15 +539,15 @@ export function deleteInventoryMetaForSku(locationId: string, sku: string) {
 // -------------------------
 export function getState(locationId: string): RestaurantState {
   const existing = statesByLocationId.get(locationId);
-  if (existing) return existing;
+  if (existing) {
+    return applyInventoryMetaToState(locationId, existing);
+  }
 
   const created = cloneSeedForLocation(locationId);
   statesByLocationId.set(locationId, created);
 
-  // ✅ Ensure meta exists even if meta is requested immediately after state creation
   seedInventoryMetaIfMissing(locationId);
-
-  return created;
+  return applyInventoryMetaToState(locationId, created);
 }
 
 export function setState(locationId: string, next: RestaurantState) {
