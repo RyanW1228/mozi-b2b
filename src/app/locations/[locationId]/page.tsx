@@ -39,31 +39,6 @@ function demoConsumedKey(locationId: string) {
   return `mozi_demo_consumed_units:${locationId}`;
 }
 
-function demoConsumeStatsKey(locationId: string) {
-  return `mozi_demo_consume_stats:${locationId}`;
-}
-
-function chatMemoryKey(env: string, owner: string, locationId: string) {
-  return `mozi_chat_memory:${env}:${owner.toLowerCase()}:${locationId}`;
-}
-
-function loadChatMemory(env: string, owner: string, locationId: string) {
-  if (typeof window === "undefined") return "";
-  return (
-    window.localStorage.getItem(chatMemoryKey(env, owner, locationId)) ?? ""
-  );
-}
-
-function saveChatMemory(
-  env: string,
-  owner: string,
-  locationId: string,
-  value: string
-) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(chatMemoryKey(env, owner, locationId), value);
-}
-
 function HelpDot({
   title = "What do these mean?",
   align = "auto",
@@ -338,6 +313,47 @@ export default function LocationPage() {
     }
   }
 
+  // -------------------------
+  // Executed Orders (localStorage fallback for Vercel)
+  // -------------------------
+  function executedOrdersKey(env: string, owner: string, locationId: string) {
+    return `mozi_executed_orders:${env}:${owner.toLowerCase()}:${locationId}`;
+  }
+
+  function loadExecutedLocal(
+    env: string,
+    owner: string,
+    locationId: string
+  ): IntentRow[] {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(
+        executedOrdersKey(env, owner, locationId)
+      );
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveExecutedLocal(
+    env: string,
+    owner: string,
+    locationId: string,
+    intents: IntentRow[]
+  ) {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        executedOrdersKey(env, owner, locationId),
+        JSON.stringify(intents.slice(0, 200)) // cap size
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   // --- Simulate inventory depletion (UI-only time travel drives server inventory) ---
   function makeSeededRng(seed: number) {
     // deterministic LCG (good enough for demo)
@@ -398,6 +414,47 @@ export default function LocationPage() {
       const u1 = Math.max(1e-12, rng());
       const u2 = rng();
       return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    }
+
+    // -------------------------
+    // Executed Orders (localStorage fallback for Vercel)
+    // -------------------------
+    function executedOrdersKey(env: string, owner: string, locationId: string) {
+      return `mozi_executed_orders:${env}:${owner.toLowerCase()}:${locationId}`;
+    }
+
+    function loadExecutedLocal(
+      env: string,
+      owner: string,
+      locationId: string
+    ): IntentRow[] {
+      if (typeof window === "undefined") return [];
+      try {
+        const raw = window.localStorage.getItem(
+          executedOrdersKey(env, owner, locationId)
+        );
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function saveExecutedLocal(
+      env: string,
+      owner: string,
+      locationId: string,
+      intents: IntentRow[]
+    ) {
+      if (typeof window === "undefined") return;
+      try {
+        window.localStorage.setItem(
+          executedOrdersKey(env, owner, locationId),
+          JSON.stringify(intents.slice(0, 200)) // cap size
+        );
+      } catch {
+        // ignore
+      }
     }
 
     // --- Helper: Poisson-ish sample around mean ---
@@ -1596,7 +1653,46 @@ export default function LocationPage() {
         (it) => Array.isArray(it.items) && it.items.length > 0
       );
 
+      let finalIntents = cleaned;
+
+      // 🚑 If backend returned nothing (Vercel cold start / memory loss),
+      // fall back to locally stored executed orders
+      if (finalIntents.length === 0) {
+        const local = loadExecutedLocal(env, owner, locationId);
+        if (local.length > 0) {
+          finalIntents = local;
+        }
+      }
+
+      setIntents(finalIntents);
+
+      // Save executed orders locally for persistence
+      try {
+        const executedOnly = finalIntents.filter(
+          (it) => it.executed && !it.canceled && Array.isArray(it.items)
+        );
+        saveExecutedLocal(env, owner, locationId, executedOnly);
+      } catch {
+        // ignore
+      }
+
       setIntents(cleaned);
+      // ✅ Persist executed orders locally for Vercel / serverless fallback
+      try {
+        const env2 = env;
+        const owner2 = owner;
+        const loc2 = locationId;
+
+        // Only store real executed orders (not empty, not canceled)
+        const executedOnly = cleaned.filter(
+          (it) => it.executed && !it.canceled && Array.isArray(it.items)
+        );
+
+        saveExecutedLocal(env2, owner2, loc2, executedOnly);
+      } catch {
+        // ignore
+      }
+
       // ✅ Snapshot fixed demo execution/arrival times per order (frontend-only)
       try {
         const env2 = env; // already in scope
@@ -1938,122 +2034,6 @@ export default function LocationPage() {
     }
   }
 
-  async function planOrder() {
-    if (!locationId) return;
-    if (planningLoading) return;
-
-    setPlanningLoading(true);
-    setError("");
-    try {
-      const owner = getSavedOwnerAddress();
-      const env = getSavedEnv();
-
-      if (!owner || !isAddress(owner)) {
-        setOrdersError(
-          "No valid wallet found. Go to the homepage, connect wallet, then come back here."
-        );
-        return;
-      }
-
-      // 1) nonce
-      const nonceRes = await fetch(
-        `/api/auth/nonce?env=${encodeURIComponent(
-          env
-        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
-          locationId
-        )}`,
-        { method: "GET" }
-      );
-      const nonceJson = await nonceRes.json().catch(() => null);
-      if (!nonceRes.ok || !nonceJson?.ok) {
-        setError(
-          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
-        );
-        return; //
-      }
-
-      const nonce: string = String(nonceJson.nonce ?? "");
-      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
-
-      // 2) signature
-      const injected = getInjectedProvider();
-      if (!injected) {
-        setError("No injected wallet found (MetaMask).");
-        return;
-      }
-
-      const provider = new BrowserProvider(injected);
-      await provider.send("eth_requestAccounts", []);
-      const signer = await provider.getSigner();
-      const signerAddr = await signer.getAddress();
-
-      if (signerAddr.toLowerCase() !== owner.toLowerCase()) {
-        setError(
-          `Connected wallet (${signerAddr}) does not match saved owner (${owner}).`
-        );
-        return;
-      }
-
-      const message =
-        `Mozi: Plan Order\n` +
-        `env: ${env}\n` +
-        `locationId: ${locationId}\n` +
-        `owner: ${owner}\n` +
-        `nonce: ${nonce}\n` +
-        `issuedAtMs: ${issuedAtMs}\n`;
-
-      const signature = await signer.signMessage(message);
-
-      // 3) plan (NO BROADCAST)
-      const res = await fetch(
-        `/api/orders/plan?locationId=${encodeURIComponent(locationId)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            env,
-            ownerAddress: owner,
-            auth: { message, signature, nonce, issuedAtMs },
-            strategy,
-            horizonDays,
-            notes: formatContextForNotes(additionalContext),
-          }),
-        }
-      );
-
-      const json = await res.json().catch(() => null);
-
-      if (!res.ok || !json?.ok) {
-        setError(
-          `PLAN ORDER HTTP ${res.status}\n` + JSON.stringify(json, null, 2)
-        );
-        return;
-      }
-
-      const nowMs = appNowMs();
-
-      const planned: PlannedOrder = {
-        id: `${nowMs}_${Math.random().toString(16).slice(2)}`,
-        createdAtMs: nowMs,
-        env,
-        owner,
-        locationId,
-        intent: json.intent as IntentRow,
-        calls: (json.calls ?? []) as { to: string; data: string }[],
-      };
-
-      setPlannedOrders(() => {
-        const next = [planned]; // ✅ only one planned order allowed
-        savePlanned(env, owner, locationId, next);
-        return next;
-      });
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
-    } finally {
-      setPlanningLoading(false);
-    }
-  }
-
   function cancelEditPlannedOrder(plannedId: string) {
     setEditingPlannedId((cur) => (cur === plannedId ? null : cur));
     setPlannedQtyDrafts((prev) => {
@@ -2228,6 +2208,16 @@ export default function LocationPage() {
       }
 
       await refreshOrders();
+      // Force-save the latest visible orders locally after generation
+      try {
+        const env2 = env;
+        const owner2 = owner;
+        const loc2 = locationId;
+        const local = loadExecutedLocal(env2, owner2, loc2);
+        if (local.length > 0) {
+          saveExecutedLocal(env2, owner2, loc2, local);
+        }
+      } catch {}
     } catch (e: any) {
       // ✅ If the user cancels the MetaMask signature prompt, don't show an error.
       if (isUserRejected(e)) return;
