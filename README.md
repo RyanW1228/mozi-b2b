@@ -15,11 +15,6 @@ This repository contains the full stack:
 ## ✨ Key Features
 
 - **AI-driven order planning** – Converts inventory state + business constraints into a concrete purchasing plan.
-- **Autonomous or Manual execution** – Toggle between:
-
-  - **Autonomous:** AI plans and immediately executes on-chain.
-  - **Manual:** AI plans first, user approves before execution.
-
 - **On-chain payments** – Orders are executed as smart contract calls, providing transparency and auditability.
 - **Pipeline-aware inventory** – Tracks inbound orders so future plans account for what’s already been ordered.
 - **Stateless-friendly MVP design** – In-memory stores and idempotent routes for fast hackathon iteration.
