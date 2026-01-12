@@ -124,7 +124,12 @@ function buildBaseInputNoFetch(args: {
 
     return {
       ...s,
-      onHandUnits: arrivedOnHand + inbound,
+
+      // IMPORTANT:
+      // - onHandUnits must mean "arrived/physically on hand"
+      // - inbound stays in pipeline (context.pipelineBySku)
+      // generatePlan will compute effectiveOnHandUnits = onHandUnits + pipelineUnits
+      onHandUnits: arrivedOnHand,
       inboundUnits: inbound,
     };
   });

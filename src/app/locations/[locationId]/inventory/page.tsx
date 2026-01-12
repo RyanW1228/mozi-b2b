@@ -93,6 +93,11 @@ export default function InventoryPage() {
   }, [params]);
 
   const [rows, setRows] = useState<InventoryRow[]>([]);
+  const [ownerAddress, setOwnerAddress] = useState<string>("");
+  const [incomingBySku, setIncomingBySku] = useState<Record<string, number>>(
+    {}
+  );
+
   const [loading, setLoading] = useState(false);
   const [savingSku, setSavingSku] = useState<string | null>(null);
 

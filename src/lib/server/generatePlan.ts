@@ -168,7 +168,7 @@ function makeCompactPromptPayload(input: PlanInput) {
       // inventory
       onHandUnits: onHand,
       pipelineUnits: pipe,
-      effectiveOnHandUnits: onHand + pipe,
+      effectiveOnHandUnits: onHand,
 
       // signals
       avgDailyConsumption:
@@ -241,9 +241,9 @@ async function callGeminiForJson(args: {
           model: "models/gemini-2.5-pro",
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           config: {
-            temperature: 0.2,
-            topP: 0.9,
-            topK: 40,
+            temperature: 1,
+            topP: 0.95,
+            topK: 60,
 
             // IMPORTANT: give it plenty of output tokens
             maxOutputTokens: 8192,
@@ -321,7 +321,7 @@ export async function generatePlan(input: PlanInput): Promise<PlanOutput> {
     `- avgDailyConsumption (units/day)\n` +
     `- supplier leadTimeDays (days)\n` +
     `- useByDays (shelf life in days)\n` +
-    `- effectiveOnHandUnits (onHandUnits + pipelineUnits)\n` +
+    `- onHandUnits\n` +
     `planningHorizonDays is SECONDARY and should have minimal impact.\n\n` +
     `PlanOutput schema:\n` +
     `{\n` +
@@ -344,9 +344,9 @@ export async function generatePlan(input: PlanInput): Promise<PlanOutput> {
     `1) Only use sku values from inputs.skus[].sku.\n` +
     `2) Only use supplierId values from inputs.suppliers[].supplierId.\n` +
     `3) Never output items with orderUnits <= 0. If you would output 0, OMIT the SKU.\n` +
-    `4) Do NOT buy “random extras”. Only order when the math says you are below the target or reorder point.\n` +
+    `4) Do NOT buy “random extras”. Only order when the math says you are below the target or reorder point. You do not have to order from every supplier in every order.\n` +
     `5) For every ordered item, item.reason MUST include numbers:\n` +
-    `   daily, useByDays, leadTimeDays, targetOnHandUnits, effectiveOnHandUnits, reorderPointUnits, shortage.\n` +
+    `   daily, useByDays, leadTimeDays, targetOnHandUnits, onHandUnits, reorderPointUnits, shortage.\n` +
     `6) You MUST read and apply inputs.additionalContext if it contains any demand/constraint signal.\n` +
     `7) For every ordered item, item.reason must explicitly say whether additionalContext affected this SKU.\n` +
     `8) summary.contextApplied must list the concrete changes you made due to additionalContext (or "No actionable context found").\n` +
@@ -354,7 +354,7 @@ export async function generatePlan(input: PlanInput): Promise<PlanOutput> {
     `   Use leadTimeDays + safety buffer and order when below reorderPointUnits.\n` +
     `10) Do NOT reduce ordering because an order was recently placed. Each run is independent.\n` +
     `11) You MUST use supplier leadTimeDays when available to determine reorder urgency.\n` +
-    `12) If a SKU has daily > 0 and effectiveOnHandUnits is below reorderPointUnits, you MUST order (do not omit).\n\n` +
+    `12) If a SKU has daily > 0 and onHandUnits is below reorderPointUnits, you MUST order (do not omit).\n\n` +
     `Core calculation rules (do the math — lead time + safety, bounded by shelf life):\n` +
     `- daily = sku.avgDailyConsumption (units/day). If missing/0, treat daily as 0 and OMIT.\n` +
     `- useBy = sku.useByDays (days). If missing/0, treat useBy as 30.\n` +
@@ -371,15 +371,15 @@ export async function generatePlan(input: PlanInput): Promise<PlanOutput> {
     `- reorderPointUnits = daily * clamp(lead + 1, 1, 10)\n` +
     `\n` +
     `Strategy handling (still stockout-averse):\n` +
-    `- If inputs.ownerPrefs.strategy is "minimize_waste": targetOnHandUnits = targetOnHandUnits * 0.95\n` +
+    `- If inputs.ownerPrefs.strategy is "min_waste": targetOnHandUnits = targetOnHandUnits * 0.95\n` +
     `- If inputs.ownerPrefs.strategy is "balanced": targetOnHandUnits = targetOnHandUnits * 1.10\n` +
-    `- If inputs.ownerPrefs.strategy is "minimize_stockouts": targetOnHandUnits = targetOnHandUnits * 1.25\n` +
+    `- If inputs.ownerPrefs.strategy is "min_stockouts": targetOnHandUnits = targetOnHandUnits * 1.25\n` +
     `- Otherwise: targetOnHandUnits = targetOnHandUnits * 1.10\n` +
     `\n` +
     `Ordering logic (MUST avoid stockouts):\n` +
-    `- effectiveOnHandUnits = sku.effectiveOnHandUnits\n` +
-    `- shortage = targetOnHandUnits - effectiveOnHandUnits\n` +
-    `- belowReorderPoint = effectiveOnHandUnits <= reorderPointUnits\n` +
+    `- availableUnits = sku.onHandUnits\n` +
+    `- shortage = targetOnHandUnits - availableUnits\n` +
+    `- belowReorderPoint = availableUnits <= reorderPointUnits\n` +
     `- If belowReorderPoint: you MUST order at least max(1, ceil(shortage)).\n` +
     `- Otherwise: orderUnits = ceil(max(0, shortage)).\n` +
     `\n` +
@@ -403,7 +403,7 @@ export async function generatePlan(input: PlanInput): Promise<PlanOutput> {
     `- Prefer ordering from sku.supplierId when present; otherwise choose a reasonable supplierId from inputs.suppliers.\n` +
     `- Keep reasons short and numeric.\n\n` +
     `Output expectations:\n` +
-    `- "reason" must include: daily, useByDays, leadTimeDays, targetOnHandUnits, effectiveOnHandUnits, reorderPointUnits, shortage,\n` +
+    `- "reason" must include: daily, useByDays, leadTimeDays, targetOnHandUnits, onHandUnits, reorderPointUnits, shortage,\n` +
     `  and whether context changed anything.\n` +
     `- "summary.keyDrivers" must mention lead-time coverage, safety buffer, and shelf-life bounds.\n\n` +
     `Inputs JSON:\n` +
