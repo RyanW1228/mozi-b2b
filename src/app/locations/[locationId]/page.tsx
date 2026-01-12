@@ -1955,26 +1955,6 @@ export default function LocationPage() {
         return;
       }
 
-      // 1) nonce
-      const nonceRes = await fetch(
-        `/api/auth/nonce?env=${encodeURIComponent(
-          env
-        )}&owner=${encodeURIComponent(owner)}&locationId=${encodeURIComponent(
-          locationId
-        )}`,
-        { method: "GET" }
-      );
-      const nonceJson = await nonceRes.json().catch(() => null);
-      if (!nonceRes.ok || !nonceJson?.ok) {
-        setError(
-          `NONCE HTTP ${nonceRes.status}\n` + JSON.stringify(nonceJson, null, 2)
-        );
-        return;
-      }
-
-      const nonce: string = String(nonceJson.nonce ?? "");
-      const issuedAtMs: number = Number(nonceJson.issuedAtMs ?? Date.now());
-
       // 2) signature
       const injected = getInjectedProvider();
       if (!injected) {
@@ -1994,12 +1974,13 @@ export default function LocationPage() {
         return;
       }
 
+      const issuedAtMs = Date.now();
+
       const message =
-        `Mozi: Plan Order\n` +
+        `Mozi: Generate Orders\n` +
         `env: ${env}\n` +
         `locationId: ${locationId}\n` +
         `owner: ${owner}\n` +
-        `nonce: ${nonce}\n` +
         `issuedAtMs: ${issuedAtMs}\n`;
 
       const signature = await signer.signMessage(message);
@@ -2013,10 +1994,14 @@ export default function LocationPage() {
           body: JSON.stringify({
             env,
             ownerAddress: owner,
-            auth: { message, signature, nonce, issuedAtMs },
+            auth: { message, signature, issuedAtMs }, // ✅ nonce removed
+            pendingWindowHours: 0,
             strategy,
             horizonDays,
             notes: formatContextForNotes(additionalContext),
+
+            // NEW: persist “execution time” as the simulated click moment
+            clientExecUnix: demoNowUnix(),
           }),
         }
       );
