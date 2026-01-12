@@ -3051,6 +3051,13 @@ export default function LocationPage() {
                   return visibleIntents.map((intent) => {
                     const key = String(intent.ref || "");
                     const isOpen = Boolean(openOrderKeys[key]);
+                    const isPlanned = (intent as any).__kind === "planned";
+                    const plannedId = isPlanned
+                      ? String((intent as any).__plannedId || "")
+                      : "";
+                    const isEditingThisPlanned =
+                      isPlanned && editingPlannedId === plannedId;
+
                     const toggleOpen = () =>
                       setOpenOrderKeys((prev) => ({
                         ...prev,
